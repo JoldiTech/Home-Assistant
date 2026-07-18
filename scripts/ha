@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# ha — tiny wrapper around the Home Assistant REST API.
+#
+# Uses the environment-provided credentials so you can hit the API without
+# re-typing the token or base URL:
+#   HOMEASSISTANT_BASE_URL   e.g. https://ha.nmteaco.com
+#   HOMEASSISTANT_TOKEN      long-lived access token (JWT)
+#
+# Usage:
+#   scripts/ha <path> [curl-args...]
+#
+# Examples:
+#   scripts/ha /api/                       # health check
+#   scripts/ha /api/config                 # instance config
+#   scripts/ha /api/states                 # all entity states
+#   scripts/ha /api/states/sun.sun         # one entity
+#   scripts/ha /api/services/light/turn_on -X POST \
+#       -H 'Content-Type: application/json' -d '{"entity_id":"light.example"}'
+set -euo pipefail
+
+: "${HOMEASSISTANT_BASE_URL:?HOMEASSISTANT_BASE_URL is not set}"
+: "${HOMEASSISTANT_TOKEN:?HOMEASSISTANT_TOKEN is not set}"
+
+if [[ $# -lt 1 ]]; then
+  echo "usage: scripts/ha <path> [curl-args...]" >&2
+  echo "example: scripts/ha /api/" >&2
+  exit 2
+fi
+
+path="$1"; shift
+# Allow either "/api/..." or a full URL.
+case "$path" in
+  http://*|https://*) url="$path" ;;
+  /*)                 url="${HOMEASSISTANT_BASE_URL%/}${path}" ;;
+  *)                  url="${HOMEASSISTANT_BASE_URL%/}/${path}" ;;
+esac
+
+curl -fsS \
+  -H "Authorization: Bearer ${HOMEASSISTANT_TOKEN}" \
+  -H "Content-Type: application/json" \
+  "$@" \
+  "$url"
