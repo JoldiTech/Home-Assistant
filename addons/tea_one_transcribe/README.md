@@ -68,7 +68,9 @@ Green); subsequent starts are instant.
 | `camera_entity` | `camera.tea_one_low_resolution_channel` | Camera to record. |
 | `gate_entity` | `binary_sensor.g6_dome_speaking_detected` | Speech gate; capture only while `on`. |
 | `model` | `tiny.en` | `tiny.en` (fastest), `base.en`, or `small.en`. |
+| `model_dir` | `/share/whisper_models` | Where GGML models live (persistent). Auto-downloaded from Hugging Face on first run if absent. |
 | `language` | `en` | Whisper language hint. |
+| `timezone` | `America/Denver` | Timezone for log/dashboard timestamps. |
 | `segment_seconds` | `20` | Length of each recorded clip while the gate is open. |
 | `lookback_seconds` | `5` | Pre-roll captured before the trigger. |
 | `threads` | `3` | Whisper CPU threads (leave ≥1 core for HA). |
@@ -94,8 +96,10 @@ The add-on also publishes an HA entity (`ha_sensor`, default
 attribute is the recent rolling feed. No MQTT broker required — it's pushed
 straight to Core's state machine.
 
-Add a **Markdown card** (Edit dashboard → Add card → Manual) for a live feed,
-newest first:
+A dedicated **"Tea One Transcript"** view is already installed on the
+**DowntownControls** dashboard (`dashboard-downtowncontrols`): it names the
+camera and shows the running transcript, newest first. To recreate it elsewhere,
+add a **Markdown card** (Edit dashboard → Add card → Manual):
 
 ```yaml
 type: markdown

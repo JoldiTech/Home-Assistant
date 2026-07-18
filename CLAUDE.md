@@ -245,6 +245,34 @@ The history endpoint's `minimal_response` shrinks payloads but **omits `entity_i
 on repeated rows** — don't use it when you need to know which camera each row
 belongs to.
 
+### Local audio transcription (Tea One)
+
+A local add-on transcribes the **Tea One** camera mic on-device (whisper.cpp
+`tiny.en`, aarch64/NEON) into a searchable log + a dashboard feed. Source of
+truth is `addons/tea_one_transcribe/` in this repo; it's deployed to
+`/addons/tea_one_transcribe/` on the box and managed by Supervisor as
+`local_tea_one_transcribe`.
+
+- **Gate (efficiency):** only runs while `binary_sensor.g6_dome_speaking_detected`
+  (Tea One's on-camera speaking AI) is `on` — enabled via
+  `switch.g6_dome_speaking_detection`. Idle cost ~12 MB RAM, 0 % CPU; whisper
+  only fires (a ~15 s spike, RTF ~0.97) during real speech. `base.en` is too slow
+  (RTF ~1.3) — stay on `tiny.en`.
+- **Audio source:** HA's own `camera.record` (already 16 kHz mono AAC) via the
+  Supervisor proxy — no UniFi creds / RTSP needed.
+- **Models:** live on the persistent `/share/whisper_models/` (NOT baked into the
+  image), auto-downloaded from HF on first run. Keeps rebuilds fast.
+- **Outputs:** searchable log `/share/tea_one_transcript.log`; entity
+  `sensor.tea_one_transcript` (state = last line, `lines` attr = rolling feed);
+  a **"Tea One Transcript"** view on the **DowntownControls** dashboard
+  (`dashboard-downtowncontrols`).
+- **Manage:** `ha apps {info,logs,restart,rebuild,stats} local_tea_one_transcribe`
+  over SSH. Options are set via the Supervisor API
+  (`POST http://supervisor/addons/local_tea_one_transcribe/options` with
+  `$SUPERVISOR_TOKEN`; send the FULL options object — partial payloads are
+  rejected for missing required keys). There is no `ha apps options` subcommand.
+- **CLI note:** `ha addons` is deprecated in favor of `ha apps` on this box.
+
 ### Repo conventions
 
 - Scripts live in `scripts/`, are standard-library-only Python 3, and read

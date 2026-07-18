@@ -10,6 +10,7 @@ Standard library only. Config comes from /data/options.json (add-on options);
 the Supervisor token comes from $SUPERVISOR_TOKEN.
 """
 import datetime
+import glob
 import json
 import os
 import signal
@@ -19,6 +20,11 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Python < 3.9
+    ZoneInfo = None
 
 OPTS = json.load(open("/data/options.json"))
 TOKEN = os.environ["SUPERVISOR_TOKEN"]
@@ -37,6 +43,23 @@ SIL_DB = int(OPTS.get("silence_threshold_db", -30))
 LOG = OPTS.get("log_path", "/share/tea_one_transcript.log")
 HA_SENSOR = (OPTS.get("ha_sensor") or "").strip()  # "" disables dashboard sensor
 RECENT = int(OPTS.get("recent_lines", 30))
+TZNAME = OPTS.get("timezone", "America/Denver")
+
+
+def _tz():
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(TZNAME)
+        except Exception:  # noqa: BLE001 - bad name / missing tzdata -> local
+            pass
+    return datetime.datetime.now().astimezone().tzinfo
+
+
+ZONE = _tz()
+
+
+def _now():
+    return datetime.datetime.now(ZONE)
 
 POLL = 1.5  # seconds between gate checks while idle
 WORKDIR = "/media/tea_one_transcribe_tmp"  # camera.record target (allowlisted)
@@ -144,7 +167,7 @@ def _is_noise(line):
 def append_log(lines):
     if not lines:
         return
-    now = datetime.datetime.now().astimezone()
+    now = _now()
     stamp = now.strftime("%Y-%m-%d %H:%M:%S %Z")
     hm = now.strftime("%H:%M:%S")
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
@@ -193,14 +216,14 @@ def seed_recent():
         _recent.append("%s | %s" % (hm, text))
     if _recent and HA_SENSOR:
         last = _recent[-1].partition(" | ")[2]
-        push_sensor(last, datetime.datetime.now().astimezone())
+        push_sensor(last, _now())
 
 
 def cleanup(mp4):
-    base = mp4[:-4]
-    for ext in (".mp4", ".wav", ".txt"):
+    # glob catches .mp4, .wav, .txt and camera.record's leftover .mp4.tmp
+    for f in glob.glob(mp4[:-4] + "*"):
         try:
-            os.remove(base + ext)
+            os.remove(f)
         except OSError:
             pass
 
@@ -243,6 +266,12 @@ def main():
     if HA_SENSOR:
         log("dashboard sensor:", HA_SENSOR)
     seed_recent()
+    # clear stale temp clips left by a previous interrupted run
+    for f in glob.glob(os.path.join(WORKDIR, "seg_*")):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
 
     was_on = False
     while not _STOP:

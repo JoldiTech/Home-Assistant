@@ -31,6 +31,7 @@ options:
   model: tiny.en
   model_dir: /share/whisper_models
   language: en
+  timezone: America/Denver
   segment_seconds: 20
   lookback_seconds: 5
   threads: 3
@@ -44,6 +45,7 @@ schema:
   model: list(tiny.en|base.en|small.en)
   model_dir: str
   language: str
+  timezone: str
   segment_seconds: int(5,300)
   lookback_seconds: int(0,15)
   threads: int(1,4)
