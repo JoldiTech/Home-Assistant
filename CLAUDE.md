@@ -63,8 +63,13 @@ long-lived tokens, so **add-on / Supervisor / host management must go through SS
 
 ## Connect over SSH (copy-paste)
 
-Requires `ssh` + `cloudflared` (the environment setup script installs both; the
-guards below self-install if missing).
+> **In this repo it's already automated.** The committed SessionStart hook
+> (`.claude/hooks/session-start.sh`) runs the steps below on every fresh session,
+> so you can just `ssh homeassistant` with no setup. The steps here are the
+> manual fallback and the explanation of what the hook does.
+
+Requires `ssh` + `cloudflared` (the hook installs both; the guards below
+self-install if missing).
 
 ```bash
 # 1) Tooling (idempotent). cloudflared comes from Cloudflare's apt repo —
@@ -149,24 +154,26 @@ curl -fsS -X POST -H "Authorization: Bearer $HOMEASSISTANT_TOKEN" \
 
 ---
 
-## Environment setup script
+## How this persists (the container is wiped every session)
 
-Tooling (`openssh-client` + `cloudflared`) is meant to be installed at container
-provision time so it's ready from the start of every session. The script is
-secret-free and idempotent; it lives in the **environment's Setup script** setting
-(Claude Code on the web → environment settings), not in the repo:
+The container filesystem does **not** survive between sessions — installed tools,
+the decoded key, and `~/.ssh/config` are all gone next time. Only three stores are
+durable: **startup scripts, environment variables, and GitHub.** This setup uses
+all three so nothing depends on ephemeral state:
 
-```bash
-#!/bin/bash
-set -euo pipefail
-if ! command -v ssh >/dev/null 2>&1; then
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq && apt-get install -y --no-install-recommends openssh-client
-fi
-if ! command -v cloudflared >/dev/null 2>&1; then
-  export DEBIAN_FRONTEND=noninteractive
-  tmp="$(mktemp -d)"; base="https://pkg.cloudflare.com/cloudflared"
-  fn="$(curl -fsSL "$base/dists/any/main/binary-amd64/Packages" | awk '/^Filename:/{print $2; exit}')"
-  curl -fsSL -o "$tmp/cloudflared.deb" "$base/$fn"; apt-get install -y "$tmp/cloudflared.deb"; rm -rf "$tmp"
-fi
-```
+- **GitHub + startup script:** `.claude/hooks/session-start.sh` (registered in
+  `.claude/settings.json`) is committed to the repo and runs on every SessionStart.
+  It reinstalls `openssh-client` + `cloudflared`, re-materializes the key (with the
+  trailing-newline fix), rewrites the ProxyCommand wrapper, and rewrites the
+  `ssh homeassistant` alias — all idempotent and secret-free.
+- **Environment variables:** the hook reads every secret (`HA_SSH_KEY_B64`,
+  `CF_ACCESS_CLIENT_*`, `HOMEASSISTANT_TOKEN`, …) from the secret store at runtime.
+
+Net effect: a brand-new container is fully connection-ready with no manual steps.
+The hook activates for all sessions once merged to the default branch.
+
+> Optional speed-up: the same tool-install commands can also go in the
+> **environment's Setup script** setting (Claude Code on the web → environment
+> settings). That installs `cloudflared` at provision time and caches it, so the
+> hook's install step becomes a fast no-op. Not required — the hook installs it
+> either way.
