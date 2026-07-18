@@ -29,6 +29,7 @@ options:
   camera_entity: camera.tea_one_low_resolution_channel
   gate_entity: binary_sensor.g6_dome_speaking_detected
   model: tiny.en
+  model_dir: /share/whisper_models
   language: en
   segment_seconds: 20
   lookback_seconds: 5
@@ -41,6 +42,7 @@ schema:
   camera_entity: str
   gate_entity: str
   model: list(tiny.en|base.en|small.en)
+  model_dir: str
   language: str
   segment_seconds: int(5,300)
   lookback_seconds: int(0,15)

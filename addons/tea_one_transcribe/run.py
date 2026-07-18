@@ -26,7 +26,9 @@ API = "http://supervisor/core/api"
 
 CAM = OPTS["camera_entity"]
 GATE = OPTS["gate_entity"]
-MODEL = "/opt/models/ggml-%s.bin" % OPTS.get("model", "tiny.en")
+MODEL_NAME = OPTS.get("model", "tiny.en")
+MODEL_DIR = OPTS.get("model_dir", "/share/whisper_models")
+MODEL = os.path.join(MODEL_DIR, "ggml-%s.bin" % MODEL_NAME)
 LANG = OPTS.get("language", "en")
 SEG = int(OPTS.get("segment_seconds", 20))
 LOOKBACK = int(OPTS.get("lookback_seconds", 5))
@@ -203,9 +205,38 @@ def cleanup(mp4):
             pass
 
 
+def ensure_model():
+    """Model lives on the persistent /share mount; fetch it if it's not there."""
+    if os.path.exists(MODEL):
+        return True
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    url = ("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-%s.bin"
+           % MODEL_NAME)
+    log("model not on disk, downloading:", url)
+    tmp = MODEL + ".part"
+    try:
+        with urllib.request.urlopen(url, timeout=600) as r, open(tmp, "wb") as f:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+        os.replace(tmp, MODEL)
+        log("model downloaded:", MODEL, "(%d bytes)" % os.path.getsize(MODEL))
+        return True
+    except Exception as e:  # noqa: BLE001 - report and fail cleanly
+        log("model download failed:", e)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
 def main():
-    if not os.path.exists(MODEL):
-        log("FATAL: model missing:", MODEL)
+    if not ensure_model():
+        have = os.listdir(MODEL_DIR) if os.path.isdir(MODEL_DIR) else "(no dir)"
+        log("FATAL: model unavailable:", MODEL, "- dir contains:", have)
         sys.exit(1)
     log("tea_one_transcribe up: cam=%s gate=%s model=%s seg=%ss lookback=%ss threads=%s -> %s"
         % (CAM, GATE, MODEL, SEG, LOOKBACK, THREADS, LOG))
