@@ -33,8 +33,10 @@ options:
   segment_seconds: 20
   lookback_seconds: 5
   threads: 3
-  silence_threshold_db: -30
+  silence_threshold_db: -45
   log_path: /share/tea_one_transcript.log
+  ha_sensor: sensor.tea_one_transcript
+  recent_lines: 30
 schema:
   camera_entity: str
   gate_entity: str
@@ -45,3 +47,5 @@ schema:
   threads: int(1,4)
   silence_threshold_db: int(-60,0)
   log_path: str
+  ha_sensor: str?
+  recent_lines: int(1,200)

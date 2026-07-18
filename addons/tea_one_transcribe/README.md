@@ -72,8 +72,10 @@ Green); subsequent starts are instant.
 | `segment_seconds` | `20` | Length of each recorded clip while the gate is open. |
 | `lookback_seconds` | `5` | Pre-roll captured before the trigger. |
 | `threads` | `3` | Whisper CPU threads (leave ≥1 core for HA). |
-| `silence_threshold_db` | `-30` | ffmpeg silence-trim threshold. Higher (e.g. `-25`) trims more aggressively in a noisy room. |
+| `silence_threshold_db` | `-45` | ffmpeg silence-trim threshold. Only audio below this is treated as dead air. This room's ambient floor is ~−31 dB, so keep it well below that (e.g. `-45`) or real speech gets cut. |
 | `log_path` | `/share/tea_one_transcript.log` | Searchable output log. |
+| `ha_sensor` | `sensor.tea_one_transcript` | Entity to publish for the dashboard. Empty string disables it. |
+| `recent_lines` | `30` | How many recent lines to keep in the log tail buffer / dashboard feed. |
 
 ## Reading the log
 
@@ -82,14 +84,49 @@ ssh homeassistant 'tail -f /share/tea_one_transcript.log'
 ssh homeassistant 'grep -i "refund" /share/tea_one_transcript.log'
 ```
 
-Each line is `timestamp (America/Denver) | transcribed text`.
+Each line is `timestamp (America/Denver) | transcribed text`. `/share` is also
+browsable from the File Editor / VS Code / Samba add-ons.
+
+## See it on the dashboard
+
+The add-on also publishes an HA entity (`ha_sensor`, default
+`sensor.tea_one_transcript`): the **state** is the latest line, and the **`lines`**
+attribute is the recent rolling feed. No MQTT broker required — it's pushed
+straight to Core's state machine.
+
+Add a **Markdown card** (Edit dashboard → Add card → Manual) for a live feed,
+newest first:
+
+```yaml
+type: markdown
+title: Tea One — Live Transcript
+content: |
+  Last heard: **{{ state_attr('sensor.tea_one_transcript','last_spoken') }}**
+  {% for l in (state_attr('sensor.tea_one_transcript','lines') or []) | reverse %}
+  - {{ l }}
+  {% endfor %}
+```
+
+Or a one-line **Entities card** showing just the most recent utterance:
+
+```yaml
+type: entities
+entities:
+  - entity: sensor.tea_one_transcript
+    name: Last heard on Tea One
+```
+
+Note: API-pushed states don't survive a Core restart, but the add-on reseeds the
+sensor from the log tail on startup, so the card repopulates on its own.
 
 ## Notes & caveats
 
 - **Quality is camera-mic quality.** A ceiling camera in a room with music/HVAC
-  is a hard STT target; `tiny.en` will miss words and occasionally invent them.
-  Bump `model` to `base.en` if the box has headroom, and raise
-  `silence_threshold_db` toward `-25` in a noisy room.
+  is a hard STT target; `tiny.en` transcribes at the *gist* level — good enough to
+  search, not verbatim — and will occasionally invent a phrase.
+- **Model choice.** Benchmarked on this box: `tiny.en` runs at ~0.97× real time
+  (keeps up), `base.en` at ~1.3× (falls behind continuous speech). Stay on
+  `tiny.en` unless you move the workload to a stronger machine.
 - **Privacy/consent.** This records audio of customers and staff. Confirm it's
   consistent with posted notice and local policy before running it permanently.
 - **`switch.g6_dome_speaking_detection`** (Tea One Speaking detection) must be

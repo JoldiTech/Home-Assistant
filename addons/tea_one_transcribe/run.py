@@ -18,6 +18,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 
 OPTS = json.load(open("/data/options.json"))
 TOKEN = os.environ["SUPERVISOR_TOKEN"]
@@ -32,12 +33,15 @@ LOOKBACK = int(OPTS.get("lookback_seconds", 5))
 THREADS = str(OPTS.get("threads", 3))
 SIL_DB = int(OPTS.get("silence_threshold_db", -30))
 LOG = OPTS.get("log_path", "/share/tea_one_transcript.log")
+HA_SENSOR = (OPTS.get("ha_sensor") or "").strip()  # "" disables dashboard sensor
+RECENT = int(OPTS.get("recent_lines", 30))
 
 POLL = 1.5  # seconds between gate checks while idle
 WORKDIR = "/media/tea_one_transcribe_tmp"  # camera.record target (allowlisted)
 os.makedirs(WORKDIR, exist_ok=True)
 
 _STOP = False
+_recent = deque(maxlen=RECENT)  # rolling "HH:MM:SS | text" lines for the dashboard
 
 
 def _sig(_signum, _frame):
@@ -108,8 +112,9 @@ def transcribe(mp4):
         return []
 
     subprocess.run(
+        # -mc 0: no cross-segment context -> fewer runaway repetition hallucinations.
         ["whisper-cli", "-m", MODEL, "-f", wav, "-l", LANG, "-t", THREADS,
-         "-nt", "-otxt", "-of", base, "--no-speech-thold", "0.6"],
+         "-mc", "0", "-nt", "-otxt", "-of", base, "--no-speech-thold", "0.6"],
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
@@ -137,12 +142,56 @@ def _is_noise(line):
 def append_log(lines):
     if not lines:
         return
-    ts = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    now = datetime.datetime.now().astimezone()
+    stamp = now.strftime("%Y-%m-%d %H:%M:%S %Z")
+    hm = now.strftime("%H:%M:%S")
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
     with open(LOG, "a") as f:
         for ln in lines:
-            f.write("%s | %s\n" % (ts, ln))
+            f.write("%s | %s\n" % (stamp, ln))
+            _recent.append("%s | %s" % (hm, ln))
     log("+%d line(s):" % len(lines), " / ".join(lines)[:200])
+    push_sensor(lines[-1], now)
+
+
+def push_sensor(latest, when):
+    """Publish the rolling transcript to an HA sensor for the dashboard."""
+    if not HA_SENSOR:
+        return
+    payload = {
+        "state": latest[:250],
+        "attributes": {
+            "friendly_name": "Tea One Transcript",
+            "icon": "mdi:message-text",
+            "last_spoken": when.isoformat(timespec="seconds"),
+            "lines": list(_recent),  # newest last
+        },
+    }
+    try:
+        api("POST", "/states/" + HA_SENSOR, payload)
+    except urllib.error.URLError as e:
+        log("sensor push error:", e)
+
+
+def seed_recent():
+    """Repopulate the rolling buffer (and sensor) from the tail of the log."""
+    if not os.path.exists(LOG):
+        return
+    try:
+        with open(LOG) as f:
+            tail = f.readlines()[-RECENT:]
+    except OSError:
+        return
+    for raw in tail:
+        raw = raw.strip()
+        if " | " not in raw:
+            continue
+        stamp, _, text = raw.partition(" | ")
+        hm = stamp.split(" ")[1] if " " in stamp else stamp  # HH:MM:SS
+        _recent.append("%s | %s" % (hm, text))
+    if _recent and HA_SENSOR:
+        last = _recent[-1].partition(" | ")[2]
+        push_sensor(last, datetime.datetime.now().astimezone())
 
 
 def cleanup(mp4):
@@ -160,6 +209,9 @@ def main():
         sys.exit(1)
     log("tea_one_transcribe up: cam=%s gate=%s model=%s seg=%ss lookback=%ss threads=%s -> %s"
         % (CAM, GATE, MODEL, SEG, LOOKBACK, THREADS, LOG))
+    if HA_SENSOR:
+        log("dashboard sensor:", HA_SENSOR)
+    seed_recent()
 
     was_on = False
     while not _STOP:
