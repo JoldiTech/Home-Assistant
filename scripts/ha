@@ -35,7 +35,15 @@ case "$path" in
   *)                  url="${HOMEASSISTANT_BASE_URL%/}/${path}" ;;
 esac
 
+# The tunnel occasionally drops a request (brief cloudflared reconnect, HA core
+# reload, edge blip). Retry transient failures with backoff so callers see the
+# flakiness as, at worst, a slightly slower call instead of a hard error.
+# curl's --retry already covers the transient HTTP statuses the tunnel emits
+# (502/503/504) and, with --retry-connrefused, a refused origin during an HA
+# reload — without wastefully retrying genuine 4xx client errors.
 curl -fsS \
+  --connect-timeout 10 --max-time 60 \
+  --retry 4 --retry-delay 1 --retry-connrefused \
   -H "Authorization: Bearer ${HOMEASSISTANT_TOKEN}" \
   -H "Content-Type: application/json" \
   "$@" \
