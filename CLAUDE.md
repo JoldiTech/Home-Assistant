@@ -154,6 +154,96 @@ curl -fsS -X POST -H "Authorization: Bearer $HOMEASSISTANT_TOKEN" \
 
 ---
 
+## Reliability — why it feels flaky, and what's already done about it
+
+The connection *feels* unreliable, but the box itself is healthy (checked
+2026-07-18: ~2.5 GB RAM free, load ≈ 0.2, disk 20 GB free, no swap, `ha
+resolution` clean). The flakiness is almost entirely at **connection-setup
+time**, and the cloudflared add-on logs name the causes precisely:
+
+1. **Internal DNS starvation → SSH "banner exchange" timeouts.** Every new SSH
+   connection makes cloudflared resolve `core-ssh` over HA's internal DNS plugin
+   (`hassio_dns`/coredns). That plugin is periodically flooded with reverse-DNS
+   `PTR` lookups for the whole LAN (`*.22.168.192.in-addr.arpa`, all NXDOMAIN),
+   and under that load a lookup occasionally misses its deadline:
+   `ERR error="dial tcp: lookup core-ssh: operation was canceled" … ssh://core-ssh:22`.
+   Measured raw SSH success was ~4/6 (≈67%) — a single `ssh` fails ~1 in 3.
+2. **Brief HA-core reload windows.** Occasionally the origin refuses connections
+   for ~20-30 s: `dial tcp 172.30.32.1:8123: connect: connection refused`. Every
+   request in that window fails (web UI, API, everything) until core is back.
+3. **Log noise / wasted origin load** from `context canceled` on camera-thumbnail
+   and brand-icon requests — mostly browsers aborting dashboard image loads.
+
+### Client-side mitigations (in this repo — already active)
+
+These make *our* tooling robust to the above. They don't change the HA box.
+
+- **SSH connection multiplexing** — the session hook now writes `ControlMaster
+  auto` / `ControlPath ~/.ssh/cm/%r@%h:%p` / `ControlPersist 300` plus keepalives
+  and `ConnectionAttempts 3`. The flaky cloudflared+DNS handshake is paid **once**;
+  every later `ssh homeassistant …` reuses the live socket instantly.
+- **`scripts/ha-ssh`** — resilient entrypoint: establishes that master with
+  retry+backoff (so the *first* connection is reliable too), then runs your
+  command over it. Use it instead of raw `ssh` for anything scripted:
+  `scripts/ha-ssh 'ha core info'`. `--up` just opens the master; `--down` closes it.
+- **`scripts/ha` retries** — the REST wrapper now retries transient tunnel
+  failures (`--retry 4 --retry-connrefused`, 10 s connect / 60 s total), so a
+  502/blip becomes a slightly slower call, not a hard error.
+- **`scripts/tunnel_health.py`** — quantify it. `scripts/tunnel_health.py -n 30
+  --ssh` reports success rate + latency percentiles for API and SSH (exit 1 if
+  below `--threshold`). Use it to confirm a fix or catch a regression. With
+  multiplexing up, SSH measured 15/15 and API 15/15.
+
+### The browser/app freeze — tunnel transport (QUIC), the #1 fix
+
+Symptom (David, 2026-07): the web UI / mobile app "freezes for a few minutes,
+every few minutes." A sustained probe (`scripts/tunnel_health.py` / the poll in
+`scripts/`) reproduced it — a **~28 s window where the API was completely
+unreachable** (a 20 s hard timeout + a 5 s recovery), then back to ~0.4 s
+normal. During such a window a browser holding HA's persistent WebSocket just
+hangs on the spinner, which reads as a multi-minute freeze. Meanwhile HA **core
+is healthy** — no event-loop stalls, no recorder/DB blocking in `ha core logs` —
+so the freeze is in the **Cloudflare tunnel transport, not the server**. HA core
+even logs the other side of it: `aiohttp.server Error handling request from
+172.30.33.0` (the cloudflared container) + `ClientConnectionResetError: Cannot
+write to closing transport`.
+
+Root cause: the cloudflared add-on has **no transport override**, so it runs
+cloudflared's default **QUIC (UDP/7844)**. QUIC over a residential ISP is the
+best-known cause of exactly this periodic-stall pattern (UDP shaping, buffer
+bloat, packet loss, MTU/fragmentation). **Fix: force the TCP-based `http2`
+transport.**
+
+The community `9074a9fa_cloudflared` add-on exposes a `run_parameters` option
+(extra args for `cloudflared tunnel run`). In the add-on's **Configuration**:
+
+```yaml
+run_parameters:
+  - --protocol
+  - http2
+```
+
+Then **Restart** the add-on (a ~10-30 s remote-access blip; local/LAN access is
+unaffected). Verify from the add-on log that it registers connections on
+`http2`, and re-run `scripts/tunnel_health.py -n 60` — the stall windows should
+be gone. To roll back, clear `run_parameters` and restart. (Leave
+`post_quantum` **off** — it forces QUIC, the opposite of what we want.)
+
+### Other server-side hardening (need David's OK — production instance)
+
+- **Stop the reverse-DNS flood** (the cause of the SSH-side DNS timeouts). Find
+  the integration PTR-scanning the LAN — typically an `nmap`/`ping`/SNMP
+  **device tracker** or router integration enumerating `192.168.22.0/24`.
+  Disabling it, narrowing its scan, or adding a local PTR zone stops the coredns
+  contention.
+- **Add a second cloudflared connector/replica** so one connector hiccup doesn't
+  drop the tunnel — Cloudflare load-balances across connectors.
+- **Investigate the brief core-reload windows** (a ~25 s `connection refused` to
+  `:8123` was seen at 15:30): `ha core logs` around it — auto-update, an
+  integration reload, or memory pressure?
+
+---
+
 ## How this persists (the container is wiped every session)
 
 The container filesystem does **not** survive between sessions — installed tools,

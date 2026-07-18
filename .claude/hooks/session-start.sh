@@ -102,9 +102,25 @@ PROXY_EOF
 chmod 700 "$PROXY"
 
 # --- 5) ssh config alias -> `ssh homeassistant` ------------------------------
+# The tunnel is intermittently flaky at *connection setup* time: cloudflared
+# cold-starts a fresh TLS/WebSocket session to Cloudflare's edge and then the
+# origin has to resolve `core-ssh` over HA's internal DNS, which is periodically
+# starved (see the "Reliability" section in CLAUDE.md). A single ssh attempt
+# fails ~1-in-3 with "timed out during banner exchange".
+#
+# Two settings turn that into a non-issue:
+#   * Connection multiplexing (ControlMaster/ControlPath/ControlPersist) — pay
+#     the flaky setup cost ONCE, then every later `ssh homeassistant ...` in the
+#     session reuses the live socket instantly (no cloudflared, no DNS).
+#   * Keepalives + ConnectionAttempts — hold the master open and let ssh itself
+#     retry the initial TCP setup a few times.
+# The `scripts/ha-ssh` wrapper adds retry-with-backoff on top, so establishing
+# that first master is reliable too.
 HOST="${HA_SSH_HOST:-ssh.nmteaco.com}"
 USER_NAME="${HA_SSH_USER:-root}"
 [ -n "$USER_NAME" ] || USER_NAME="root"   # HA_SSH_USER may be set-but-empty
+CM_DIR="$SSH_DIR/cm"
+mkdir -p "$CM_DIR" && chmod 700 "$CM_DIR"  # control-socket dir for multiplexing
 CFG="$SSH_DIR/config"
 START="# >>> ha-ssh-setup >>>"
 END="# <<< ha-ssh-setup <<<"
@@ -119,12 +135,18 @@ END="# <<< ha-ssh-setup <<<"
   echo "    StrictHostKeyChecking accept-new"
   echo "    UserKnownHostsFile $SSH_DIR/known_hosts"
   echo "    ProxyCommand $PROXY %h"
-  echo "    ConnectTimeout 50"
+  echo "    ConnectTimeout 30"
+  echo "    ConnectionAttempts 3"
   echo "    ServerAliveInterval 15"
+  echo "    ServerAliveCountMax 3"
+  echo "    TCPKeepAlive yes"
+  echo "    ControlMaster auto"
+  echo "    ControlPath $CM_DIR/%r@%h:%p"
+  echo "    ControlPersist 300"
   echo "$END"
 } >> "$CFG"
 chmod 600 "$CFG"
-log "ssh config ready — connect with: ssh homeassistant"
+log "ssh config ready — connect with: ssh homeassistant (or scripts/ha-ssh for retries)"
 
 log "HA SSH setup complete"
 exit 0
