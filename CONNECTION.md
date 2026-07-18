@@ -1,99 +1,100 @@
 # Home Assistant — Connection Self-Assessment
 
 **Date:** 2026-07-18
-**Result:** ✅ Connectable out of the box via the **REST API**. SSH is provisioned
-but gated behind Cloudflare Access and needs an extra credential that is not
-present in this environment.
+**Result:** ✅ **Both** connection paths work — REST API **and** SSH.
+
+> The full working runbook (SSH setup via the SessionStart hook, troubleshooting,
+> camera/entity reference) lives in **[`CLAUDE.md`](CLAUDE.md)** — treat that as
+> the source of truth. This file is the point-in-time assessment kept for the
+> evidence snapshot.
 
 ---
 
 ## TL;DR
 
-Yes — this session can talk to Home Assistant without any setup. The REST API
-credentials are already in the environment and work immediately. Use the
-`scripts/ha` helper (or `curl` directly) with `HOMEASSISTANT_BASE_URL` +
-`HOMEASSISTANT_TOKEN`.
+This session can reach Home Assistant two ways, both using credentials already in
+the environment — no manual setup:
+
+- **REST API** — `HOMEASSISTANT_BASE_URL` + `HOMEASSISTANT_TOKEN` (plain HTTPS).
+  Use `scripts/ha` or `curl`.
+- **SSH** — `cloudflared access ssh` + the `CF_ACCESS_CLIENT_ID` /
+  `CF_ACCESS_CLIENT_SECRET` service token, landing as `root@core-ssh` (HAOS).
 
 ---
 
 ## Credentials available in the environment
 
-These are provided as environment variables (values not reproduced here):
+Provided as environment variables (values not reproduced here):
 
-| Variable                 | Purpose                                          | Usable? |
-| ------------------------ | ------------------------------------------------ | ------- |
-| `HOMEASSISTANT_BASE_URL` | HA base URL (`https://ha.nmteaco.com`)           | ✅ yes  |
-| `HOMEASSISTANT_TOKEN`    | Long-lived access token (JWT) for the REST API   | ✅ yes  |
-| `HA_SSH_HOST`            | SSH host (`ssh.nmteaco.com`, behind Cloudflare)  | ⚠️ gated |
-| `HA_SSH_USER`            | SSH user (`root`)                                | ⚠️ gated |
-| `HA_SSH_KEY_B64`         | base64-encoded ED25519 private key               | ⚠️ gated |
+| Variable | Purpose | Works? |
+| --- | --- | --- |
+| `HOMEASSISTANT_BASE_URL` | HA base URL (`https://ha.nmteaco.com`) | ✅ |
+| `HOMEASSISTANT_TOKEN` | Long-lived access token (JWT) for the REST API | ✅ |
+| `HA_SSH_HOST` | SSH host (`ssh.nmteaco.com`, behind Cloudflare Access) | ✅ |
+| `HA_SSH_USER` | SSH user (empty → default `root`) | ✅ |
+| `HA_SSH_KEY_B64` | base64-encoded ED25519 private key | ✅ |
+| `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | Cloudflare Access service token | ✅ |
 
 ---
 
-## Method 1 — REST API ✅ (recommended, works today)
+## Method 1 — REST API ✅
 
-The token + base URL work with no additional configuration. Outbound HTTPS is
-allowed to the HA host through the session's egress proxy.
+The token + base URL work with no configuration. Outbound HTTPS reaches the HA
+host through the session's egress proxy.
 
 ```bash
 # Health check
-curl -sS -H "Authorization: Bearer $HOMEASSISTANT_TOKEN" \
-  "$HOMEASSISTANT_BASE_URL/api/"
+curl -sS -H "Authorization: Bearer $HOMEASSISTANT_TOKEN" "$HOMEASSISTANT_BASE_URL/api/"
 # -> {"message":"API running."}
 
 # Read all entity states
-curl -sS -H "Authorization: Bearer $HOMEASSISTANT_TOKEN" \
-  "$HOMEASSISTANT_BASE_URL/api/states"
+curl -sS -H "Authorization: Bearer $HOMEASSISTANT_TOKEN" "$HOMEASSISTANT_BASE_URL/api/states"
 
-# Call a service (write) — example shape, not executed during assessment
+# Call a service (write)
 curl -sS -X POST -H "Authorization: Bearer $HOMEASSISTANT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"entity_id":"light.example"}' \
+  -H "Content-Type: application/json" -d '{"entity_id":"light.example"}' \
   "$HOMEASSISTANT_BASE_URL/api/services/light/turn_on"
 ```
 
-Verified during this assessment (read-only calls):
+Verified (read-only calls):
 
-- `GET /api/`        → `200 {"message":"API running."}`
-- `GET /api/config`  → `200` (version, location, components)
-- `GET /api/states`  → `200`, **626 entities**
-- `GET /api/services`→ `200`, **67 service domains** (write path is authorized)
+- `GET /api/` → `200 {"message":"API running."}`
+- `GET /api/config` → `200` — HA **2026.7.2**, America/Denver, RUNNING
+- `GET /api/states` → `200`, **626 entities**
+- `GET /api/services` → `200`, **67 service domains** (write path authorized)
 - `GET /api/websocket` → `400` (endpoint present; expects a WebSocket upgrade)
 
-The token also grants the WebSocket API (`/api/websocket`) for real-time /
-event-driven use.
+## Method 2 — SSH ✅
 
-## Method 2 — SSH ⚠️ (provisioned, but blocked by Cloudflare Access)
-
-`ssh.nmteaco.com` resolves to a **Cloudflare** address. Findings:
-
-- **Port 22 is not reachable** (times out) — raw SSH does not apply.
-- **Port 443 is open**, and `cloudflared` (v2026.7.x) is installed, so the
-  intended path is SSH-over-HTTPS via a `cloudflared access ssh` ProxyCommand.
-- That path currently returns **HTTP 403 / `websocket: bad handshake`**. The
-  host responds with `cf-access-domain: ssh.nmteaco.com` and a
-  `cf-access-aud` header — i.e. the app sits behind **Cloudflare Access**.
-
-To use SSH, one of the following must be added to the environment:
-
-- A **Cloudflare Access service token** (`CF-Access-Client-Id` +
-  `CF-Access-Client-Secret`) for a non-interactive service login, or
-- An interactive `cloudflared access login` (needs a browser, not available in
-  a headless session).
-
-Reference ProxyCommand once a service token is available:
+`ssh.nmteaco.com` is **not** raw port-22 SSH — it sits behind **Cloudflare
+Access** (port 22 times out; 443 is open). `cloudflared` is installed, so SSH is
+tunneled over HTTPS via a `cloudflared access ssh` ProxyCommand, authenticated
+with the Cloudflare Access service token.
 
 ```bash
-# Write $HA_SSH_KEY_B64 to a 0600 key file first, then:
-ssh -i "$KEY" -o ProxyCommand="cloudflared access ssh --hostname %h" \
-    "$HA_SSH_USER@$HA_SSH_HOST"
+# key: decode $HA_SSH_KEY_B64 to a 0600 file (append a trailing newline if missing)
+export TUNNEL_SERVICE_TOKEN_ID="$CF_ACCESS_CLIENT_ID"
+export TUNNEL_SERVICE_TOKEN_SECRET="$CF_ACCESS_CLIENT_SECRET"
+ssh -i "$KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+    -o ProxyCommand="cloudflared access ssh --hostname %h" \
+    "${HA_SSH_USER:-root}@$HA_SSH_HOST" 'ha core info'
 ```
+
+Verified 2026-07-18: connected as `root@core-ssh`; `ha core info` returns
+(HAOS, `aarch64`). The committed SessionStart hook
+(`.claude/hooks/session-start.sh`) automates all of this, so `ssh homeassistant`
+works from the first moment of a fresh session.
+
+> **Correction:** an earlier revision of this file claimed SSH was "blocked /
+> service token not present." That was wrong — the `CF_ACCESS_CLIENT_ID` /
+> `CF_ACCESS_CLIENT_SECRET` service token **is** present, and SSH works. The 403
+> seen initially was simply because the token had not been passed to cloudflared.
 
 ---
 
 ## Recommendation
 
-Use the **REST API** for all interaction with this Home Assistant instance —
-reading state, calling services, and (via `/api/websocket`) subscribing to
-events. It requires no setup. Reserve SSH for host-level admin tasks and only
-after a Cloudflare Access service token is provisioned.
+Use the **REST API** for entity/service/state work (simplest — no tunnel). Use
+**SSH** for OS/filesystem access and the `ha` CLI (Supervisor/add-on/host
+control, which the REST API's long-lived token cannot reach). Full details in
+[`CLAUDE.md`](CLAUDE.md).
