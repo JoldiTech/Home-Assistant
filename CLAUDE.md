@@ -208,26 +208,40 @@ even logs the other side of it: `aiohttp.server Error handling request from
 172.30.33.0` (the cloudflared container) + `ClientConnectionResetError: Cannot
 write to closing transport`.
 
-Root cause: the cloudflared add-on has **no transport override**, so it runs
-cloudflared's default **QUIC (UDP/7844)**. QUIC over a residential ISP is the
-best-known cause of exactly this periodic-stall pattern (UDP shaping, buffer
-bloat, packet loss, MTU/fragmentation). **Fix: force the TCP-based `http2`
-transport.**
+Root cause: the cloudflared add-on had **no transport override**, so it ran
+cloudflared's default **QUIC (UDP/7844)**. QUIC over this ISP is broken —
+cloudflared's own startup precheck proves it:
 
-The community `9074a9fa_cloudflared` add-on exposes a `run_parameters` option
-(extra args for `cloudflared tunnel run`). In the add-on's **Configuration**:
-
-```yaml
-run_parameters:
-  - --protocol
-  - http2
+```
+UDP Connectivity  region1.v2.argotunnel.com  PASS  QUIC connection successful
+UDP Connectivity  region2.v2.argotunnel.com  FAIL  QUIC connection failed
+WARNING: Allow outbound QUIC traffic on port 7844 or use HTTP2.
+SUMMARY: Environment ready with degraded transport. cloudflared will proceed using 'http2'.
 ```
 
-Then **Restart** the add-on (a ~10-30 s remote-access blip; local/LAN access is
-unaffected). Verify from the add-on log that it registers connections on
-`http2`, and re-run `scripts/tunnel_health.py -n 60` — the stall windows should
-be gone. To roll back, clear `run_parameters` and restart. (Leave
-`post_quantum` **off** — it forces QUIC, the opposite of what we want.)
+On the default `auto` protocol cloudflared limps along on those degraded QUIC
+connections, which is what produced the periodic multi-minute freezes. The fix
+is to pin the TCP-based **`http2`** transport.
+
+**✅ APPLIED 2026-07-18.** The `9074a9fa_cloudflared` add-on now has, in its
+options, `run_parameters: ["--protocol=http2"]` (note the required `--flag=value`
+form — the add-on's validator rejects a bare `["--protocol", "http2"]`). Set it
+via the add-on **Configuration** page, or the Supervisor API:
+
+```bash
+# from an SSH shell on the box (SUPERVISOR_TOKEN is in the add-on env)
+curl -sS -X POST -H "Authorization: Bearer $SUPERVISOR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"options": {"external_hostname": "ha.nmteaco.com", "additional_hosts": [], "run_parameters": ["--protocol=http2"]}}' \
+  http://supervisor/addons/9074a9fa_cloudflared/options
+ha addons restart 9074a9fa_cloudflared     # ~3-5 s remote blip; LAN access unaffected
+```
+
+Verify: the add-on log shows `Initial protocol http2` and
+`Registered tunnel connection … protocol=http2`, and `scripts/tunnel_health.py
+-n 40 --ssh` reports 100% with no timeouts (post-fix it did; pre-fix the same
+probe hit 20 s dead windows). To roll back, clear `run_parameters` and restart.
+Leave `post_quantum` **off** — it forces QUIC, the opposite of what we want.
 
 ### Other server-side hardening (need David's OK — production instance)
 
