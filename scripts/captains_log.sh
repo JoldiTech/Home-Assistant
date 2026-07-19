@@ -1,37 +1,47 @@
 #!/usr/bin/env bash
 # captains_log.sh — box-side mechanics for the daily "captain's log" pipeline.
 #
-# Run these over SSH on the Home Assistant box (they touch /share). The daily
-# summarizer (Opus, fired by a Routine at 7pm MT) drives the order:
+# GENERIC over all cameras: any add-on that writes /share/<camera>_transcript.log
+# is picked up automatically — no per-camera hard-coding. Add a camera, and the
+# next nightly run just includes it.
 #
-#   1) rotate           -> atomically move the day's transcript aside and print it
-#   2) (Opus summarizes, writes captains_log/<date>.md, commits + pushes to git)
-#   3) discard <date>   -> delete the staged raw transcript  (ONLY after push)
+# The nightly summarizer (Opus, fired by a Routine at 7pm MT) drives the order:
+#   1) rotate           -> freeze every camera's transcript and print them all,
+#                          each under a "===== CAMERA: <name> =====" header
+#   2) (Opus reads all of them and writes ONE combined captains_log/<date>.md,
+#       de-duping/reconstructing across cameras as it summarizes, then commits)
+#   3) discard <date>   -> delete all of that day's staged transcripts (ONLY after push)
 #
-# Rotating (not just reading) means the add-on immediately starts a fresh live
-# log, so speech during summarization isn't lost, and the day's data is frozen.
+# Rotating (truncate-in-place) means each add-on immediately keeps appending to a
+# fresh log, so speech during summarization isn't lost, and the day's data is frozen.
 set -euo pipefail
 
-LOG="${TRANSCRIPT_LOG:-/share/tea_one_transcript.log}"
+SHARE="${SHARE_DIR:-/share}"
 STAGE="${STAGE_DIR:-/share/captains_log_staging}"
 
 cmd="${1:-}"
 case "$cmd" in
   rotate)
-    mkdir -p "$STAGE"
-    d="$(date +%F)"                       # box-local date (America/Denver)
-    # Fold any already-staged content for today back in, then take the live log.
-    tmp="$STAGE/$d.log"
-    if [ -s "$LOG" ]; then
-      cat "$LOG" >> "$tmp"
-      : > "$LOG"                           # truncate in place; add-on keeps appending
-    fi
-    [ -f "$tmp" ] && cat "$tmp" || true    # emit the day's transcript to stdout
+    d="$(date +%F)"                     # box-local date (America/Denver)
+    dst="$STAGE/$d"
+    mkdir -p "$dst"
+    for L in "$SHARE"/*_transcript.log; do
+      [ -s "$L" ] || continue           # skips the literal glob when nothing matches
+      cam="$(basename "$L" _transcript.log)"
+      cat "$L" >> "$dst/$cam.log"
+      : > "$L"                          # truncate in place; add-on keeps appending
+    done
+    echo "LOGDATE=$d"
+    for f in "$dst"/*.log; do
+      [ -e "$f" ] || continue
+      echo "===== CAMERA: $(basename "$f" .log) ====="
+      cat "$f"
+    done
     ;;
   discard)
     d="${2:?usage: captains_log.sh discard <YYYY-MM-DD>}"
-    rm -f "$STAGE/$d.log"
-    echo "discarded $STAGE/$d.log"
+    rm -rf "${STAGE:?}/$d"
+    echo "discarded $STAGE/$d"
     ;;
   *)
     echo "usage: $0 {rotate|discard <YYYY-MM-DD>}" >&2

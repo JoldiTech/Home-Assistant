@@ -6,38 +6,41 @@ A daily, **de-identified** operational summary of the Tea One store audio — a
 ## How it works
 
 ```
-Local whisper (tiny.en) transcribes Tea One audio  →  /share/tea_one_transcript.log   (transient, on the HA box)
+Local whisper transcribes each camera's audio  →  /share/<camera>_transcript.log   (transient, on the HA box)
         │  once a day at 7pm MT
         ▼
-Opus reads the day's raw transcript, writes a sanitized summary here  →  captains_log/YYYY-MM-DD.md   (durable, in git)
+Opus reads EVERY camera's transcript at once, writes ONE combined summary  →  captains_log/YYYY-MM-DD.md   (durable, in git)
         │  only after the summary is committed + pushed
         ▼
-Raw transcript is deleted.
+ALL raw transcripts are deleted.
 ```
+
+Cameras are **auto-discovered**: the job globs `/share/*_transcript.log`, so
+pointing a new transcribe add-on at another camera is all it takes — the next
+nightly run includes it with zero code changes.
 
 **The split is deliberate:** the *local model* only transcribes (mechanical). The
 *judgment* — what's worth keeping and what must never be written down — is done by
 Opus at summary time. The raw, word-for-word transcript is never kept; only the
 scrubbed daily log survives.
 
-## Multi-camera fusion (planned, once all cameras transcribe)
+## Multi-camera: combining is the summary step
 
-Today only Tea One transcribes. Once every camera does (needs the GPU box), the
-summarizer is fed **all cameras' transcripts, each line tagged with its camera and
-timestamp** — and does something no local model can:
+There is **no separate "combine" stage**. Every camera's transcript is just more
+input to the one summary pass — Opus reads them all together (each under a
+`===== CAMERA: <name> =====` header, with timestamps) and, while writing the
+single day's log, naturally:
 
-- **De-duplicate across cameras.** Two cameras that overhear the *same* counter
-  conversation (both catch the "instant chai" chat within the same minute) get
-  merged into **one** event, not counted twice — using timestamp proximity plus
-  content similarity.
-- **Cross-reconstruct.** Each camera catches slightly different fragments of the
-  same speech; the summarizer stitches them into a more complete, higher-confidence
-  version than any single camera's transcript.
-- **Locate.** Which camera(s) heard it says roughly *where in the store* it
-  happened — useful context for the log.
+- **De-duplicates** — two cameras that overhear the *same* counter conversation
+  (both catch the "instant chai" chat in the same minute) become **one** event in
+  the log, not two.
+- **Cross-reconstructs** — each camera catches slightly different fragments; using
+  them together yields a more complete, higher-confidence read than any one alone
+  (the transcription is lossy, so this genuinely helps).
+- **Locates** — which cameras heard it says roughly *where in the store* it was.
 
-This is why the raw lines must keep their **camera label + timestamp**: those are
-what make fusion possible.
+That's it — no clustering pipeline, no per-camera code. Adjacent cameras (e.g.
+Tea One + Emporium Hall) overlap the most and help each other the most.
 
 ## Sanitization policy (the summarizer MUST follow this)
 
@@ -92,5 +95,6 @@ _Source: Tea One mic → local whisper (tiny.en) → summarized by Opus. Raw tra
 
 ## Retention
 
-The raw transcript is **ephemeral** — deleted each night once the day's log is
-safely in git. These dated summaries are the durable record.
+The raw transcripts are **ephemeral** — every camera's log is deleted each night
+once the day's combined summary is safely in git. These dated summaries are the
+only durable record.
