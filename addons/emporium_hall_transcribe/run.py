@@ -19,7 +19,6 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from collections import deque
 
 try:
     from zoneinfo import ZoneInfo
@@ -68,7 +67,7 @@ WORKDIR = os.path.join("/media/transcribe_tmp", CAM.replace(".", "_"))
 os.makedirs(WORKDIR, exist_ok=True)
 
 _STOP = False
-_recent = deque(maxlen=RECENT)  # rolling "HH:MM:SS | text" lines for the dashboard
+_last_size = -1  # last log size the sensor was pushed for (detects external truncation)
 
 
 def _sig(_signum, _frame):
@@ -169,56 +168,75 @@ def _is_noise(line):
 def append_log(lines):
     if not lines:
         return
-    now = _now()
-    stamp = now.strftime("%Y-%m-%d %H:%M:%S %Z")
-    hm = now.strftime("%H:%M:%S")
+    stamp = _now().strftime("%Y-%m-%d %H:%M:%S %Z")
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
     with open(LOG, "a") as f:
         for ln in lines:
             f.write("%s | %s\n" % (stamp, ln))
-            _recent.append("%s | %s" % (hm, ln))
     log("+%d line(s):" % len(lines), " / ".join(lines)[:200])
-    push_sensor(lines[-1], now)
+    push_sensor()
 
 
-def push_sensor(latest, when):
-    """Publish the rolling transcript to an HA sensor for the dashboard."""
-    if not HA_SENSOR:
-        return
-    payload = {
-        "state": latest[:250],
-        "attributes": {
-            "friendly_name": "Tea One Transcript",
-            "icon": "mdi:message-text",
-            "last_spoken": when.isoformat(timespec="seconds"),
-            "lines": list(_recent),  # newest last
-        },
-    }
+_SENSOR_NAME = (HA_SENSOR.split(".", 1)[-1].replace("_", " ").title()
+                if HA_SENSOR else "")
+
+
+def _log_size():
     try:
-        api("POST", "/states/" + HA_SENSOR, payload)
-    except urllib.error.URLError as e:
-        log("sensor push error:", e)
+        return os.path.getsize(LOG)
+    except OSError:
+        return 0
 
 
-def seed_recent():
-    """Repopulate the rolling buffer (and sensor) from the tail of the log."""
-    if not os.path.exists(LOG):
-        return
+def _read_tail(n):
+    """Last n parsed rows from the log as (full_stamp, hh_mm_ss, text)."""
     try:
         with open(LOG) as f:
-            tail = f.readlines()[-RECENT:]
+            raw = f.readlines()
     except OSError:
-        return
-    for raw in tail:
-        raw = raw.strip()
-        if " | " not in raw:
+        return []
+    rows = []
+    for line in raw:
+        line = line.strip()
+        if " | " not in line:
             continue
-        stamp, _, text = raw.partition(" | ")
-        hm = stamp.split(" ")[1] if " " in stamp else stamp  # HH:MM:SS
-        _recent.append("%s | %s" % (hm, text))
-    if _recent and HA_SENSOR:
-        last = _recent[-1].partition(" | ")[2]
-        push_sensor(last, _now())
+        stamp, _, text = line.partition(" | ")
+        parts = stamp.split(" ")
+        hm = parts[1] if len(parts) > 1 else stamp  # HH:MM:SS
+        rows.append((stamp, hm, text))
+    return rows[-n:]
+
+
+def push_sensor():
+    """Publish the CURRENT log tail to the HA sensor. The feed is a live view of
+    the file, so when the nightly job truncates the log the dashboard clears
+    itself — no restart needed."""
+    global _last_size
+    if not HA_SENSOR:
+        return
+    rows = _read_tail(RECENT)
+    if rows:
+        last_stamp, _hm, last_text = rows[-1]
+        state = last_text[:250]
+        last_spoken = last_stamp
+        lines = ["%s | %s" % (hm, text) for (_s, hm, text) in rows]
+    else:
+        state = "idle"
+        last_spoken = None
+        lines = []
+    try:
+        api("POST", "/states/" + HA_SENSOR, {
+            "state": state,
+            "attributes": {
+                "friendly_name": _SENSOR_NAME,
+                "icon": "mdi:message-text",
+                "last_spoken": last_spoken,
+                "lines": lines,  # newest last
+            },
+        })
+        _last_size = _log_size()
+    except urllib.error.URLError as e:
+        log("sensor push error:", e)
 
 
 def cleanup(mp4):
@@ -263,11 +281,11 @@ def main():
         have = os.listdir(MODEL_DIR) if os.path.isdir(MODEL_DIR) else "(no dir)"
         log("FATAL: model unavailable:", MODEL, "- dir contains:", have)
         sys.exit(1)
-    log("tea_one_transcribe up: cam=%s gate=%s model=%s seg=%ss lookback=%ss threads=%s -> %s"
+    log("transcribe up: cam=%s gate=%s model=%s seg=%ss lookback=%ss threads=%s -> %s"
         % (CAM, GATE, MODEL, SEG, LOOKBACK, THREADS, LOG))
     if HA_SENSOR:
-        log("dashboard sensor:", HA_SENSOR)
-    seed_recent()
+        log("dashboard sensor:", HA_SENSOR, "(name: %s)" % _SENSOR_NAME)
+    push_sensor()
     # clear stale temp clips left by a previous interrupted run
     for f in glob.glob(os.path.join(WORKDIR, "seg_*")):
         try:
@@ -297,6 +315,10 @@ def main():
             if was_on:
                 log("gate CLOSED -> idle")
             was_on = False
+            # If the log changed out from under us (e.g. the nightly captain's-log
+            # job truncated it), refresh so the dashboard mirrors the file.
+            if HA_SENSOR and _log_size() != _last_size:
+                push_sensor()
             time.sleep(POLL)
 
     log("stopping (signal received)")
