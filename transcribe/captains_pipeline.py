@@ -267,8 +267,9 @@ Also FIX garbled product names from the lossy mic: if a "product" is not a
 plausible real tea/herb/ingredient/flavor (e.g. "cold bread cookies", "mullet
 tea", "banana teas", a random phrase), delete just that item
 from its bullet - do not list it. Keep genuine but unusual products (honey bush,
-rooibos, Russian Caravan, Tulsi, cactus nectar). When unsure whether a tea is
-real, drop it - unless it is one of the named genuine products above.
+rooibos, Russian Caravan, Tulsi, cactus nectar, rainbow splint). When unsure
+whether a tea is real, drop it - unless it is one of the named genuine products
+above.
 
 Keep everything operational (teas, orders, payment/equipment issues, traffic).
 Do not add commentary. Output ONLY the cleaned markdown log. /no_think"""
