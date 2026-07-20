@@ -322,6 +322,48 @@ truth is `addons/tea_one_transcribe/` in this repo; it's deployed to
   rejected for missing required keys). There is no `ha apps options` subcommand.
 - **CLI note:** `ha addons` is deprecated in favor of `ha apps` on this box.
 
+### Ephemeral image generation (AI box)
+
+A minimal, single-purpose SDXL image generator runs on the **AI box**, public at
+`https://aibox.nmteaco.com`. Source of truth is `imagegen/` in this repo; deployed
+to `~/imagegen/` on the AI box and run as the `imagegen.service` systemd unit
+(`~/imagegen-env` venv). Checkpoint: JuggernautXL Ragnarok (SDXL), loaded via
+`diffusers.StableDiffusionXLPipeline.from_single_file` at
+`~/imagegen/models/juggernautXL_ragnarok.safetensors` (not in git — 6.6 GB;
+re-download from Civitai if the box is rebuilt).
+
+**Deliberately stateless — do not add persistence.** Nothing is ever written to
+disk: generated PNGs exist only as in-memory bytes for the life of one request,
+embedded as a base64 `data:` URI directly in the HTML response. No database, no
+history, no login username — a single shared password gates the whole app. Every
+`GET /` is a blank form; there is nothing to page through or resume.
+
+- **Auth:** one password (`IMAGEGEN_PASSWORD` in `/etc/nmteaco/imagegen.env`,
+  mode 600 root:root — same pattern as `protect.env`), compared with
+  `hmac.compare_digest`. Session tokens are a plain in-process dict (dies on
+  restart) — no persistent session store. Login attempts are rate-limited
+  per-IP (5 / 15 min), keyed off `CF-Connecting-IP` since real traffic arrives
+  via the Cloudflare Tunnel on loopback.
+- **Network:** app binds `127.0.0.1:8189` only — never reachable except through
+  `cloudflared` on the same box. Public hostname `aibox.nmteaco.com` → tunnel →
+  `localhost:8189` is configured in the Cloudflare **dashboard** (this tunnel is
+  remotely-managed — no local `config.yml` — so hostname/ingress changes happen
+  in Zero Trust → Networks → Tunnels, not on the box). A Cloudflare **Cache
+  Rule** (`Hostname equals aibox.nmteaco.com` → Bypass cache) forces the edge to
+  never cache a response, on top of the app's own `Cache-Control: no-store` and
+  the fact that `/generate` is a POST (Cloudflare never caches POST by default).
+- **VRAM:** 6 GB card (RTX 2060) — `enable_model_cpu_offload()` +
+  `pipe.vae.enable_slicing()` are required, not optional; without them SDXL at
+  1024×1024 does not fit. VRAM returns to ~150 MB idle between generations
+  (offload releases it each time), at the cost of ~30s/image versus a
+  higher-VRAM card that could keep weights resident.
+- **Manage:** `sudo systemctl {status,restart,stop} imagegen.service`,
+  `sudo journalctl -u imagegen.service -f`. The unit is hardened
+  (`ProtectSystem=strict`, `NoNewPrivileges=yes`, no `ReadWritePaths` except the
+  Hugging Face scaffolding cache) — GPU access requires `PrivateDevices=no`.
+- **Password rotation:** edit `/etc/nmteaco/imagegen.env` on the box, then
+  `sudo systemctl restart imagegen.service`. Never commit it.
+
 ### Repo conventions
 
 - Scripts live in `scripts/`, are standard-library-only Python 3, and read

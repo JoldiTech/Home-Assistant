@@ -1,0 +1,34 @@
+[Unit]
+Description=Ephemeral local image generation (JuggernautXL Ragnarok)
+After=network.target
+
+[Service]
+Type=simple
+User=nmteaco
+Group=nmteaco
+WorkingDirectory=/home/nmteaco/imagegen
+EnvironmentFile=/etc/nmteaco/imagegen.env
+Environment=MODEL_PATH=/home/nmteaco/imagegen/models/juggernautXL_ragnarok.safetensors
+Environment=PORT=8189
+ExecStart=/home/nmteaco/imagegen-env/bin/python /home/nmteaco/imagegen/app.py
+Restart=on-failure
+RestartSec=5
+
+# --- Hardening ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# Model + huggingface cache dirs need write access for the cache only -
+# no generated image or prompt content ever lands on disk.
+ReadWritePaths=/home/nmteaco/.cache/huggingface
+PrivateTmp=yes
+PrivateDevices=no
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
