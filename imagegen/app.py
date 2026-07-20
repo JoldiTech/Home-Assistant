@@ -450,6 +450,35 @@ def _run_llm(history: list[dict]) -> str:
     return completion["choices"][0]["message"]["content"].strip()
 
 
+def _build_image_prompt(message: str, reply: str) -> str:
+    """Turn the actual exchange into an image prompt: a visual scene drawn from
+    what BOTH sides said, wearing the configured 'look'. Runs in the background
+    image job (latency hidden behind the sidebar shimmer), so the extra LLM call
+    is free UX-wise. Kept short so it fits under CLIP's 77-token limit and the
+    scene isn't truncated away (that truncation was why images used to reflect
+    only the look, not the conversation)."""
+    appearance = _prompts["image_prompt_prefix"]
+    instr = [
+        {
+            "role": "system",
+            "content": (
+                "You write ONE short prompt for an image generator. Given a chat "
+                f"exchange, output a single vivid visual description (max 25 words) of "
+                f"a photograph of {appearance}, in a setting / pose / outfit / mood that "
+                "fits what was just said. Depict the scene the exchange implies. Output "
+                "ONLY the description — no preamble, no quotes, no lists."
+            ),
+        },
+        {"role": "user", "content": f"I said: {message}\nYou replied: {reply}"},
+    ]
+    with _llm_lock:
+        c = llm.create_chat_completion(messages=instr, max_tokens=64)
+    scene = c["choices"][0]["message"]["content"].strip().replace("\n", " ").strip('"')
+    # Lead with the look (consistent identity), then the conversation-derived
+    # scene; cap length so CLIP doesn't truncate the scene.
+    return f"{appearance}. {scene}"[:240]
+
+
 def _run_image(prompt: str) -> str:
     with _gpu_lock:
         image = image_pipe(
@@ -514,11 +543,9 @@ async def chat_images(request: Request):
     # background and the client polls /api/image-status for it. Doing both
     # in one request risks exceeding Cloudflare's ~100s origin timeout
     # (LLM CPU inference + ~30s SDXL can add up), and the reply shouldn't
-    # wait on the image anyway.
-    # Every image depicts Chloe herself, consistently, as though she's the
-    # one sending it - not an unrelated scene derived from the topic.
-    context = f"{message}. {reply}"[:300]
-    image_prompt = f"{_prompts['image_prompt_prefix']}, {context}"
+    # wait on the image anyway. The image depicts the assistant (consistent
+    # look) in a scene drawn from THIS exchange - both what the user said and
+    # what she replied - built by _build_image_prompt inside the job.
     job_id = secrets.token_urlsafe(8)
     jobs = mode_state["jobs"]
     jobs[job_id] = {"status": "pending", "image": None}
@@ -527,6 +554,7 @@ async def chat_images(request: Request):
 
     def _generate_and_store():
         try:
+            image_prompt = _build_image_prompt(message, reply)
             image_b64 = _run_image(image_prompt)
             with _state_lock:
                 jobs[job_id] = {"status": "done", "image": image_b64}
