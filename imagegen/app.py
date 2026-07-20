@@ -38,14 +38,13 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 import logging
-import queue
 import warnings
 
 import torch
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from diffusers import AutoencoderTiny, DPMSolverMultistepScheduler, StableDiffusionXLPipeline
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from llama_cpp import Llama
 
@@ -461,24 +460,27 @@ async def get_state(request: Request):
     )
 
 
-def _run_llm_stream(history: list[dict], q: "queue.Queue"):
-    """Generate the reply token-by-token, pushing each delta onto q. A None
-    sentinel marks completion. Holds _llm_lock for the whole generation (CPU),
-    which is independent of _gpu_lock, so an image can render on the GPU at the
-    same time."""
+def _run_llm(history: list[dict]) -> str:
+    """Non-streaming generation. llama.cpp's chat handler cleanly returns the
+    final answer for this model, parsing out its internal 'thinking' channel.
+    (Token streaming was tried but exposed that model's raw <|channel|> control
+    tokens - which loop on some inputs - so it was reverted; re-enabling it
+    needs channel-aware stream parsing specific to this checkpoint.)
+
+    Sampling is set explicitly: llama.cpp's default temperature (0.2) is too
+    greedy for this abliterated model and drives it into repetition loops
+    (it latches onto a phrase and repeats forever). A higher temperature plus a
+    repetition penalty keeps replies varied and loop-free."""
     messages = [{"role": "system", "content": _prompts["system_prompt"]}, *history]
-    try:
-        with _llm_lock:
-            for chunk in llm.create_chat_completion(
-                messages=messages, max_tokens=LLM_MAX_TOKENS, stream=True
-            ):
-                delta = chunk["choices"][0]["delta"].get("content", "")
-                if delta:
-                    q.put(delta)
-    except Exception as e:
-        q.put(f"\n[error: {e}]")
-    finally:
-        q.put(None)
+    with _llm_lock:
+        completion = llm.create_chat_completion(
+            messages=messages,
+            max_tokens=LLM_MAX_TOKENS,
+            temperature=0.75,
+            top_p=0.9,
+            repeat_penalty=1.18,
+        )
+    return completion["choices"][0]["message"]["content"].strip()
 
 
 def _build_image_prompt_from_message(message: str) -> str:
@@ -490,37 +492,6 @@ def _build_image_prompt_from_message(message: str) -> str:
     appearance = _prompts["image_prompt_prefix"]
     scene = message.strip().replace("\n", " ")[:180]
     return f"{appearance}. {scene}"[:240]
-
-
-def _stream_reply(history, mode_state, image_job=None):
-    """Shared streaming body for /api/chat and /api/chat-images. Kicks the LLM
-    generator onto the LLM executor, then async-drains its queue, encrypting
-    each delta. If image_job is given (job_id, prompt), fires the image onto the
-    GPU executor FIRST so it runs concurrently with the reply."""
-    loop = asyncio.get_event_loop()
-    if image_job is not None:
-        job_id, image_prompt = image_job
-        loop.run_in_executor(_gpu_executor, _run_image_job, job_id, image_prompt, mode_state)
-
-    q: "queue.Queue" = queue.Queue()
-    loop.run_in_executor(_llm_executor, _run_llm_stream, history[-MAX_HISTORY:], q)
-
-    async def gen():
-        if image_job is not None:
-            yield json.dumps(_encrypt({"job_id": image_job[0]})) + "\n"
-        parts = []
-        while True:
-            delta = await loop.run_in_executor(None, q.get)
-            if delta is None:
-                break
-            parts.append(delta)
-            yield json.dumps(_encrypt({"delta": delta})) + "\n"
-        full = "".join(parts).strip()
-        history.append({"role": "assistant", "content": full})
-        del history[:-MAX_HISTORY]
-        yield json.dumps(_encrypt({"done": True})) + "\n"
-
-    return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
 def _run_image(prompt: str) -> str:
@@ -572,7 +543,10 @@ async def chat(request: Request):
 
     history = state["chat"]["history"]
     history.append({"role": "user", "content": message})
-    return _stream_reply(history, state["chat"])
+    reply = await asyncio.get_event_loop().run_in_executor(_llm_executor, _run_llm, history[-MAX_HISTORY:])
+    history.append({"role": "assistant", "content": reply})
+    del history[:-MAX_HISTORY]
+    return JSONResponse(_encrypt({"reply": reply}))
 
 
 @app.post("/api/chat-images")
@@ -592,19 +566,24 @@ async def chat_images(request: Request):
     history = mode_state["history"]
     history.append({"role": "user", "content": message})
 
-    # Kick the image off the USER's message so it can render on the GPU in
-    # PARALLEL with the reply streaming on the CPU. The image reflects what the
-    # user said (the reply doesn't exist yet when the image starts - that's the
-    # cost of true parallelism). _stream_reply fires the image job first, then
-    # streams the reply; the client starts polling image-status on the job_id
-    # it receives as the first stream line.
+    # Kick the image off the USER's message FIRST, so it renders on the GPU in
+    # PARALLEL with the reply generating on the CPU (different hardware, genuine
+    # overlap). The image reflects what the user said - the reply doesn't exist
+    # yet when the image starts, which is the inherent cost of parallelism. The
+    # client polls /api/image-status on the returned job_id.
     job_id = secrets.token_urlsafe(8)
     jobs = mode_state["jobs"]
     jobs[job_id] = {"status": "pending", "image": None}
     for old_id in list(jobs)[:-10]:
         del jobs[old_id]
     image_prompt = _build_image_prompt_from_message(message)
-    return _stream_reply(history, mode_state, image_job=(job_id, image_prompt))
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(_gpu_executor, _run_image_job, job_id, image_prompt, mode_state)
+
+    reply = await loop.run_in_executor(_llm_executor, _run_llm, history[-MAX_HISTORY:])
+    history.append({"role": "assistant", "content": reply})
+    del history[:-MAX_HISTORY]
+    return JSONResponse(_encrypt({"reply": reply, "job_id": job_id}))
 
 
 @app.post("/api/image-status")
