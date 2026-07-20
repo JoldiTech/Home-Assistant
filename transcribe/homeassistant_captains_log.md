@@ -14,7 +14,7 @@ Cloudflare. Replace the host with the AI box's LAN IP, and put the shared secret
 ```yaml
 rest_command:
   captains_log_run:
-    url: "http://<AIBOX_LAN_IP>:8190/run"
+    url: "http://192.168.22.6:8190/run"   # AI box LAN IP
     method: POST
     headers:
       X-Trigger-Token: !secret aibox_trigger_token
