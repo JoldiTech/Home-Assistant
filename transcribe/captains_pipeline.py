@@ -22,6 +22,7 @@ The transcription half is delegated to transcribe_day.py (which loads and frees
 large-v3 in its own process, so the GPU is clear before the summarizer loads).
 """
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -35,7 +36,7 @@ HERE = Path(__file__).resolve().parent
 TRANSCRIBE_SCRIPT = HERE / "transcribe_day.py"
 
 SUMMARIZER_MODEL = os.environ.get(
-    "SUMMARIZER_MODEL", os.path.expanduser("~/transcribe/models/Qwen2.5-7B-Instruct-Q4_K_M.gguf")
+    "SUMMARIZER_MODEL", os.path.expanduser("~/transcribe/models/Qwen3-8B-Q4_K_M.gguf")
 )
 # Summarizer runs AFTER transcription (whose subprocess has exited and freed the
 # GPU), so it can use the GPU - ~10x faster than CPU. Needs a CUDA-enabled
@@ -63,19 +64,35 @@ INCLUDE (de-identified, aggregate):
   mentions, equipment problems, notable large/curbside/wholesale orders (amounts ok).
 - Staff-surfaced business observations. Anything actionable for running the shop.
 
-NEVER write:
+NEVER write (this is the whole point - be strict):
 - Names of customers or staff, or anything identifying a specific person.
 - Contact info (phone, email, address).
 - Health/medical details tied to an individual. You MAY note "a wellness-tea
   consultation occurred" in the aggregate - never the person or their specifics.
-- Personal-life specifics (relationships, travel, family, religion, politics).
+- ANY personal-life content overheard on the floor that is not about running the
+  tea shop. Drop it entirely - do NOT summarize it. This includes: someone's
+  schooling or college, jobs/side-businesses (e.g. solar sales), hobbies, art
+  fairs, museum or travel mentions, family, relationships, religion, politics,
+  people's personal struggles or feelings, and small talk. If a line is a person
+  talking about their own life rather than a shop transaction, it does not belong
+  in the log.
 - Verbatim quotes that could identify someone. Gossip or interpersonal conflict.
+
+EXAMPLES of what to DROP (never include lines like these):
+- "Personal struggles with college shared by a staff member"
+- "Museum visit / art fair / travel conversation by a customer"
+- "Discussion on solar panel sales tactics"
+- "Staff member's feelings about workload"
 
 RULES:
 - When in doubt, leave it out. A shorter, safer log beats an oversharing one.
-- Transcription is lossy (camera mic) - flag uncertain items as "possible" and
-  never assert shaky specifics as fact.
-- Output ONLY the markdown log in the exact format given. No preamble."""
+- Transcription is lossy (camera mic). If a phrase looks like garbled audio
+  (e.g. "breakfast assaulting piece"), do NOT invent a product from it - drop it.
+  Flag genuinely uncertain items as "possible"; never assert shaky specifics.
+- Keep it operational: teas, categories, orders, payment/equipment issues,
+  traffic. Merge duplicates - one bullet per real event, not several.
+- Output ONLY the markdown log in the exact format given. No preamble, no
+  <think> tags, no reasoning - just the log. /no_think"""
 
 USER_TEMPLATE = """Write the Captain's Log for {weekday} {date} from this Tea One \
 transcript (timestamp | text lines). Combine and de-identify per policy.
@@ -194,6 +211,29 @@ def _chunk_by_tokens(llm, text: str, budget: int) -> list[str]:
     return chunks
 
 
+def _strip_think(text: str) -> str:
+    """Qwen3 emits <think>...</think> reasoning by default. Even with /no_think we
+    strip it defensively so raw reasoning tokens never reach the log."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    return text.replace("<think>", "").replace("</think>", "").strip()
+
+
+REDACT_SYSTEM = """You are a privacy redactor for a tea shop's operational log. \
+You are given a draft Captain's Log. Return it UNCHANGED except remove any line \
+that violates the policy, then output the cleaned log in the same format.
+
+REMOVE any bullet that contains:
+- a person's name, or anything identifying an individual;
+- personal-life content not about running the shop (schooling/college, jobs or
+  side-businesses like solar sales, hobbies, art fairs, museums, travel, family,
+  relationships, religion, politics, someone's feelings/struggles, small talk);
+- health/medical details tied to a person;
+- something that reads like garbled audio rather than a real shop event.
+
+Keep everything operational (teas, orders, payment/equipment issues, traffic).
+Do not add commentary. Output ONLY the cleaned markdown log. /no_think"""
+
+
 def _summarize(transcript: str, day: datetime) -> str:
     print("[pipeline] loading summarizer...", file=sys.stderr, flush=True)
     llm = Llama(model_path=SUMMARIZER_MODEL, n_ctx=SUMMARIZER_CTX, n_threads=8,
@@ -202,33 +242,33 @@ def _summarize(transcript: str, day: datetime) -> str:
     compact = _compact_transcript(transcript)
     INPUT_BUDGET = SUMMARIZER_CTX - 2600  # leave room for system + template + output
 
-    def _final(body_field, body):
-        user = (USER_TEMPLATE if body_field == "transcript" else FINAL_FROM_NOTES).format(
-            weekday=wk, date=ds, **{body_field: body}
-        )
+    def _gen(system, user, max_tokens):
         out = llm.create_chat_completion(
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}],
-            max_tokens=1200, temperature=0.3, top_p=0.9, repeat_penalty=1.1,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            max_tokens=max_tokens, temperature=0.3, top_p=0.9, repeat_penalty=1.1,
         )
-        return out["choices"][0]["message"]["content"].strip()
+        return _strip_think(out["choices"][0]["message"]["content"])
+
+    def _final(body_field, body):
+        tmpl = USER_TEMPLATE if body_field == "transcript" else FINAL_FROM_NOTES
+        return _gen(SYSTEM_PROMPT, tmpl.format(weekday=wk, date=ds, **{body_field: body}), 1200)
 
     if len(llm.tokenize(compact.encode(), add_bos=False)) <= INPUT_BUDGET:
-        return _final("transcript", compact)
+        draft = _final("transcript", compact)
+    else:
+        # Long day: chunk -> de-identified notes per slice -> merge into the log.
+        chunks = _chunk_by_tokens(llm, compact, INPUT_BUDGET)
+        print(f"[pipeline] long day: {len(chunks)} slices -> notes -> final", file=sys.stderr, flush=True)
+        notes = [
+            _gen(NOTES_SYSTEM, NOTES_TEMPLATE.format(i=i, n=len(chunks), chunk=ch), 500)
+            for i, ch in enumerate(chunks, 1)
+        ]
+        draft = _final("notes", "\n".join(notes))
 
-    # Long day: chunk -> de-identified notes per slice -> merge into the log.
-    chunks = _chunk_by_tokens(llm, compact, INPUT_BUDGET)
-    print(f"[pipeline] long day: {len(chunks)} slices -> notes -> final", file=sys.stderr, flush=True)
-    notes = []
-    for i, ch in enumerate(chunks, 1):
-        out = llm.create_chat_completion(
-            messages=[
-                {"role": "system", "content": NOTES_SYSTEM},
-                {"role": "user", "content": NOTES_TEMPLATE.format(i=i, n=len(chunks), chunk=ch)},
-            ],
-            max_tokens=500, temperature=0.3, top_p=0.9, repeat_penalty=1.1,
-        )
-        notes.append(out["choices"][0]["message"]["content"].strip())
-    return _final("notes", "\n".join(notes))
+    # Second, independent redaction pass: re-read the draft ONLY to strip anything
+    # personal/identifying/garbled that slipped through. Cheap on GPU (~seconds).
+    print("[pipeline] redaction pass...", file=sys.stderr, flush=True)
+    return _gen(REDACT_SYSTEM, f"Draft to clean:\n\n{draft}", 1200)
 
 
 def _git(*args, check=True):

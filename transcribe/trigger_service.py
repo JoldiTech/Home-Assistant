@@ -11,6 +11,7 @@ Secret from /etc/nmteaco/captains.env (mode 600):
   TRIGGER_TOKEN   shared secret; HA sends it as the X-Trigger-Token header
 Bind host/port default to 0.0.0.0:8190 (override with TRIGGER_HOST/TRIGGER_PORT).
 """
+import glob
 import hmac
 import os
 import subprocess
@@ -19,6 +20,13 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+# The CUDA-enabled llama-cpp-python needs the CUDA runtime libs (cublas, etc.)
+# that ship with torch's nvidia-* packages in the venv. Put them on
+# LD_LIBRARY_PATH for the pipeline subprocess so the summarizer loads on GPU.
+_NVIDIA_LIBS = ":".join(
+    glob.glob(os.path.expanduser("~/transcribe-env/lib/python*/site-packages/nvidia/*/lib"))
+)
 
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse
@@ -48,7 +56,10 @@ def _run_pipeline(date_str: str):
         print("[trigger] pipeline already running; ignoring", file=sys.stderr, flush=True)
         return
     try:
-        subprocess.run([sys.executable, str(PIPELINE), date_str])
+        env = {**os.environ}
+        if _NVIDIA_LIBS:
+            env["LD_LIBRARY_PATH"] = _NVIDIA_LIBS + ":" + env.get("LD_LIBRARY_PATH", "")
+        subprocess.run([sys.executable, str(PIPELINE), date_str], env=env)
     finally:
         _run_lock.release()
 
