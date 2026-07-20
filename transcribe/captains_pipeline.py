@@ -44,7 +44,9 @@ SUMMARIZER_MODEL = os.environ.get(
 # modest context (KV cache grows with n_ctx), so cap at 8k and let the
 # hierarchical chunker feed it smaller slices. Both are env-overridable; set
 # SUMMARIZER_GPU_LAYERS=0 to fall back to CPU (slower but no CUDA build needed).
-SUMMARIZER_GPU_LAYERS = int(os.environ.get("SUMMARIZER_GPU_LAYERS", "-1"))  # -1 = all layers
+# 30 fits Qwen3-8B on the 6GB card (full offload OOMs); it also fully offloads
+# the smaller 7B (which has fewer layers). Env-overridable; 0 forces CPU.
+SUMMARIZER_GPU_LAYERS = int(os.environ.get("SUMMARIZER_GPU_LAYERS", "30"))
 SUMMARIZER_CTX = int(os.environ.get("SUMMARIZER_CTX", "8192"))
 
 DEFAULT_REPO = "JoldiTech/Home-Assistant"
@@ -236,8 +238,20 @@ Do not add commentary. Output ONLY the cleaned markdown log. /no_think"""
 
 def _summarize(transcript: str, day: datetime) -> str:
     print("[pipeline] loading summarizer...", file=sys.stderr, flush=True)
-    llm = Llama(model_path=SUMMARIZER_MODEL, n_ctx=SUMMARIZER_CTX, n_threads=8,
-                n_gpu_layers=SUMMARIZER_GPU_LAYERS, verbose=False)
+    # Load with a fallback chain: the configured layer count, then fewer, then
+    # CPU. Covers the edge case where Chloe's image tool is holding VRAM at run
+    # time - the summary still completes (slower) instead of failing the job.
+    llm = None
+    for layers in [SUMMARIZER_GPU_LAYERS, 20, 0]:
+        try:
+            llm = Llama(model_path=SUMMARIZER_MODEL, n_ctx=SUMMARIZER_CTX, n_threads=8,
+                        n_gpu_layers=layers, verbose=False)
+            break
+        except Exception as e:
+            print(f"[pipeline] load with {layers} GPU layers failed ({e}); trying fewer",
+                  file=sys.stderr, flush=True)
+    if llm is None:
+        raise RuntimeError("summarizer failed to load on GPU and CPU")
     wk, ds = day.strftime("%A"), day.strftime("%Y-%m-%d")
     compact = _compact_transcript(transcript)
     INPUT_BUDGET = SUMMARIZER_CTX - 2600  # leave room for system + template + output
