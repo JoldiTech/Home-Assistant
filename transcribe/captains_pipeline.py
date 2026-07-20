@@ -88,11 +88,15 @@ EXAMPLES of what to DROP (never include lines like these):
 
 RULES:
 - When in doubt, leave it out. A shorter, safer log beats an oversharing one.
-- Transcription is lossy (camera mic). If a phrase looks like garbled audio
-  (e.g. "breakfast assaulting piece"), do NOT invent a product from it - drop it.
-  Flag genuinely uncertain items as "possible"; never assert shaky specifics.
-- Keep it operational: teas, categories, orders, payment/equipment issues,
-  traffic. Merge duplicates - one bullet per real event, not several.
+- Transcription is lossy (camera mic). Only list a product if it is a plausible
+  real tea / herb / ingredient / blend. If a name looks garbled or nonsensical
+  (e.g. "breakfast assaulting piece", "acrimon teat", "blue oasis", a random
+  word), DROP it - never guess or list it. A missing item beats a made-up one.
+- In "Notable / follow-ups", lead with the SINGLE most important actionable
+  item, stated specifically - especially any cash / payment / order discrepancy,
+  with its amount and what to reconcile. Then the rest. Merge duplicates into
+  one bullet per real event, not several.
+- Keep it operational: teas, categories, orders, payment/equipment issues, traffic.
 - Output ONLY the markdown log in the exact format given. No preamble, no
   <think> tags, no reasoning - just the log. /no_think"""
 
@@ -116,6 +120,10 @@ Use EXACTLY this format:
 - …
 
 _Source: Tea One mic → UniFi Protect → faster-whisper large-v3 (GPU) → de-identified by a local instruct model on the AI box. Raw transcript discarded after this log was written._
+
+The FIRST speech was captured at {first_ts} and the LAST at {last_ts}. Use these
+as the real "Hours active" (do NOT invent a wider window). Describe traffic
+relative to the [HH:00] time markers in the transcript.
 
 TRANSCRIPT:
 {transcript}"""
@@ -175,8 +183,31 @@ per policy into ONE log in EXACTLY this format:
 
 _Source: Tea One mic → UniFi Protect → faster-whisper large-v3 (GPU) → de-identified by a local instruct model on the AI box. Raw transcript discarded after this log was written._
 
+The FIRST speech was captured at {first_ts} and the LAST at {last_ts}. Use these
+as the real "Hours active" (do NOT invent a wider window).
+
 NOTES:
 {notes}"""
+
+
+def _active_window(transcript: str) -> tuple[str, str]:
+    """First and last speech timestamps as 12h am/pm, so the summary reports the
+    REAL active hours instead of inventing a window from the [HH:00] markers."""
+    lines = [l for l in transcript.splitlines() if "|" in l]
+    if not lines:
+        return "unknown", "unknown"
+
+    def ampm(line):
+        ts = line.split("|", 1)[0].strip().split()  # ["2026-07-19","09:39:54","MDT"]
+        if len(ts) < 2 or ":" not in ts[1]:
+            return "unknown"
+        h, m, *_ = ts[1].split(":")
+        h = int(h)
+        ap = "am" if h < 12 else "pm"
+        h12 = h % 12 or 12
+        return f"{h12}:{m} {ap}"
+
+    return ampm(lines[0]), ampm(lines[-1])
 
 
 def _compact_transcript(transcript: str) -> str:
@@ -253,6 +284,7 @@ def _summarize(transcript: str, day: datetime) -> str:
     if llm is None:
         raise RuntimeError("summarizer failed to load on GPU and CPU")
     wk, ds = day.strftime("%A"), day.strftime("%Y-%m-%d")
+    first_ts, last_ts = _active_window(transcript)
     compact = _compact_transcript(transcript)
     INPUT_BUDGET = SUMMARIZER_CTX - 2600  # leave room for system + template + output
 
@@ -265,7 +297,8 @@ def _summarize(transcript: str, day: datetime) -> str:
 
     def _final(body_field, body):
         tmpl = USER_TEMPLATE if body_field == "transcript" else FINAL_FROM_NOTES
-        return _gen(SYSTEM_PROMPT, tmpl.format(weekday=wk, date=ds, **{body_field: body}), 1200)
+        return _gen(SYSTEM_PROMPT, tmpl.format(
+            weekday=wk, date=ds, first_ts=first_ts, last_ts=last_ts, **{body_field: body}), 1200)
 
     if len(llm.tokenize(compact.encode(), add_bos=False)) <= INPUT_BUDGET:
         draft = _final("transcript", compact)
