@@ -38,13 +38,14 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 import logging
+import queue
 import warnings
 
 import torch
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from diffusers import StableDiffusionXLPipeline
+from diffusers import AutoencoderTiny, DPMSolverMultistepScheduler, StableDiffusionXLPipeline
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from llama_cpp import Llama
 
@@ -98,7 +99,7 @@ MAX_HISTORY = 40  # messages kept per conversation, oldest dropped past this
 MAX_GALLERY = 30  # images kept per conversation-with-images session
 MIN_PASSWORD_LEN = 8
 
-IMG_STEPS = 32
+IMG_STEPS = 24  # DPM++ 2M Karras converges well here (was 32 w/ default scheduler)
 IMG_GUIDANCE = 6.0
 IMG_SIZE = 1024
 LLM_MAX_TOKENS = 512
@@ -269,14 +270,31 @@ SECURITY_HEADERS = {
 }
 
 
-@app.middleware("http")
-async def add_security_headers(request: Request, call_next):
-    response = await call_next(request)
-    for k, v in SECURITY_HEADERS.items():
-        response.headers[k] = v
-    return response
+class SecurityHeadersMiddleware:
+    """Pure-ASGI header injector. Deliberately NOT @app.middleware('http')
+    (Starlette's BaseHTTPMiddleware), which buffers the whole response body and
+    would break token streaming - it injects headers at response-start and
+    passes the streamed body chunks straight through."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                headers = message.setdefault("headers", [])
+                for k, v in SECURITY_HEADERS.items():
+                    headers.append((k.encode(), v.encode()))
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
 
 
+app.add_middleware(SecurityHeadersMiddleware)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
@@ -443,40 +461,66 @@ async def get_state(request: Request):
     )
 
 
-def _run_llm(history: list[dict]) -> str:
+def _run_llm_stream(history: list[dict], q: "queue.Queue"):
+    """Generate the reply token-by-token, pushing each delta onto q. A None
+    sentinel marks completion. Holds _llm_lock for the whole generation (CPU),
+    which is independent of _gpu_lock, so an image can render on the GPU at the
+    same time."""
     messages = [{"role": "system", "content": _prompts["system_prompt"]}, *history]
-    with _llm_lock:
-        completion = llm.create_chat_completion(messages=messages, max_tokens=LLM_MAX_TOKENS)
-    return completion["choices"][0]["message"]["content"].strip()
+    try:
+        with _llm_lock:
+            for chunk in llm.create_chat_completion(
+                messages=messages, max_tokens=LLM_MAX_TOKENS, stream=True
+            ):
+                delta = chunk["choices"][0]["delta"].get("content", "")
+                if delta:
+                    q.put(delta)
+    except Exception as e:
+        q.put(f"\n[error: {e}]")
+    finally:
+        q.put(None)
 
 
-def _build_image_prompt(message: str, reply: str) -> str:
-    """Turn the actual exchange into an image prompt: a visual scene drawn from
-    what BOTH sides said, wearing the configured 'look'. Runs in the background
-    image job (latency hidden behind the sidebar shimmer), so the extra LLM call
-    is free UX-wise. Kept short so it fits under CLIP's 77-token limit and the
-    scene isn't truncated away (that truncation was why images used to reflect
-    only the look, not the conversation)."""
+def _build_image_prompt_from_message(message: str) -> str:
+    """Image prompt from what the USER just said (no LLM call), so image
+    generation can start immediately and run on the GPU in parallel with the
+    reply on the CPU. No LLM here on purpose - an LLM call would contend with
+    the reply on the single LLM thread and re-serialize the two. Lead with the
+    configured look, then the user's line as the scene; cap under CLIP's limit."""
     appearance = _prompts["image_prompt_prefix"]
-    instr = [
-        {
-            "role": "system",
-            "content": (
-                "You write ONE short prompt for an image generator. Given a chat "
-                f"exchange, output a single vivid visual description (max 25 words) of "
-                f"a photograph of {appearance}, in a setting / pose / outfit / mood that "
-                "fits what was just said. Depict the scene the exchange implies. Output "
-                "ONLY the description — no preamble, no quotes, no lists."
-            ),
-        },
-        {"role": "user", "content": f"I said: {message}\nYou replied: {reply}"},
-    ]
-    with _llm_lock:
-        c = llm.create_chat_completion(messages=instr, max_tokens=64)
-    scene = c["choices"][0]["message"]["content"].strip().replace("\n", " ").strip('"')
-    # Lead with the look (consistent identity), then the conversation-derived
-    # scene; cap length so CLIP doesn't truncate the scene.
+    scene = message.strip().replace("\n", " ")[:180]
     return f"{appearance}. {scene}"[:240]
+
+
+def _stream_reply(history, mode_state, image_job=None):
+    """Shared streaming body for /api/chat and /api/chat-images. Kicks the LLM
+    generator onto the LLM executor, then async-drains its queue, encrypting
+    each delta. If image_job is given (job_id, prompt), fires the image onto the
+    GPU executor FIRST so it runs concurrently with the reply."""
+    loop = asyncio.get_event_loop()
+    if image_job is not None:
+        job_id, image_prompt = image_job
+        loop.run_in_executor(_gpu_executor, _run_image_job, job_id, image_prompt, mode_state)
+
+    q: "queue.Queue" = queue.Queue()
+    loop.run_in_executor(_llm_executor, _run_llm_stream, history[-MAX_HISTORY:], q)
+
+    async def gen():
+        if image_job is not None:
+            yield json.dumps(_encrypt({"job_id": image_job[0]})) + "\n"
+        parts = []
+        while True:
+            delta = await loop.run_in_executor(None, q.get)
+            if delta is None:
+                break
+            parts.append(delta)
+            yield json.dumps(_encrypt({"delta": delta})) + "\n"
+        full = "".join(parts).strip()
+        history.append({"role": "assistant", "content": full})
+        del history[:-MAX_HISTORY]
+        yield json.dumps(_encrypt({"done": True})) + "\n"
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
 def _run_image(prompt: str) -> str:
@@ -497,6 +541,22 @@ def _run_image(prompt: str) -> str:
     return result
 
 
+def _run_image_job(job_id: str, prompt: str, mode_state: dict):
+    """Generate an image and store it into mode_state['jobs'][job_id] + gallery.
+    Runs on the GPU executor; the client polls /api/image-status for it."""
+    jobs = mode_state["jobs"]
+    try:
+        image_b64 = _run_image(prompt)
+        with _state_lock:
+            jobs[job_id] = {"status": "done", "image": image_b64}
+            gallery = mode_state["gallery"]
+            gallery.append(image_b64)
+            del gallery[:-MAX_GALLERY]
+    except Exception:
+        with _state_lock:
+            jobs[job_id] = {"status": "error", "image": None}
+
+
 @app.post("/api/chat")
 async def chat(request: Request):
     result = _require_session(request)
@@ -512,11 +572,7 @@ async def chat(request: Request):
 
     history = state["chat"]["history"]
     history.append({"role": "user", "content": message})
-    reply = await asyncio.get_event_loop().run_in_executor(_llm_executor, _run_llm, history[-MAX_HISTORY:])
-    history.append({"role": "assistant", "content": reply})
-    del history[:-MAX_HISTORY]
-
-    return JSONResponse(_encrypt({"reply": reply}))
+    return _stream_reply(history, state["chat"])
 
 
 @app.post("/api/chat-images")
@@ -535,45 +591,20 @@ async def chat_images(request: Request):
     mode_state = state["chat_images"]
     history = mode_state["history"]
     history.append({"role": "user", "content": message})
-    reply = await asyncio.get_event_loop().run_in_executor(_llm_executor, _run_llm, history[-MAX_HISTORY:])
-    history.append({"role": "assistant", "content": reply})
-    del history[:-MAX_HISTORY]
 
-    # Image generation is deliberately NOT awaited here - it runs in the
-    # background and the client polls /api/image-status for it. Doing both
-    # in one request risks exceeding Cloudflare's ~100s origin timeout
-    # (LLM CPU inference + ~30s SDXL can add up), and the reply shouldn't
-    # wait on the image anyway. The image depicts the assistant (consistent
-    # look) in a scene drawn from THIS exchange - both what the user said and
-    # what she replied - built by _build_image_prompt inside the job.
+    # Kick the image off the USER's message so it can render on the GPU in
+    # PARALLEL with the reply streaming on the CPU. The image reflects what the
+    # user said (the reply doesn't exist yet when the image starts - that's the
+    # cost of true parallelism). _stream_reply fires the image job first, then
+    # streams the reply; the client starts polling image-status on the job_id
+    # it receives as the first stream line.
     job_id = secrets.token_urlsafe(8)
     jobs = mode_state["jobs"]
     jobs[job_id] = {"status": "pending", "image": None}
     for old_id in list(jobs)[:-10]:
         del jobs[old_id]
-
-    def _generate_and_store():
-        try:
-            image_prompt = _build_image_prompt(message, reply)
-            image_b64 = _run_image(image_prompt)
-            with _state_lock:
-                jobs[job_id] = {"status": "done", "image": image_b64}
-                gallery = mode_state["gallery"]
-                gallery.append(image_b64)
-                del gallery[:-MAX_GALLERY]
-        except Exception:
-            with _state_lock:
-                jobs[job_id] = {"status": "error", "image": None}
-
-    # Fire-and-forget on the shared default executor - NOT a raw
-    # threading.Thread(...).start(), which spins up a brand-new OS thread
-    # per call that's used exactly once. Under repeated chat-images turns
-    # that pattern was implicated in a real memory leak (the service got
-    # OOM-killed under moderate live use); the shared executor reuses a
-    # bounded pool of threads instead.
-    asyncio.get_event_loop().run_in_executor(_gpu_executor, _generate_and_store)
-
-    return JSONResponse(_encrypt({"reply": reply, "job_id": job_id}))
+    image_prompt = _build_image_prompt_from_message(message)
+    return _stream_reply(history, mode_state, image_job=(job_id, image_prompt))
 
 
 @app.post("/api/image-status")
@@ -623,8 +654,16 @@ def _load_models():
         image_pipe = StableDiffusionXLPipeline.from_single_file(
             IMAGE_MODEL_PATH, torch_dtype=torch.float16, use_safetensors=True
         )
+        # Speed, no model change: DPM++ 2M Karras converges in fewer steps than
+        # the default scheduler, and TAESD (a tiny distilled VAE) decodes far
+        # faster than the full SDXL VAE and removes the VAE-decode VRAM spike
+        # that used to flirt with OOM on the 6GB card. Set the VAE BEFORE
+        # enable_model_cpu_offload so the offload hooks attach to it.
+        image_pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+            image_pipe.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++"
+        )
+        image_pipe.vae = AutoencoderTiny.from_pretrained("madebyollin/taesdxl", torch_dtype=torch.float16)
         image_pipe.enable_model_cpu_offload()
-        image_pipe.vae.enable_slicing()
         print("image model ready", flush=True)
 
         print("loading Gemma-4-12B-OBLITERATED (CPU)...", flush=True)

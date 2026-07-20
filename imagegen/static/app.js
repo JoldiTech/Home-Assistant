@@ -350,6 +350,42 @@ function appendMessage(role, text) {
   div.appendChild(span);
   $("transcript").appendChild(div);
   div.scrollIntoView({ block: "end" });
+  return span; // caller can stream more text into it
+}
+
+// Streaming POST: reads newline-delimited encrypted envelopes and decrypts
+// each as it arrives, so the reply appears token-by-token. Callbacks:
+//   onJobId(id) - fired once, when conversation-with-images returns its image job
+//   onDelta(text) - fired per token chunk
+async function streamChat(path, payload, { onJobId, onDelta }) {
+  const body = JSON.stringify(await encryptEnvelope(payload));
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+  });
+  if (res.status === 401) {
+    showLogin("session expired - enter password again");
+    throw new Error("session expired");
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      if (!line.trim()) continue;
+      const obj = await decryptEnvelope(JSON.parse(line));
+      if (obj.job_id && onJobId) onJobId(obj.job_id);
+      if (obj.delta && onDelta) onDelta(obj.delta);
+      // obj.done -> stream complete
+    }
+  }
 }
 
 function appendGalleryImage(b64png) {
@@ -378,14 +414,24 @@ async function onChatSubmit(e, withImages) {
   appendMessage("user", message);
   const btn = e.target.querySelector("button");
   btn.disabled = true;
-  $("chat-status").textContent = "thinking...";
+  $("chat-status").textContent = withImages ? "" : "thinking...";
+  // Empty assistant bubble to stream tokens into as they arrive.
+  const asstSpan = appendMessage("assistant", "");
   try {
     const path = withImages ? "/api/chat-images" : "/api/chat";
-    const result = await apiCall(path, { message });
-    appendMessage("assistant", result.reply);
+    await streamChat(path, { message }, {
+      // job_id arrives first; start the image (which is already rendering on
+      // the GPU in parallel) polling immediately, before the reply finishes.
+      onJobId: (jid) => { if (withImages) pollImageJob(jid); },
+      onDelta: (d) => {
+        asstSpan.textContent += d;
+        $("chat-status").textContent = "";
+        asstSpan.parentElement.scrollIntoView({ block: "end" });
+      },
+    });
     $("chat-status").textContent = "";
-    if (withImages && result.job_id) pollImageJob(result.job_id);
   } catch (err) {
+    if (!asstSpan.textContent) asstSpan.parentElement.remove();
     $("chat-status").textContent = "failed to get a reply";
   } finally {
     btn.disabled = false;
