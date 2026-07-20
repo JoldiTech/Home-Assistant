@@ -40,9 +40,20 @@ long-lived tokens, so **add-on / Supervisor / host management must go through SS
 | `HOMEASSISTANT_TOKEN` | **yes** | HA long-lived access token (REST API auth) |
 | `HA_SSH_HOST` | no | `ssh.nmteaco.com` — the Cloudflare Access SSH hostname |
 | `HA_SSH_USER` | no | SSH login user. **May be empty — default to `root`** |
-| `HA_SSH_KEY_B64` | **yes** | base64 of the ed25519 private key |
-| `CF_ACCESS_CLIENT_ID` | **yes** | Cloudflare Access service-token ID (`*.access`) |
-| `CF_ACCESS_CLIENT_SECRET` | **yes** | Cloudflare Access service-token secret |
+| `HA_SSH_KEY_B64` | **yes** | base64 of the ed25519 private key (also authorized on the AI box, see below) |
+| `CF_ACCESS_CLIENT_ID_HA` | **yes** | Cloudflare Access service-token ID for the **HA box's** tunnel |
+| `CF_ACCESS_CLIENT_SECRET_HA` | **yes** | Cloudflare Access service-token secret for the **HA box's** tunnel |
+| `AI_BOX_SSH_HOST` | no | `ssh-ai.nmteaco.com` — SSH hostname for the **AI box** (see "AI box" below) |
+| `AI_BOX_SSH_USER` | no | SSH login user on the AI box. Defaults to `nmteaco` if unset |
+| `CF_ACCESS_CLIENT_ID_AI_BOX` | **yes** | Cloudflare Access service-token ID for the **AI box's** tunnel (separate from HA's) |
+| `CF_ACCESS_CLIENT_SECRET_AI_BOX` | **yes** | Cloudflare Access service-token secret for the **AI box's** tunnel |
+
+> **Naming history:** the Cloudflare Access vars used to be plain `CF_ACCESS_CLIENT_ID`/
+> `CF_ACCESS_CLIENT_SECRET` (HA was the only box). They were renamed to the `_HA`
+> suffix when the AI box got its own independent tunnel + service token, so each
+> box's credentials are distinct and independently revocable. If something that
+> reaches `ssh.nmteaco.com` breaks with `Permission denied (publickey,password)`
+> after an env-var change, check for this exact renaming first.
 
 ---
 
@@ -58,6 +69,19 @@ long-lived tokens, so **add-on / Supervisor / host management must go through SS
 - **`ssh.nmteaco.com` is NOT raw SSH on port 22.** It is SSH wrapped in an HTTPS
   WebSocket behind Cloudflare Access. You **must** tunnel through `cloudflared` and
   authenticate with the service token — a plain `ssh -p 22` will not work.
+
+### AI box (`nmteacoaiserver`)
+
+A separate machine — Ubuntu 24.04, NVIDIA RTX 2060 (driver `nvidia-driver-595-open`,
+CUDA 13.2 ceiling) — for GPU workloads (local transcription models, etc.). It has
+its **own independent Cloudflare Tunnel and Access application**, entirely separate
+from the HA box's tunnel (own service token, own hostname `ssh-ai.nmteaco.com`) —
+so it's reachable even if the HA box or its tunnel is ever down. It reuses the
+**same SSH private key** as the HA box (`HA_SSH_KEY_B64`'s public half is
+authorized on both machines) — only the Access layer differs per box.
+
+Connect with `ssh aibox` (set up by the same SessionStart hook / Setup script as
+`ssh homeassistant`).
 
 ---
 
@@ -94,8 +118,8 @@ cat > ~/.ssh/ha_cf_proxy.sh <<'EOF'
 #!/bin/bash
 exec env -u HTTPS_PROXY -u HTTP_PROXY -u ALL_PROXY -u https_proxy -u http_proxy -u all_proxy \
   cloudflared access ssh --hostname "$1" \
-    --service-token-id "$CF_ACCESS_CLIENT_ID" \
-    --service-token-secret "$CF_ACCESS_CLIENT_SECRET"
+    --service-token-id "$CF_ACCESS_CLIENT_ID_HA" \
+    --service-token-secret "$CF_ACCESS_CLIENT_SECRET_HA"
 EOF
 chmod 700 ~/.ssh/ha_cf_proxy.sh
 
@@ -109,6 +133,11 @@ ssh -i ~/.ssh/ha_ssh_key \
 
 For an interactive/repeat session you can drop the same values into `~/.ssh/config`
 as a `Host homeassistant` alias and then just `ssh homeassistant`.
+
+**AI box:** identical pattern — same key (`~/.ssh/ha_ssh_key`), but its own proxy
+wrapper reading `CF_ACCESS_CLIENT_ID_AI_BOX`/`CF_ACCESS_CLIENT_SECRET_AI_BOX`,
+hostname `${AI_BOX_SSH_HOST}`, user `${AI_BOX_SSH_USER:-nmteaco}`. The
+SessionStart hook sets both up automatically — connect with `ssh aibox`.
 
 ---
 
