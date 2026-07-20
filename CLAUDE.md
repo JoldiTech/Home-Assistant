@@ -294,33 +294,59 @@ The history endpoint's `minimal_response` shrinks payloads but **omits `entity_i
 on repeated rows** — don't use it when you need to know which camera each row
 belongs to.
 
-### Local audio transcription (Tea One)
+### Captain's Log (nightly, HA-triggered → AI box → GitHub)
 
-A local add-on transcribes the **Tea One** camera mic on-device (whisper.cpp
-`tiny.en`, aarch64/NEON) into a searchable log + a dashboard feed. Source of
-truth is `addons/tea_one_transcribe/` in this repo; it's deployed to
-`/addons/tea_one_transcribe/` on the box and managed by Supervisor as
-`local_tea_one_transcribe`.
+> **History:** an earlier design ran live on-box whisper.cpp add-ons
+> (`local_tea_one_transcribe`, `local_emporium_hall_transcribe`) that kept a
+> rolling transcript on the HA box. Those were **fully removed on 2026-07-20**
+> (add-ons uninstalled, `/share/*_transcript.log` + `/share/whisper_models`
+> deleted, the live "Transcripts" dashboard view removed, `addons/` deleted from
+> the repo). Nothing transcribes on the HA box anymore — HA only *triggers* the
+> AI box and *reads back* the finished log. No raw audio or verbatim transcript
+> is ever retained.
 
-- **Gate (efficiency):** only runs while `binary_sensor.g6_dome_speaking_detected`
-  (Tea One's on-camera speaking AI) is `on` — enabled via
-  `switch.g6_dome_speaking_detection`. Idle cost ~12 MB RAM, 0 % CPU; whisper
-  only fires (a ~15 s spike, RTF ~0.97) during real speech. `base.en` is too slow
-  (RTF ~1.3) — stay on `tiny.en`.
-- **Audio source:** HA's own `camera.record` (already 16 kHz mono AAC) via the
-  Supervisor proxy — no UniFi creds / RTSP needed.
-- **Models:** live on the persistent `/share/whisper_models/` (NOT baked into the
-  image), auto-downloaded from HF on first run. Keeps rebuilds fast.
-- **Outputs:** searchable log `/share/tea_one_transcript.log`; entity
-  `sensor.tea_one_transcript` (state = last line, `lines` attr = rolling feed);
-  a **"Tea One Transcript"** view on the **DowntownControls** dashboard
-  (`dashboard-downtowncontrols`).
-- **Manage:** `ha apps {info,logs,restart,rebuild,stats} local_tea_one_transcribe`
-  over SSH. Options are set via the Supervisor API
-  (`POST http://supervisor/addons/local_tea_one_transcribe/options` with
-  `$SUPERVISOR_TOKEN`; send the FULL options object — partial payloads are
-  rejected for missing required keys). There is no `ha apps options` subcommand.
-- **CLI note:** `ha addons` is deprecated in favor of `ha apps` on this box.
+Once a night the shop's day is distilled into a de-identified **Captain's Log**.
+The heavy lifting runs on the **AI box** (GPU); HA is only the scheduler and the
+reader. Source of truth is `transcribe/` in this repo (`captains_pipeline.py`,
+`transcribe_day.py`, `trigger_service.py`, `captains-transcribe.service`),
+deployed to `~/transcribe/` on the AI box and run as the
+`captains-transcribe.service` systemd unit (`~/transcribe-env` venv).
+
+- **Flow:** HA automation `captains_log_nightly` fires at **19:00 MT** →
+  `rest_command.captains_log_run` POSTs to the AI-box trigger service
+  (`http://192.168.22.6:8190/run`, header `X-Trigger-Token: !secret
+  aibox_trigger_token`, body `{"date": "..."}` — empty means today) → the box
+  transcribes **Tea One** for the day, summarizes, pushes the day-file, and
+  **deletes the transcription**. The endpoint returns `202` immediately and runs
+  in the background (`/health` reports `{"running":true|false}`).
+- **Transcription:** `faster-whisper large-v3` on the GPU, window **08:00–20:00
+  MT**, pulling Tea One's recording **directly from UniFi Protect** (Protect
+  Integrations API, creds from `/etc/nmteaco/protect.env`) — no HA in the audio
+  path. `condition_on_previous_text=False` + strict VAD to avoid hallucination
+  loops.
+- **Summarizer:** `Qwen3-8B-Q4_K_M.gguf` (`~/transcribe/models/`, not in git) via
+  llama-cpp-python (CUDA), ~30 GPU layers with a `[30, 20, 0]` fallback chain so
+  the job still finishes (slower) if Chloe is holding VRAM. Timestamps are
+  compacted to hourly markers + hierarchical chunk→notes→merge so a full day fits
+  the context, then a redaction pass strips names/personal-life/garbled products.
+- **Output:** one Markdown day-file `captains_log/YYYY-MM-DD.md` pushed to the
+  **`captains-log` branch** of this repo (persistent clone `~/ha-captains-repo`,
+  auth via a fine-grained PAT in `/etc/nmteaco/captains.env`). The transcription
+  is deleted after the log is pushed — GitHub holds only the sanitized log.
+- **HA read-back:** `sensor.captains_log` is a `command_line` sensor running
+  `/share/render_captains_log.py` (stdlib urllib), which fetches the day-files
+  from the `captains-log` branch via the GitHub API (read PAT in
+  `/config/captains_gh.token`) and emits `{"count", "content"}`. The **"Captain's
+  Log"** view on the **DowntownControls** dashboard (`dashboard-downtowncontrols`)
+  renders `content` (one collapsible `<details>` per day).
+- **Manage:** on the AI box `sudo systemctl {status,restart} captains-transcribe.service`,
+  `sudo journalctl -u captains-transcribe.service -f`; trigger a run by hand with
+  `curl -X POST -H "X-Trigger-Token: <tok>" -d '{"date":"YYYY-MM-DD"}'
+  http://127.0.0.1:8190/run`. Fire the whole HA→box path with
+  `POST /api/services/rest_command/captains_log_run`.
+- **Secrets:** AI box `/etc/nmteaco/captains.env` (trigger token + GitHub write
+  PAT); HA `secrets.yaml` `aibox_trigger_token` + `/config/captains_gh.token`
+  (GitHub read PAT). None are committed.
 
 ### Chloe / ephemeral generation tool (AI box)
 
