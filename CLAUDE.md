@@ -83,6 +83,26 @@ authorized on both machines) — only the Access layer differs per box.
 Connect with `ssh aibox` (set up by the same SessionStart hook / Setup script as
 `ssh homeassistant`).
 
+**Python ML stack** lives in a venv at `~/transcribe-env` on the box (activate with
+`source ~/transcribe-env/bin/activate`): `torch` (CUDA build, confirmed working on
+the RTX 2060), `faster-whisper`, `demucs`, `nemo_toolkit[asr]` (Parakeet). This is
+the exact Demucs-vocal-isolation → Whisper/Parakeet pipeline validated on the HA
+Green earlier — same tools, now with real GPU acceleration.
+
+**Talks to UniFi Protect directly** (no HA in the loop) via Protect's local
+Integrations API. Credentials are **not** in this repo or in the Claude session
+environment — they live only on the box itself:
+
+- `/etc/nmteaco/protect.env` (mode `600`, owned by `nmteaco`) — `PROTECT_API_KEY`
+  and `PROTECT_HOST` (`192.168.22.1` — the UniFi console's LAN IP; originally
+  discovered via HA's `unifiprotect` config entry, which reports a
+  `*.id.ui.direct` hostname — we resolved and pinned the LAN IP instead so the
+  pipeline doesn't depend on that DNS mechanism at boot).
+- Verified: `curl -k -H "X-API-KEY: $PROTECT_API_KEY" https://$PROTECT_HOST/proxy/protect/integration/v1/meta/info`
+  → `200 {"applicationVersion":"7.1.87"}`.
+- Any future systemd service on this box should read secrets via
+  `EnvironmentFile=/etc/nmteaco/protect.env`, never hardcode them.
+
 ---
 
 ## Connect over SSH (copy-paste)
