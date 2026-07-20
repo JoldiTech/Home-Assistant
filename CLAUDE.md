@@ -322,47 +322,67 @@ truth is `addons/tea_one_transcribe/` in this repo; it's deployed to
   rejected for missing required keys). There is no `ha apps options` subcommand.
 - **CLI note:** `ha addons` is deprecated in favor of `ha apps` on this box.
 
-### Ephemeral image generation (AI box)
+### Chloe / ephemeral generation tool (AI box)
 
-A minimal, single-purpose SDXL image generator runs on the **AI box**, public at
-`https://aibox.nmteaco.com`. Source of truth is `imagegen/` in this repo; deployed
-to `~/imagegen/` on the AI box and run as the `imagegen.service` systemd unit
-(`~/imagegen-env` venv). Checkpoint: JuggernautXL Ragnarok (SDXL), loaded via
-`diffusers.StableDiffusionXLPipeline.from_single_file` at
-`~/imagegen/models/juggernautXL_ragnarok.safetensors` (not in git — 6.6 GB;
-re-download from Civitai if the box is rebuilt).
+A single password-gated web app ("Chloe") runs on the **AI box**, public at
+`https://aibox.nmteaco.com`, with three modes after login: **conversation**
+(local LLM chat), **conversation with images** (chat + an auto-generated image
+"from the assistant" per reply, flowing into a session sidebar), and **image
+only** (SDXL). Source of truth is `imagegen/` in this repo (`app.py`,
+`static/{index.html,app.js}`, `imagegen.service`); deployed to `~/imagegen/` on
+the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
 
-**Deliberately stateless — do not add persistence.** Nothing is ever written to
-disk: generated PNGs exist only as in-memory bytes for the life of one request,
-embedded as a base64 `data:` URI directly in the HTML response. No database, no
-history, no login username — a single shared password gates the whole app. Every
-`GET /` is a blank form; there is nothing to page through or resume.
+- **Models (not in git):** image = JuggernautXL Ragnarok (SDXL) at
+  `~/imagegen/models/juggernautXL_ragnarok.safetensors` (6.6 GB, re-download
+  from Civitai); chat = `Gemma-4-12B-OBLITERATED.Q4_K_M.gguf` (~7.4 GB, from
+  `mradermacher/Gemma-4-12B-OBLITERATED-GGUF`) via `llama-cpp-python`, **CPU-only**
+  (`n_gpu_layers=0`) so it never contends with SDXL for the 6 GB VRAM. Install
+  llama-cpp-python with `--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu`
+  (plain `--index-url` breaks dep resolution).
+- **Lazy load:** nothing loads at startup (~700 MB cold). The **Initialize**
+  button (`/api/initialize`) loads both models; steady state ~17 GB RAM. The
+  unit caps memory (`MemoryHigh=22G`, `MemoryMax=26G`) as a safety net.
 
-- **Auth:** one password (`IMAGEGEN_PASSWORD` in `/etc/nmteaco/imagegen.env`,
-  mode 600 root:root — same pattern as `protect.env`), compared with
-  `hmac.compare_digest`. Session tokens are a plain in-process dict (dies on
-  restart) — no persistent session store. Login attempts are rate-limited
-  per-IP (5 / 15 min), keyed off `CF-Connecting-IP` since real traffic arrives
-  via the Cloudflare Tunnel on loopback.
-- **Network:** app binds `127.0.0.1:8189` only — never reachable except through
-  `cloudflared` on the same box. Public hostname `aibox.nmteaco.com` → tunnel →
-  `localhost:8189` is configured in the Cloudflare **dashboard** (this tunnel is
-  remotely-managed — no local `config.yml` — so hostname/ingress changes happen
-  in Zero Trust → Networks → Tunnels, not on the box). A Cloudflare **Cache
-  Rule** (`Hostname equals aibox.nmteaco.com` → Bypass cache) forces the edge to
-  never cache a response, on top of the app's own `Cache-Control: no-store` and
-  the fact that `/generate` is a POST (Cloudflare never caches POST by default).
-- **VRAM:** 6 GB card (RTX 2060) — `enable_model_cpu_offload()` +
-  `pipe.vae.enable_slicing()` are required, not optional; without them SDXL at
-  1024×1024 does not fit. VRAM returns to ~150 MB idle between generations
-  (offload releases it each time), at the cost of ~30s/image versus a
-  higher-VRAM card that could keep weights resident.
+**Two hard guarantees (do not "optimize" away):**
+
+1. **E2E encrypted through Cloudflare.** The password never crosses the network
+   — login is an HMAC challenge/response; both browser (SubtleCrypto) and server
+   independently derive the same AES-GCM key from it via PBKDF2, and every
+   request/response body is an AES-GCM envelope. Cloudflare terminates TLS but
+   only relays ciphertext it has no key for. The browser keeps the key in a JS
+   variable only (no localStorage), so a reload re-prompts for the password.
+2. **Nothing conversational persists.** Conversations, images, and sessions are
+   in-memory only — gone on restart, 20-min idle timeout, reset, or tab close
+   (session cookie, no Max-Age). No database, no disk writes of content.
+
+- **Persisted state (the only two things on disk):** `/var/lib/imagegen/`
+  (owned by `nmteaco`, mode 700; `ReadWritePaths` hole in the strict sandbox).
+  `password` = current password, plaintext, mode 600 (server is the trusted
+  endpoint and needs it to derive keys — same trust model as `protect.env`).
+  `prompts.enc` = the editable prompts (assistant system prompt + image-prompt
+  prefix), AES-GCM encrypted under the password-derived key, decrypted only at
+  time of use. First-ever start seeds `password` from `IMAGEGEN_PASSWORD` (via
+  the systemd EnvironmentFile `/etc/nmteaco/imagegen.env`), then the file wins.
+- **Settings (after login):** edit the assistant prompts (persisted encrypted),
+  and **change the password** — which rewrites the password file, re-derives the
+  keys, re-encrypts the prompts under the new key, and clears all sessions. The
+  password IS the encryption key until changed again.
+- **Network:** binds `127.0.0.1:8189` only. Public hostname → tunnel →
+  `localhost:8189` is set in the Cloudflare **dashboard** (remotely-managed
+  tunnel, no local `config.yml`). A Cloudflare **Cache Rule** (`Hostname equals
+  aibox.nmteaco.com` → Bypass cache) plus `Cache-Control: no-store` and a strict
+  CSP (`script-src 'self'`) are defense-in-depth for the ephemerality guarantee.
+- **Concurrency/memory:** all GPU work is pinned to one dedicated thread
+  (`_gpu_executor`, max_workers=1), likewise the LLM (`_llm_executor`). This is
+  load-bearing — spreading generation across a thread pool leaked memory
+  (confirmed OOM at 16 GB+) via per-thread CUDA state. Conversation-with-images
+  generates the image in the background (client polls `/api/image-status`),
+  keeping any single request under Cloudflare's ~100 s origin timeout.
 - **Manage:** `sudo systemctl {status,restart,stop} imagegen.service`,
-  `sudo journalctl -u imagegen.service -f`. The unit is hardened
-  (`ProtectSystem=strict`, `NoNewPrivileges=yes`, no `ReadWritePaths` except the
-  Hugging Face scaffolding cache) — GPU access requires `PrivateDevices=no`.
-- **Password rotation:** edit `/etc/nmteaco/imagegen.env` on the box, then
-  `sudo systemctl restart imagegen.service`. Never commit it.
+  `sudo journalctl -u imagegen.service -f`. Hardened unit (`ProtectSystem=strict`,
+  `NoNewPrivileges=yes`); GPU needs `PrivateDevices=no`.
+- **Password:** change it in-app (Settings → change password), not by editing
+  files. `/etc/nmteaco/imagegen.env` only seeds the very first start. Never commit it.
 
 ### Repo conventions
 

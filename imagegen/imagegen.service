@@ -9,7 +9,9 @@ Group=nmteaco
 WorkingDirectory=/home/nmteaco/imagegen
 EnvironmentFile=/etc/nmteaco/imagegen.env
 Environment=MODEL_PATH=/home/nmteaco/imagegen/models/juggernautXL_ragnarok.safetensors
+Environment=LLM_MODEL_PATH=/home/nmteaco/imagegen/models/Gemma-4-12B-OBLITERATED.Q4_K_M.gguf
 Environment=PORT=8189
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ExecStart=/home/nmteaco/imagegen-env/bin/python /home/nmteaco/imagegen/app.py
 Restart=on-failure
 RestartSec=5
@@ -19,8 +21,10 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
 # Model + huggingface cache dirs need write access for the cache only -
-# no generated image or prompt content ever lands on disk.
-ReadWritePaths=/home/nmteaco/.cache/huggingface
+# no generated image or conversation content ever lands on disk.
+# /var/lib/imagegen holds the two persisted things: the current password
+# (plaintext, mode 600) and the prompts (encrypted under the derived key).
+ReadWritePaths=/home/nmteaco/.cache/huggingface /var/lib/imagegen
 PrivateTmp=yes
 PrivateDevices=no
 ProtectKernelTunables=yes
@@ -29,6 +33,14 @@ ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes
+# Safety net, not a fix: caps a runaway process well below the box's 31G so
+# a leak kills+restarts this service instead of swap-thrashing the whole
+# machine. Confirmed steady-state with both models loaded is ~17.2G (one-
+# time CUDA/accelerate init cost on first generation, then flat across
+# repeated calls - see imagegen/README.md) - these ceilings sit above that
+# with headroom, not at the bare minimum.
+MemoryHigh=22G
+MemoryMax=26G
 
 [Install]
 WantedBy=multi-user.target
