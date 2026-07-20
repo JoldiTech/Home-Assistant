@@ -121,19 +121,107 @@ def _transcribe(date_str: str) -> tuple[str, Path]:
     return proc.stdout, log_path
 
 
+NOTES_SYSTEM = SYSTEM_PROMPT + (
+    "\n\nFor THIS step you are taking rough notes on one slice of the day. Output a "
+    "short de-identified bullet list of what happened (products/topics discussed, "
+    "traffic feel, any operational events). No names/PII. No format headers - just "
+    "bullets."
+)
+
+NOTES_TEMPLATE = "Notes for time slice {i} of {n} (times are HH:00 markers):\n\n{chunk}"
+
+FINAL_FROM_NOTES = """Write the Captain's Log for {weekday} {date} from these \
+de-identified notes taken across the day's Tea One audio. Merge and de-dupe them \
+per policy into ONE log in EXACTLY this format:
+
+# Captain's Log — {weekday} {date}
+
+**Hours active:** …
+**Traffic:** …
+
+## Product & topics
+- …
+
+## Notable / follow-ups
+- …
+
+## Staff & ops notes
+- …
+
+_Source: Tea One mic → UniFi Protect → faster-whisper large-v3 (GPU) → de-identified by a local instruct model on the AI box. Raw transcript discarded after this log was written._
+
+NOTES:
+{notes}"""
+
+
+def _compact_transcript(transcript: str) -> str:
+    """Per-line 'YYYY-MM-DD HH:MM:SS TZ | text' timestamps dominate the token
+    count (~15 tokens each). Replace them with a single '[HH:00]' marker when the
+    hour changes, keeping time-of-day context at a fraction of the token cost."""
+    out, last_hour = [], None
+    for ln in transcript.splitlines():
+        if "|" in ln:
+            ts, _, text = ln.partition("|")
+            text = text.strip()
+            parts = ts.split()
+            hh = parts[1][:2] if len(parts) >= 2 and ":" in parts[1] else None
+            if hh and hh != last_hour:
+                out.append(f"[{hh}:00]")
+                last_hour = hh
+            if text:
+                out.append(text)
+    return "\n".join(out)
+
+
+def _chunk_by_tokens(llm, text: str, budget: int) -> list[str]:
+    """Split text into line-blocks each under `budget` tokens."""
+    chunks, cur, cur_tok = [], [], 0
+    for ln in text.splitlines():
+        t = len(llm.tokenize(("\n" + ln).encode(), add_bos=False))
+        if cur and cur_tok + t > budget:
+            chunks.append("\n".join(cur))
+            cur, cur_tok = [], 0
+        cur.append(ln)
+        cur_tok += t
+    if cur:
+        chunks.append("\n".join(cur))
+    return chunks
+
+
 def _summarize(transcript: str, day: datetime) -> str:
-    if len(transcript) > MAX_TRANSCRIPT_CHARS:
-        transcript = transcript[:MAX_TRANSCRIPT_CHARS] + "\n[...transcript truncated...]"
     print("[pipeline] loading summarizer...", file=sys.stderr, flush=True)
     llm = Llama(model_path=SUMMARIZER_MODEL, n_ctx=LLM_CTX, n_threads=8, n_gpu_layers=0, verbose=False)
-    user = USER_TEMPLATE.format(
-        weekday=day.strftime("%A"), date=day.strftime("%Y-%m-%d"), transcript=transcript
-    )
-    out = llm.create_chat_completion(
-        messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}],
-        max_tokens=1200, temperature=0.3, top_p=0.9, repeat_penalty=1.1,
-    )
-    return out["choices"][0]["message"]["content"].strip()
+    wk, ds = day.strftime("%A"), day.strftime("%Y-%m-%d")
+    compact = _compact_transcript(transcript)
+    INPUT_BUDGET = 22000  # leave room for system + template + output within 32k
+
+    def _final(body_field, body):
+        user = (USER_TEMPLATE if body_field == "transcript" else FINAL_FROM_NOTES).format(
+            weekday=wk, date=ds, **{body_field: body}
+        )
+        out = llm.create_chat_completion(
+            messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}],
+            max_tokens=1200, temperature=0.3, top_p=0.9, repeat_penalty=1.1,
+        )
+        return out["choices"][0]["message"]["content"].strip()
+
+    if len(llm.tokenize(compact.encode(), add_bos=False)) <= INPUT_BUDGET:
+        return _final("transcript", compact)
+
+    # Long day: chunk -> de-identified notes per slice -> merge into the log.
+    chunks = _chunk_by_tokens(llm, compact, INPUT_BUDGET)
+    print(f"[pipeline] long day: {len(chunks)} slices -> notes -> final", file=sys.stderr, flush=True)
+    notes = []
+    for i, ch in enumerate(chunks, 1):
+        out = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": NOTES_SYSTEM},
+                {"role": "user", "content": NOTES_TEMPLATE.format(i=i, n=len(chunks), chunk=ch)},
+            ],
+            max_tokens=500, temperature=0.3, top_p=0.9, repeat_penalty=1.1,
+        )
+        notes.append(out["choices"][0]["message"]["content"].strip())
+    return _final("notes", "\n".join(notes))
 
 
 def _git(*args, check=True):
