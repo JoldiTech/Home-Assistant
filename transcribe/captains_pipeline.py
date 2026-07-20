@@ -37,8 +37,14 @@ TRANSCRIBE_SCRIPT = HERE / "transcribe_day.py"
 SUMMARIZER_MODEL = os.environ.get(
     "SUMMARIZER_MODEL", os.path.expanduser("~/transcribe/models/Qwen2.5-7B-Instruct-Q4_K_M.gguf")
 )
-LLM_CTX = 32768
-MAX_TRANSCRIPT_CHARS = 90000  # safety cap so a runaway day can't overflow context
+# Summarizer runs AFTER transcription (whose subprocess has exited and freed the
+# GPU), so it can use the GPU - ~10x faster than CPU. Needs a CUDA-enabled
+# llama-cpp-python build. On the 6GB card, Qwen-7B Q4 (~4.7GB) fits only with a
+# modest context (KV cache grows with n_ctx), so cap at 8k and let the
+# hierarchical chunker feed it smaller slices. Both are env-overridable; set
+# SUMMARIZER_GPU_LAYERS=0 to fall back to CPU (slower but no CUDA build needed).
+SUMMARIZER_GPU_LAYERS = int(os.environ.get("SUMMARIZER_GPU_LAYERS", "-1"))  # -1 = all layers
+SUMMARIZER_CTX = int(os.environ.get("SUMMARIZER_CTX", "8192"))
 
 DEFAULT_REPO = "JoldiTech/Home-Assistant"
 LOG_BRANCH = "captains-log"
@@ -190,10 +196,11 @@ def _chunk_by_tokens(llm, text: str, budget: int) -> list[str]:
 
 def _summarize(transcript: str, day: datetime) -> str:
     print("[pipeline] loading summarizer...", file=sys.stderr, flush=True)
-    llm = Llama(model_path=SUMMARIZER_MODEL, n_ctx=LLM_CTX, n_threads=8, n_gpu_layers=0, verbose=False)
+    llm = Llama(model_path=SUMMARIZER_MODEL, n_ctx=SUMMARIZER_CTX, n_threads=8,
+                n_gpu_layers=SUMMARIZER_GPU_LAYERS, verbose=False)
     wk, ds = day.strftime("%A"), day.strftime("%Y-%m-%d")
     compact = _compact_transcript(transcript)
-    INPUT_BUDGET = 22000  # leave room for system + template + output within 32k
+    INPUT_BUDGET = SUMMARIZER_CTX - 2600  # leave room for system + template + output
 
     def _final(body_field, body):
         user = (USER_TEMPLATE if body_field == "transcript" else FINAL_FROM_NOTES).format(
