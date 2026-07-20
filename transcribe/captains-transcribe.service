@@ -1,0 +1,29 @@
+[Unit]
+Description=Captain's Log trigger service (HA-triggered transcription pipeline)
+After=network.target
+
+[Service]
+Type=simple
+User=nmteaco
+Group=nmteaco
+WorkingDirectory=/home/nmteaco/transcribe
+EnvironmentFile=/etc/nmteaco/captains.env
+# Reuse the transcribe venv (has faster-whisper, uiprotect, llama-cpp, fastapi).
+ExecStart=/home/nmteaco/transcribe-env/bin/python /home/nmteaco/transcribe/trigger_service.py
+Restart=on-failure
+RestartSec=5
+
+# --- Hardening (looser than imagegen: this one needs git + network + GPU) ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=off
+PrivateTmp=yes
+PrivateDevices=no
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
