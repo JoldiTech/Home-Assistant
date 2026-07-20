@@ -41,6 +41,11 @@ LockPersonality=yes
 # with headroom, not at the bare minimum.
 MemoryHigh=22G
 MemoryMax=26G
+# Security-critical: never let this service's memory (which holds plaintext
+# conversations and in-memory generated images) be paged to the on-disk swap,
+# where it would be forensically recoverable. Under pressure the process gets
+# OOM-killed and restarted (memory cleared) instead of swapping secrets out.
+MemorySwapMax=0
 
 [Install]
 WantedBy=multi-user.target

@@ -95,3 +95,31 @@ memory at 22 G/26 G as a safety net.
 - **Don't add persistence.** Saving prompts/images/history to disk is a
   deliberate policy violation here, not a missing feature — flag it, don't add
   it.
+
+## Security audit (what was checked, and two fixes that came out of it)
+
+Verified: responses carry `Cache-Control: no-store` and Cloudflare returns
+`cf-cache-status: DYNAMIC` (edge not caching); the client uses **no**
+localStorage/sessionStorage/IndexedDB (key lives in a JS variable only);
+generated images are written to an in-memory `BytesIO`, never a file; the app
+logs no message/prompt/reply content; the only disk state is the password and
+the encrypted prompts.
+
+Two leaks were found and fixed — both mattered for "mechanically unrecoverable":
+
+1. **ML libraries logged prompt text to persistent journald.** The CLIP
+   tokenizer logs the truncated tail of every image prompt at WARNING →
+   `/var/log/journal` on disk (real conversation-derived content, unencrypted,
+   surviving restarts). Fixed by forcing `transformers`/`diffusers` logging to
+   ERROR at startup (see the "log hygiene" block in `app.py`) — verified a
+   >77-token prompt now leaves nothing in the journal. Do not lower this.
+2. **Service memory was swappable.** `MemorySwapMax=infinity` meant the ~17 GB
+   of plaintext conversations + in-memory images could be paged to the on-disk
+   swap. Fixed with `MemorySwapMax=0` in the unit — under pressure the process
+   is OOM-killed and restarted (memory cleared) rather than swapping secrets to
+   disk.
+
+Residual note: journald is persistent (`/var/log/journal`), but after fix #1 it
+only holds request *paths* (`POST /api/chat`), never bodies. System-wide swap
+is still enabled for other processes; only this service is barred from it,
+which is the correct scope.

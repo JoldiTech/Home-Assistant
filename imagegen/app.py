@@ -37,6 +37,9 @@ import time
 from collections import defaultdict, deque
 from pathlib import Path
 
+import logging
+import warnings
+
 import torch
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from diffusers import StableDiffusionXLPipeline
@@ -44,6 +47,29 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from llama_cpp import Llama
+
+# --- log hygiene (security-critical) -----------------------------------------
+# The ML stack logs conversation-DERIVED text to stderr, which journald then
+# persists to /var/log/journal on disk. The worst offender is the CLIP
+# tokenizer, which logs the *truncated portion of every image prompt* at
+# WARNING - i.e. real conversation content, unencrypted, surviving restarts.
+# That violates the "nothing conversational persists" guarantee, so silence
+# these libraries to ERROR and drop warnings. Do NOT lower this.
+warnings.filterwarnings("ignore")
+for _name in ("transformers", "diffusers"):
+    logging.getLogger(_name).setLevel(logging.ERROR)
+try:
+    import transformers
+
+    transformers.logging.set_verbosity_error()
+except Exception:
+    pass
+try:
+    import diffusers
+
+    diffusers.utils.logging.set_verbosity_error()
+except Exception:
+    pass
 
 STATIC_DIR = Path(__file__).parent / "static"
 
