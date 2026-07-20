@@ -263,6 +263,12 @@ REMOVE any bullet that contains:
 - health/medical details tied to a person;
 - something that reads like garbled audio rather than a real shop event.
 
+Also FIX garbled product names from the lossy mic: if a "product" is not a
+plausible real tea/herb/ingredient/flavor (e.g. "cold bread cookies", "mullet
+tea", "cactus nectar", "banana teas", a random phrase), delete just that item
+from its bullet - do not list it. Keep genuine but unusual teas (honey bush,
+rooibos, Russian Caravan, Tulsi). When unsure whether a tea is real, drop it.
+
 Keep everything operational (teas, orders, payment/equipment issues, traffic).
 Do not add commentary. Output ONLY the cleaned markdown log. /no_think"""
 
