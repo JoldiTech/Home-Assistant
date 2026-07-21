@@ -8,12 +8,16 @@ Design constraints (deliberate, do not "fix"):
   - Nothing is ever written to disk. All state - login sessions, chat
     history, generated images - lives only in this process's memory and
     is gone on restart, idle-timeout, or explicit reset.
-  - The password is never transmitted, not even at login: both browser and
-    server independently derive the same AES/HMAC key material from it
-    (PBKDF2), so a login is a challenge/response proof, not a password
-    submission. Every request/response body after that is an AES-GCM
-    envelope encrypted with that key - Cloudflare's edge (or anything else
-    on the path) only ever relays ciphertext it has no key for.
+  - The password is never transmitted OR stored, not even server-side. The
+    browser derives two independent PBKDF2 halves from it: an auth key and
+    an encryption key. The server persists ONLY the auth half - a login
+    verifier that can check a challenge/response proof but cannot decrypt
+    anything. The encryption key arrives at login wrapped under
+    HMAC(auth_key, nonce) and lives in server RAM only: a fresh process is
+    locked out of the prompt store until someone who knows the password
+    logs in. Every request/response body after login is an AES-GCM envelope
+    under that key - Cloudflare's edge (or anything else on the path, or
+    anything reading this box's disk) only ever has ciphertext.
   - The browser never persists the derived key anywhere (no localStorage/
     sessionStorage) - only an in-memory JS variable - so a page reload
     requires the password again by construction, not by policy.
@@ -74,12 +78,16 @@ except Exception:
 STATIC_DIR = Path(__file__).parent / "static"
 
 # Writable config dir (systemd punches a ReadWritePaths hole here despite
-# ProtectSystem=strict). Holds the two persisted things: the current
-# password (plaintext, mode 600 - same trust model as the old env file) and
-# the prompts, ENCRYPTED under the password-derived key. Conversations and
-# images are never persisted anywhere - see the module docstring.
+# ProtectSystem=strict). Holds the two persisted things: the AUTH half of
+# the PBKDF2 output (a login verifier - PBKDF2's output halves are
+# computationally independent, so it cannot yield the encryption key) and
+# the prompts, ENCRYPTED under the enc half, which is NEVER stored - the
+# browser delivers it at login, wrapped, and it lives in RAM only. Nothing
+# on this disk can decrypt anything. Conversations and images are never
+# persisted anywhere - see the module docstring.
 CONFIG_DIR = Path(os.environ.get("IMAGEGEN_CONFIG_DIR", "/var/lib/imagegen"))
-PASSWORD_FILE = CONFIG_DIR / "password"
+KAUTH_FILE = CONFIG_DIR / "k_auth"
+LEGACY_PASSWORD_FILE = CONFIG_DIR / "password"
 PROMPTS_FILE = CONFIG_DIR / "prompts.enc"
 
 IMAGE_MODEL_PATH = os.environ.get(
@@ -96,7 +104,7 @@ LOGIN_MAX_ATTEMPTS = 5
 LOGIN_WINDOW_SECONDS = 15 * 60
 MAX_HISTORY = 40  # messages kept per conversation, oldest dropped past this
 MAX_GALLERY = 30  # images kept per conversation-with-images session
-MIN_PASSWORD_LEN = 8
+MIN_PASSWORD_LEN = 8  # enforced client-side; the server never sees the password
 
 IMG_STEPS = 24  # DPM++ 2M Karras converges well here (was 32 w/ default scheduler)
 IMG_GUIDANCE = 6.0
@@ -118,16 +126,18 @@ PBKDF2_SALT = b"imagegen-e2e-v1"
 PBKDF2_ITERATIONS = 210000
 
 # --- mutable key material + prompt config, guarded by _config_lock ------------
-# The password-derived AES/HMAC keys can change at runtime (change-password),
-# so they are globals swapped under the lock, not import-time constants. The
-# browser derives the same keys from the password the user types; neither the
-# password nor the key ever crosses the network (login is challenge/response,
-# every body is an AES-GCM envelope). Cloudflare only ever relays ciphertext.
+# K_AUTH (stored on disk) can only verify login proofs. K_ENC exists ONLY in
+# this process's memory, and only after a successful login has delivered it:
+# the browser derives both halves from the password, proves knowledge of
+# K_AUTH against the challenge, and sends K_ENC wrapped under
+# HMAC(K_AUTH, "wrap-enc-key" || nonce) - Cloudflare relays ciphertext it
+# can never unwrap, and a fresh process cannot decrypt the prompts until
+# someone who knows the password logs in.
 _config_lock = threading.Lock()
 K_AUTH = b""
 K_ENC = b""
 _aesgcm = None
-_prompts = {}  # {"system_prompt": str, "image_prompt_prefix": str}
+_prompts = None  # {"system_prompt": str, "image_prompt_prefix": str} once unlocked
 
 
 def _derive_keys(password: str):
@@ -148,29 +158,32 @@ def _write_prompts_locked():
 
 
 def _load_config():
+    """Load (or create) the login verifier. The encryption key is deliberately
+    NOT recoverable here: a fresh process starts locked, and stays locked until
+    a browser that knows the password logs in and delivers the enc key."""
     global K_AUTH, K_ENC, _aesgcm, _prompts
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    if PASSWORD_FILE.exists():
-        password = PASSWORD_FILE.read_text().strip()
+    if KAUTH_FILE.exists():
+        K_AUTH = base64.b64decode(KAUTH_FILE.read_text().strip())
     else:
-        # First ever start: seed the persisted password from the env var
-        # (delivered via the systemd EnvironmentFile), then never read env again.
-        password = os.environ.get("IMAGEGEN_PASSWORD", "").strip()
+        # First start on this scheme. Derive the verifier from the legacy
+        # plaintext password file (upgrade path) or IMAGEGEN_PASSWORD (fresh
+        # install), store ONLY the auth half, and destroy the plaintext - the
+        # enc half is discarded; prompts.enc stays valid because the same
+        # password re-derives the same enc key at login.
+        if LEGACY_PASSWORD_FILE.exists():
+            password = LEGACY_PASSWORD_FILE.read_text().strip()
+        else:
+            password = os.environ.get("IMAGEGEN_PASSWORD", "").strip()
         if not password:
-            raise RuntimeError("no password file and IMAGEGEN_PASSWORD unset")
-        PASSWORD_FILE.write_text(password)
-        os.chmod(PASSWORD_FILE, 0o600)
-    K_AUTH, K_ENC = _derive_keys(password)
-    _aesgcm = AESGCM(K_ENC)
-    if PROMPTS_FILE.exists():
-        raw = PROMPTS_FILE.read_bytes()
-        _prompts = json.loads(_aesgcm.decrypt(raw[:12], raw[12:], None))
-    else:
-        _prompts = {
-            "system_prompt": DEFAULT_SYSTEM_PROMPT,
-            "image_prompt_prefix": DEFAULT_APPEARANCE,
-        }
-        _write_prompts_locked()
+            raise RuntimeError("no k_auth file, no legacy password file, IMAGEGEN_PASSWORD unset")
+        K_AUTH, _discard = _derive_keys(password)
+        KAUTH_FILE.write_text(base64.b64encode(K_AUTH).decode())
+        os.chmod(KAUTH_FILE, 0o600)
+        LEGACY_PASSWORD_FILE.unlink(missing_ok=True)
+    K_ENC = b""
+    _aesgcm = None
+    _prompts = None
 
 
 _load_config()
@@ -344,6 +357,43 @@ async def login(request: Request):
         _record_failure(ip)
         return JSONResponse({"error": "incorrect password"}, status_code=401)
 
+    # Unwrap the browser-delivered encryption key, then prove it by test-
+    # decrypting the prompt store. This binds login to the actual password:
+    # someone holding only the stored verifier (K_AUTH) can forge the HMAC
+    # proof, but cannot supply an enc key that decrypts prompts.enc.
+    global K_ENC, _aesgcm, _prompts
+    try:
+        wrap_key = hmac.new(K_AUTH, b"wrap-enc-key" + nonce, hashlib.sha256).digest()
+        ek = AESGCM(wrap_key).decrypt(
+            base64.b64decode(body.get("ek_iv", "")),
+            base64.b64decode(body.get("ek_ct", "")),
+            None,
+        )
+        if len(ek) != 32:
+            raise ValueError("bad key length")
+    except Exception:
+        _record_failure(ip)
+        return JSONResponse({"error": "incorrect password"}, status_code=401)
+
+    candidate = AESGCM(ek)
+    with _config_lock:
+        if PROMPTS_FILE.exists():
+            try:
+                raw = PROMPTS_FILE.read_bytes()
+                prompts = json.loads(candidate.decrypt(raw[:12], raw[12:], None))
+            except Exception:
+                _record_failure(ip)
+                return JSONResponse({"error": "incorrect password"}, status_code=401)
+            K_ENC, _aesgcm, _prompts = ek, candidate, prompts
+        else:
+            # Very first login ever: seed the prompt store under this key.
+            K_ENC, _aesgcm = ek, candidate
+            _prompts = {
+                "system_prompt": DEFAULT_SYSTEM_PROMPT,
+                "image_prompt_prefix": DEFAULT_APPEARANCE,
+            }
+            _write_prompts_locked()
+
     token = base64.urlsafe_b64encode(os.urandom(32)).decode()
     with _state_lock:
         _sessions[token] = {"last_seen": time.time(), **_new_conversation_state()}
@@ -426,18 +476,23 @@ async def change_password(request: Request):
     global K_AUTH, K_ENC, _aesgcm
     # The request is encrypted under the CURRENT (old) key; capture it so the
     # ack can be encrypted under it too - the browser is still holding the old
-    # key and won't re-derive until it re-logs-in.
+    # key and won't re-derive until it re-logs-in. The password itself never
+    # arrives: the browser derives the new key pair and sends the halves
+    # (length policy is enforced client-side; the server can't see length).
     old_aesgcm = _aesgcm
     body = _decrypt(await request.json(), aesgcm=old_aesgcm)
-    new_password = (body.get("new_password") or "").strip()
-    if len(new_password) < MIN_PASSWORD_LEN:
-        return JSONResponse(
-            _encrypt({"error": f"password must be at least {MIN_PASSWORD_LEN} characters"}, old_aesgcm)
-        )
+    try:
+        new_k_auth = base64.b64decode(body.get("new_k_auth", ""))
+        new_k_enc = base64.b64decode(body.get("new_k_enc", ""))
+        if len(new_k_auth) != 32 or len(new_k_enc) != 32:
+            raise ValueError("bad key length")
+    except Exception:
+        return JSONResponse(_encrypt({"error": "malformed key material"}, old_aesgcm))
     with _config_lock:
-        PASSWORD_FILE.write_text(new_password)
-        os.chmod(PASSWORD_FILE, 0o600)
-        K_AUTH, K_ENC = _derive_keys(new_password)
+        K_AUTH = new_k_auth
+        KAUTH_FILE.write_text(base64.b64encode(K_AUTH).decode())
+        os.chmod(KAUTH_FILE, 0o600)
+        K_ENC = new_k_enc
         _aesgcm = AESGCM(K_ENC)
         _write_prompts_locked()  # re-encrypt prompts under the NEW key
     # Force everyone (including this browser) to re-login with the new password.

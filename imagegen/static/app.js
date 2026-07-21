@@ -1,11 +1,13 @@
 "use strict";
 /*
- * All crypto happens here, in the browser. The derived key never leaves
- * this tab - not sent to the server, not written to localStorage/
- * sessionStorage/IndexedDB. A page reload wipes it from memory, by design:
- * that's what makes "gone once the browser is closed" true rather than a
- * claim. The server independently derives the same key from its own copy
- * of the password, so nothing needs to cross the network to agree on it.
+ * All crypto happens here, in the browser. The derived keys never persist
+ * anywhere - not localStorage/sessionStorage/IndexedDB; a page reload wipes
+ * them from memory, by design. The server stores ONLY the auth half of the
+ * PBKDF2 output (a login verifier that cannot decrypt anything); the
+ * encryption half is delivered to it at login, wrapped under a key derived
+ * from the auth half + the challenge nonce, so Cloudflare relays only
+ * ciphertext it can never unwrap and the server holds the encryption key
+ * in RAM only. Nothing stored on the server's disk can decrypt the prompts.
  */
 
 const PBKDF2_ITERATIONS = 210000;
@@ -29,7 +31,21 @@ async function deriveKeys(password) {
   const authBytes = full.slice(0, 32);
   const encBytes = full.slice(32, 64);
   const encKey = await crypto.subtle.importKey("raw", encBytes, "AES-GCM", false, ["encrypt", "decrypt"]);
-  return { authBytes, encKey };
+  return { authBytes, encBytes, encKey };
+}
+
+// Wrap the raw enc key for transit: AES-GCM under HMAC(kAuth, "wrap-enc-key" || nonce).
+// Cloudflare never sees kAuth, so it can't unwrap; the server (which stores
+// kAuth as its login verifier) can.
+async function wrapEncKey(authBytes, nonceBytes, encBytes) {
+  const label = new TextEncoder().encode("wrap-enc-key");
+  const input = new Uint8Array(label.length + nonceBytes.length);
+  input.set(label); input.set(nonceBytes, label.length);
+  const wrapBytes = await hmacProof(authBytes, input);
+  const wrapKey = await crypto.subtle.importKey("raw", wrapBytes, "AES-GCM", false, ["encrypt"]);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, wrapKey, encBytes);
+  return { ek_iv: b64e(iv), ek_ct: b64e(new Uint8Array(ct)) };
 }
 
 async function hmacProof(authBytes, nonceBytes) {
@@ -108,14 +124,16 @@ async function onLoginSubmit(e) {
   const btn = e.target.querySelector("button");
   btn.disabled = true;
   try {
-    const { authBytes, encKey } = await deriveKeys(password);
+    const { authBytes, encBytes, encKey } = await deriveKeys(password);
     const chRes = await fetch("/api/challenge", { method: "POST" });
     const { nonce } = await chRes.json();
-    const proof = await hmacProof(authBytes, b64d(nonce));
+    const nonceBytes = b64d(nonce);
+    const proof = await hmacProof(authBytes, nonceBytes);
+    const { ek_iv, ek_ct } = await wrapEncKey(authBytes, nonceBytes, encBytes);
     const loginRes = await fetch("/api/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ nonce, proof: b64e(proof) }),
+      body: JSON.stringify({ nonce, proof: b64e(proof), ek_iv, ek_ct }),
     });
     if (!loginRes.ok) {
       showLogin("incorrect password");
@@ -190,7 +208,13 @@ async function onChangePassword() {
   btn.disabled = true;
   $("pass-status").textContent = "changing...";
   try {
-    const res = await apiCall("/api/change-password", { new_password: p1 });
+    // The password itself never crosses the network - derive the new key
+    // pair here and send those (inside the current session's envelope).
+    const nk = await deriveKeys(p1);
+    const res = await apiCall("/api/change-password", {
+      new_k_auth: b64e(nk.authBytes),
+      new_k_enc: b64e(nk.encBytes),
+    });
     if (res.error) {
       $("pass-status").textContent = res.error;
       btn.disabled = false;
