@@ -40,9 +40,20 @@ long-lived tokens, so **add-on / Supervisor / host management must go through SS
 | `HOMEASSISTANT_TOKEN` | **yes** | HA long-lived access token (REST API auth) |
 | `HA_SSH_HOST` | no | `ssh.nmteaco.com` — the Cloudflare Access SSH hostname |
 | `HA_SSH_USER` | no | SSH login user. **May be empty — default to `root`** |
-| `HA_SSH_KEY_B64` | **yes** | base64 of the ed25519 private key |
-| `CF_ACCESS_CLIENT_ID` | **yes** | Cloudflare Access service-token ID (`*.access`) |
-| `CF_ACCESS_CLIENT_SECRET` | **yes** | Cloudflare Access service-token secret |
+| `HA_SSH_KEY_B64` | **yes** | base64 of the ed25519 private key (also authorized on the AI box, see below) |
+| `CF_ACCESS_CLIENT_ID_HA` | **yes** | Cloudflare Access service-token ID for the **HA box's** tunnel |
+| `CF_ACCESS_CLIENT_SECRET_HA` | **yes** | Cloudflare Access service-token secret for the **HA box's** tunnel |
+| `AI_BOX_SSH_HOST` | no | `ssh-ai.nmteaco.com` — SSH hostname for the **AI box** (see "AI box" below) |
+| `AI_BOX_SSH_USER` | no | SSH login user on the AI box. Defaults to `nmteaco` if unset |
+| `CF_ACCESS_CLIENT_ID_AI_BOX` | **yes** | Cloudflare Access service-token ID for the **AI box's** tunnel (separate from HA's) |
+| `CF_ACCESS_CLIENT_SECRET_AI_BOX` | **yes** | Cloudflare Access service-token secret for the **AI box's** tunnel |
+
+> **Naming history:** the Cloudflare Access vars used to be plain `CF_ACCESS_CLIENT_ID`/
+> `CF_ACCESS_CLIENT_SECRET` (HA was the only box). They were renamed to the `_HA`
+> suffix when the AI box got its own independent tunnel + service token, so each
+> box's credentials are distinct and independently revocable. If something that
+> reaches `ssh.nmteaco.com` breaks with `Permission denied (publickey,password)`
+> after an env-var change, check for this exact renaming first.
 
 ---
 
@@ -58,6 +69,39 @@ long-lived tokens, so **add-on / Supervisor / host management must go through SS
 - **`ssh.nmteaco.com` is NOT raw SSH on port 22.** It is SSH wrapped in an HTTPS
   WebSocket behind Cloudflare Access. You **must** tunnel through `cloudflared` and
   authenticate with the service token — a plain `ssh -p 22` will not work.
+
+### AI box (`nmteacoaiserver`)
+
+A separate machine — Ubuntu 24.04, NVIDIA RTX 2060 (driver `nvidia-driver-595-open`,
+CUDA 13.2 ceiling) — for GPU workloads (local transcription models, etc.). It has
+its **own independent Cloudflare Tunnel and Access application**, entirely separate
+from the HA box's tunnel (own service token, own hostname `ssh-ai.nmteaco.com`) —
+so it's reachable even if the HA box or its tunnel is ever down. It reuses the
+**same SSH private key** as the HA box (`HA_SSH_KEY_B64`'s public half is
+authorized on both machines) — only the Access layer differs per box.
+
+Connect with `ssh aibox` (set up by the same SessionStart hook / Setup script as
+`ssh homeassistant`).
+
+**Python ML stack** lives in a venv at `~/transcribe-env` on the box (activate with
+`source ~/transcribe-env/bin/activate`): `torch` (CUDA build, confirmed working on
+the RTX 2060), `faster-whisper`, `demucs`, `nemo_toolkit[asr]` (Parakeet). This is
+the exact Demucs-vocal-isolation → Whisper/Parakeet pipeline validated on the HA
+Green earlier — same tools, now with real GPU acceleration.
+
+**Talks to UniFi Protect directly** (no HA in the loop) via Protect's local
+Integrations API. Credentials are **not** in this repo or in the Claude session
+environment — they live only on the box itself:
+
+- `/etc/nmteaco/protect.env` (mode `600`, owned by `nmteaco`) — `PROTECT_API_KEY`
+  and `PROTECT_HOST` (`192.168.22.1` — the UniFi console's LAN IP; originally
+  discovered via HA's `unifiprotect` config entry, which reports a
+  `*.id.ui.direct` hostname — we resolved and pinned the LAN IP instead so the
+  pipeline doesn't depend on that DNS mechanism at boot).
+- Verified: `curl -k -H "X-API-KEY: $PROTECT_API_KEY" https://$PROTECT_HOST/proxy/protect/integration/v1/meta/info`
+  → `200 {"applicationVersion":"7.1.87"}`.
+- Any future systemd service on this box should read secrets via
+  `EnvironmentFile=/etc/nmteaco/protect.env`, never hardcode them.
 
 ---
 
@@ -94,8 +138,8 @@ cat > ~/.ssh/ha_cf_proxy.sh <<'EOF'
 #!/bin/bash
 exec env -u HTTPS_PROXY -u HTTP_PROXY -u ALL_PROXY -u https_proxy -u http_proxy -u all_proxy \
   cloudflared access ssh --hostname "$1" \
-    --service-token-id "$CF_ACCESS_CLIENT_ID" \
-    --service-token-secret "$CF_ACCESS_CLIENT_SECRET"
+    --service-token-id "$CF_ACCESS_CLIENT_ID_HA" \
+    --service-token-secret "$CF_ACCESS_CLIENT_SECRET_HA"
 EOF
 chmod 700 ~/.ssh/ha_cf_proxy.sh
 
@@ -109,6 +153,11 @@ ssh -i ~/.ssh/ha_ssh_key \
 
 For an interactive/repeat session you can drop the same values into `~/.ssh/config`
 as a `Host homeassistant` alias and then just `ssh homeassistant`.
+
+**AI box:** identical pattern — same key (`~/.ssh/ha_ssh_key`), but its own proxy
+wrapper reading `CF_ACCESS_CLIENT_ID_AI_BOX`/`CF_ACCESS_CLIENT_SECRET_AI_BOX`,
+hostname `${AI_BOX_SSH_HOST}`, user `${AI_BOX_SSH_USER:-nmteaco}`. The
+SessionStart hook sets both up automatically — connect with `ssh aibox`.
 
 ---
 
@@ -244,6 +293,122 @@ curl -sS -G -H "Authorization: Bearer $HOMEASSISTANT_TOKEN" \
 The history endpoint's `minimal_response` shrinks payloads but **omits `entity_id`
 on repeated rows** — don't use it when you need to know which camera each row
 belongs to.
+
+### Captain's Log (nightly, HA-triggered → AI box → GitHub)
+
+> **History:** an earlier design ran live on-box whisper.cpp add-ons
+> (`local_tea_one_transcribe`, `local_emporium_hall_transcribe`) that kept a
+> rolling transcript on the HA box. Those were **fully removed on 2026-07-20**
+> (add-ons uninstalled, `/share/*_transcript.log` + `/share/whisper_models`
+> deleted, the live "Transcripts" dashboard view removed, `addons/` deleted from
+> the repo). Nothing transcribes on the HA box anymore — HA only *triggers* the
+> AI box and *reads back* the finished log. No raw audio or verbatim transcript
+> is ever retained.
+
+Once a night the shop's day is distilled into a de-identified **Captain's Log**.
+The heavy lifting runs on the **AI box** (GPU); HA is only the scheduler and the
+reader. Source of truth is `transcribe/` in this repo (`captains_pipeline.py`,
+`transcribe_day.py`, `trigger_service.py`, `captains-transcribe.service`),
+deployed to `~/transcribe/` on the AI box and run as the
+`captains-transcribe.service` systemd unit (`~/transcribe-env` venv).
+
+- **Flow:** HA automation `captains_log_nightly` fires at **19:00 MT** →
+  `rest_command.captains_log_run` POSTs to the AI-box trigger service
+  (`http://192.168.22.6:8190/run`, header `X-Trigger-Token: !secret
+  aibox_trigger_token`, body `{"date": "..."}` — empty means today) → the box
+  transcribes **Tea One** for the day, summarizes, pushes the day-file, and
+  **deletes the transcription**. The endpoint returns `202` immediately and runs
+  in the background (`/health` reports `{"running":true|false}`).
+- **Transcription:** `faster-whisper large-v3` on the GPU, window **08:00–20:00
+  MT**, pulling Tea One's recording **directly from UniFi Protect** (Protect
+  Integrations API, creds from `/etc/nmteaco/protect.env`) — no HA in the audio
+  path. `condition_on_previous_text=False` + strict VAD to avoid hallucination
+  loops.
+- **Summarizer:** `Qwen3-8B-Q4_K_M.gguf` (`~/transcribe/models/`, not in git) via
+  llama-cpp-python (CUDA), ~30 GPU layers with a `[30, 20, 0]` fallback chain so
+  the job still finishes (slower) if Chloe is holding VRAM. Timestamps are
+  compacted to hourly markers + hierarchical chunk→notes→merge so a full day fits
+  the context, then a redaction pass strips names/personal-life/garbled products.
+- **Output:** one Markdown day-file `captains_log/YYYY-MM-DD.md` pushed to the
+  **`captains-log` branch** of this repo (persistent clone `~/ha-captains-repo`,
+  auth via a fine-grained PAT in `/etc/nmteaco/captains.env`). The transcription
+  is deleted after the log is pushed — GitHub holds only the sanitized log.
+- **HA read-back:** `sensor.captains_log` is a `command_line` sensor running
+  `/share/render_captains_log.py` (stdlib urllib), which fetches the day-files
+  from the `captains-log` branch via the GitHub API (read PAT in
+  `/config/captains_gh.token`) and emits `{"count", "content"}`. The **"Captain's
+  Log"** view on the **DowntownControls** dashboard (`dashboard-downtowncontrols`)
+  renders `content` (one collapsible `<details>` per day).
+- **Manage:** on the AI box `sudo systemctl {status,restart} captains-transcribe.service`,
+  `sudo journalctl -u captains-transcribe.service -f`; trigger a run by hand with
+  `curl -X POST -H "X-Trigger-Token: <tok>" -d '{"date":"YYYY-MM-DD"}'
+  http://127.0.0.1:8190/run`. Fire the whole HA→box path with
+  `POST /api/services/rest_command/captains_log_run`.
+- **Secrets:** AI box `/etc/nmteaco/captains.env` (trigger token + GitHub write
+  PAT); HA `secrets.yaml` `aibox_trigger_token` + `/config/captains_gh.token`
+  (GitHub read PAT). None are committed.
+
+### Chloe / ephemeral generation tool (AI box)
+
+A single password-gated web app ("Chloe") runs on the **AI box**, public at
+`https://aibox.nmteaco.com`, with three modes after login: **conversation**
+(local LLM chat), **conversation with images** (chat + an auto-generated image
+"from the assistant" per reply, flowing into a session sidebar), and **image
+only** (SDXL). Source of truth is `imagegen/` in this repo (`app.py`,
+`static/{index.html,app.js}`, `imagegen.service`); deployed to `~/imagegen/` on
+the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
+
+- **Models (not in git):** image = JuggernautXL Ragnarok (SDXL) at
+  `~/imagegen/models/juggernautXL_ragnarok.safetensors` (6.6 GB, re-download
+  from Civitai); chat = `Gemma-4-12B-OBLITERATED.Q4_K_M.gguf` (~7.4 GB, from
+  `mradermacher/Gemma-4-12B-OBLITERATED-GGUF`) via `llama-cpp-python`, **CPU-only**
+  (`n_gpu_layers=0`) so it never contends with SDXL for the 6 GB VRAM. Install
+  llama-cpp-python with `--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu`
+  (plain `--index-url` breaks dep resolution).
+- **Lazy load:** nothing loads at startup (~700 MB cold). The **Initialize**
+  button (`/api/initialize`) loads both models; steady state ~17 GB RAM. The
+  unit caps memory (`MemoryHigh=22G`, `MemoryMax=26G`) as a safety net.
+
+**Two hard guarantees (do not "optimize" away):**
+
+1. **E2E encrypted through Cloudflare.** The password never crosses the network
+   — login is an HMAC challenge/response; both browser (SubtleCrypto) and server
+   independently derive the same AES-GCM key from it via PBKDF2, and every
+   request/response body is an AES-GCM envelope. Cloudflare terminates TLS but
+   only relays ciphertext it has no key for. The browser keeps the key in a JS
+   variable only (no localStorage), so a reload re-prompts for the password.
+2. **Nothing conversational persists.** Conversations, images, and sessions are
+   in-memory only — gone on restart, 20-min idle timeout, reset, or tab close
+   (session cookie, no Max-Age). No database, no disk writes of content.
+
+- **Persisted state (the only two things on disk):** `/var/lib/imagegen/`
+  (owned by `nmteaco`, mode 700; `ReadWritePaths` hole in the strict sandbox).
+  `password` = current password, plaintext, mode 600 (server is the trusted
+  endpoint and needs it to derive keys — same trust model as `protect.env`).
+  `prompts.enc` = the editable prompts (assistant system prompt + image-prompt
+  prefix), AES-GCM encrypted under the password-derived key, decrypted only at
+  time of use. First-ever start seeds `password` from `IMAGEGEN_PASSWORD` (via
+  the systemd EnvironmentFile `/etc/nmteaco/imagegen.env`), then the file wins.
+- **Settings (after login):** edit the assistant prompts (persisted encrypted),
+  and **change the password** — which rewrites the password file, re-derives the
+  keys, re-encrypts the prompts under the new key, and clears all sessions. The
+  password IS the encryption key until changed again.
+- **Network:** binds `127.0.0.1:8189` only. Public hostname → tunnel →
+  `localhost:8189` is set in the Cloudflare **dashboard** (remotely-managed
+  tunnel, no local `config.yml`). A Cloudflare **Cache Rule** (`Hostname equals
+  aibox.nmteaco.com` → Bypass cache) plus `Cache-Control: no-store` and a strict
+  CSP (`script-src 'self'`) are defense-in-depth for the ephemerality guarantee.
+- **Concurrency/memory:** all GPU work is pinned to one dedicated thread
+  (`_gpu_executor`, max_workers=1), likewise the LLM (`_llm_executor`). This is
+  load-bearing — spreading generation across a thread pool leaked memory
+  (confirmed OOM at 16 GB+) via per-thread CUDA state. Conversation-with-images
+  generates the image in the background (client polls `/api/image-status`),
+  keeping any single request under Cloudflare's ~100 s origin timeout.
+- **Manage:** `sudo systemctl {status,restart,stop} imagegen.service`,
+  `sudo journalctl -u imagegen.service -f`. Hardened unit (`ProtectSystem=strict`,
+  `NoNewPrivileges=yes`); GPU needs `PrivateDevices=no`.
+- **Password:** change it in-app (Settings → change password), not by editing
+  files. `/etc/nmteaco/imagegen.env` only seeds the very first start. Never commit it.
 
 ### Repo conventions
 
