@@ -511,12 +511,48 @@ async function onChatSubmit(e) {
   const btn = e.target.querySelector("button[type=submit]");
   btn.disabled = true;
   $("chat-status").textContent = "thinking...";
+  const span = appendMessage("assistant", "");
   try {
-    const result = await apiCall("/api/chat", { message });
-    appendMessage("assistant", result.reply);
+    // The reply streams as newline-delimited encrypted envelopes: each line
+    // decrypts to {delta} to append, {replace} to retract-and-rewrite (the
+    // server's live channel-token filter), {error}, or {done}.
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(await encryptEnvelope({ message })),
+    });
+    if (res.status === 401) {
+      showLogin("session expired - enter password again");
+      throw new Error("session expired");
+    }
+    if (!res.ok) {
+      const raw = await res.json();
+      throw new Error(raw.error || `request failed (${res.status})`);
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "", text = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        const obj = await decryptEnvelope(JSON.parse(line));
+        if (obj.delta) { text += obj.delta; span.textContent = text; }
+        else if (obj.replace !== undefined) { text = obj.replace; span.textContent = text; }
+        else if (obj.error) throw new Error(obj.error);
+      }
+      span.parentElement.scrollIntoView({ block: "end" });
+    }
+    if (!text) span.parentElement.remove();
     $("chat-status").textContent = "";
   } catch (err) {
-    $("chat-status").textContent = "failed to get a reply";
+    if (!span.textContent) span.parentElement.remove();
+    $("chat-status").textContent = err.message || "failed to get a reply";
   } finally {
     btn.disabled = false;
   }

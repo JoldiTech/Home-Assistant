@@ -57,7 +57,7 @@ from diffusers import AutoencoderTiny, DPMSolverMultistepScheduler, StableDiffus
 from diffusers.image_processor import IPAdapterMaskProcessor
 from PIL import Image as PILImage
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from llama_cpp import Llama
 
@@ -711,12 +711,19 @@ def _run_image_job(job_id: str, prompt: str, mode_state: dict):
 
 @app.post("/api/chat")
 async def chat(request: Request):
+    """Streaming chat. The reply arrives as newline-delimited AES-GCM
+    envelopes under the session key - E2E holds per-chunk, Cloudflare only
+    relays ciphertext. Each decrypted chunk is {"delta": text} to append,
+    {"replace": text} when the live channel-token filter has to retract
+    already-shown text (a marker completed mid-stream), {"error": msg}, or
+    {"done": true}."""
     result = _require_session(request)
     if isinstance(result, JSONResponse):
         return result
     if _model_status != "ready":
         return JSONResponse({"error": "not initialized"}, status_code=503)
     token, state = result
+    aes = _current_aesgcm.get()
     body = _decrypt(await request.json())
     message = (body.get("message") or "").strip()[:4000]
     if not message:
@@ -724,10 +731,62 @@ async def chat(request: Request):
 
     history = state["chat"]["history"]
     history.append({"role": "user", "content": message})
-    reply = await asyncio.get_event_loop().run_in_executor(_llm_executor, _run_llm, history[-MAX_HISTORY:])
-    history.append({"role": "assistant", "content": reply})
-    del history[:-MAX_HISTORY]
-    return JSONResponse(_encrypt({"reply": reply}))
+    with _config_lock:
+        system_prompt = _prompts["system_prompt"]
+    messages = [{"role": "system", "content": system_prompt},
+                *history[-MAX_HISTORY:]]
+
+    q: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+
+    def produce():
+        raw, emitted = "", ""
+        try:
+            with _llm_lock:
+                for chunk in llm.create_chat_completion(
+                        messages=messages, max_tokens=LLM_MAX_TOKENS, stream=True,
+                        temperature=0.75, top_p=0.9, repeat_penalty=1.18):
+                    delta = (chunk["choices"][0].get("delta") or {}).get("content")
+                    if not delta:
+                        continue
+                    raw += delta
+                    cleaned = _clean_llm_text(raw)
+                    # Hold back a trailing partial marker ("<|chan...") so it
+                    # never flashes on screen before the regex can catch it.
+                    tail = cleaned[-14:]
+                    if "<" in tail:
+                        cleaned = cleaned[:len(cleaned) - (len(tail) - tail.index("<"))]
+                    if cleaned.startswith(emitted):
+                        d = cleaned[len(emitted):]
+                        if d:
+                            emitted = cleaned
+                            loop.call_soon_threadsafe(q.put_nowait, {"delta": d})
+                    else:
+                        # A late marker re-segmented the text: retract.
+                        emitted = cleaned
+                        loop.call_soon_threadsafe(q.put_nowait, {"replace": cleaned})
+            final = _clean_llm_text(raw)
+            with _state_lock:
+                history.append({"role": "assistant", "content": final})
+                del history[:-MAX_HISTORY]
+            if final != emitted:
+                loop.call_soon_threadsafe(q.put_nowait, {"replace": final})
+        except Exception as e:
+            print(f"chat stream failed: {e}", flush=True)
+            loop.call_soon_threadsafe(q.put_nowait, {"error": "generation failed"})
+        loop.call_soon_threadsafe(q.put_nowait, {"done": True})
+
+    loop.run_in_executor(_llm_executor, produce)
+
+    async def event_stream():
+        while True:
+            item = await q.get()
+            yield json.dumps(_encrypt(item, aes)) + "\n"
+            if item.get("done") or item.get("error"):
+                break
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson",
+                             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"})
 
 
 @app.post("/api/chat-image")
