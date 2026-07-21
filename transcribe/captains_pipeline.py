@@ -75,7 +75,10 @@ DEFAULT_REPO = "JoldiTech/Home-Assistant"
 LOG_BRANCH = "captains-log"
 REPO_CLONE = Path.home() / "ha-captains-repo"
 
-DEFAULT_DASHBOARD = "https://www.nmteaco.com"
+# dashboard.nmteaco.com, NOT www.nmteaco.com — www sits behind a Cloudflare
+# bot challenge that blocks non-browser callers; the dashboard hostname
+# serves tools/ directly (same host the GitHub deploy webhook uses).
+DEFAULT_DASHBOARD = "https://dashboard.nmteaco.com"
 DATALOG_ENDPOINTS = ("sales", "shipping", "support", "calls", "texts", "timeclock")
 
 SOURCE_LINE = (
@@ -266,7 +269,7 @@ def _datalog_get(env: dict, endpoint: str, params: dict) -> dict | None:
     if not token:
         return None
     base = env.get("DASHBOARD_BASE_URL", DEFAULT_DASHBOARD).rstrip("/")
-    url = f"{base}/dashboard/tools/datalog/{endpoint}.php?" + urllib.parse.urlencode(params)
+    url = f"{base}/tools/datalog/{endpoint}.php?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     for attempt in (1, 2):
         try:

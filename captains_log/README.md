@@ -112,8 +112,8 @@ All on the AI box in `/etc/nmteaco/captains.env` (mode 600, never committed):
 | Key | Purpose |
 | --- | --- |
 | `GITHUB_TOKEN` | push the finished log to the `captains-log` branch |
-| `DATALOG_API_TOKEN` | bearer token for `https://www.nmteaco.com/dashboard/tools/datalog/*.php` (same value lives in the dashboard's `/home/nmteaco/.env`) |
-| `DASHBOARD_BASE_URL` | optional override, default `https://www.nmteaco.com` |
+| `DATALOG_API_TOKEN` | bearer token for `https://dashboard.nmteaco.com/tools/datalog/*.php` (same value lives in the dashboard's `/home/nmteaco/.env`) |
+| `DASHBOARD_BASE_URL` | optional override, default `https://dashboard.nmteaco.com` (www is bot-challenged) |
 | `SLACK_BOT_TOKEN` | optional; scopes `channels:history` (+`groups:history` for private channels), `users:read` — bot must be invited to the channels |
 | `SLACK_CHANNELS` | optional; comma-separated channel IDs to read |
 
