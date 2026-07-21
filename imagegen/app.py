@@ -123,6 +123,13 @@ IMG_PRESETS = {
 }
 IMG_DEFAULT_PRESET = "balanced"
 IMG_SIZE = 1024
+# Baseline negative prompt - the single biggest artistic-quality lever SDXL
+# has. Callers can override per-request; empty string disables entirely.
+IMG_DEFAULT_NEGATIVE = (
+    "blurry, lowres, bad anatomy, deformed, disfigured, extra fingers, extra "
+    "limbs, mutated hands, watermark, signature, text, jpeg artifacts, "
+    "worst quality, cartoon, 3d render"
+)
 LLM_MAX_TOKENS = 512
 LLM_CONTEXT = 8192
 
@@ -585,11 +592,44 @@ def _build_image_prompt_from_message(message: str) -> str:
     return f"{appearance}. {scene}"[:240]
 
 
-def _run_image(prompt: str, quality: str = IMG_DEFAULT_PRESET) -> str:
+PROMPT_ASSIST_SYSTEM = (
+    "You turn a short image idea into ONE detailed Stable Diffusion XL prompt. "
+    "Keep the user's subject exactly (if they name a fictional character, add "
+    "the actor's real name - diffusion models know actors, not characters), "
+    "then add concrete artistic direction: shot type, composition, lighting, "
+    "color palette, mood, lens/film or art style. Comma-separated fragments, "
+    "not sentences. HARD LIMIT ~55 words (CLIP truncates past that - front-load "
+    "what matters). Output ONLY the prompt, nothing else."
+)
+
+
+def _expand_image_prompt(user_prompt: str) -> str:
+    """Optional 'prompt assist': the local chat LLM (CPU) adds artistic
+    direction. Falls back to the raw prompt on any failure."""
+    try:
+        with _llm_lock:
+            completion = llm.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": PROMPT_ASSIST_SYSTEM},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=140, temperature=0.7, top_p=0.9, repeat_penalty=1.15,
+            )
+        expanded = completion["choices"][0]["message"]["content"].strip().strip('"')
+        return expanded if expanded else user_prompt
+    except Exception as e:
+        print(f"prompt assist failed, using raw prompt: {e}", flush=True)
+        return user_prompt
+
+
+def _run_image(prompt: str, quality: str = IMG_DEFAULT_PRESET,
+               negative: str | None = None) -> str:
     p = IMG_PRESETS.get(quality, IMG_PRESETS[IMG_DEFAULT_PRESET])
+    neg = IMG_DEFAULT_NEGATIVE if negative is None else negative
     with _gpu_lock:
         image = image_pipe(
-            prompt=prompt, num_inference_steps=p["steps"], guidance_scale=p["guidance"],
+            prompt=prompt, negative_prompt=neg or None,
+            num_inference_steps=p["steps"], guidance_scale=p["guidance"],
             height=IMG_SIZE, width=IMG_SIZE,
         ).images[0]
         # 6GB is a tight budget for SDXL's VAE-decode memory spike specifically -
@@ -707,10 +747,18 @@ async def image_only(request: Request):
     quality = body.get("quality")
     if quality not in IMG_PRESETS:
         quality = IMG_DEFAULT_PRESET
+    negative = body.get("negative")
+    if negative is not None:
+        negative = str(negative).strip()[:1000]
+
+    final_prompt = prompt
+    if body.get("assist"):
+        final_prompt = await asyncio.get_event_loop().run_in_executor(
+            _llm_executor, _expand_image_prompt, prompt)
 
     try:
         image_b64 = await asyncio.get_event_loop().run_in_executor(
-            _gpu_executor, _run_image, prompt, quality)
+            _gpu_executor, _run_image, final_prompt, quality, negative)
     except RuntimeError:
         # Almost always CUDA OOM - the nightly Captain's Log transcription
         # holds ~4GB of the 6GB card while it runs.
@@ -721,7 +769,10 @@ async def image_only(request: Request):
     gallery = state["image"]["gallery"]
     gallery.append(image_b64)
     del gallery[:-MAX_GALLERY]
-    return JSONResponse(_encrypt({"image": image_b64}))
+    return JSONResponse(_encrypt({
+        "image": image_b64,
+        "used_prompt": final_prompt if final_prompt != prompt else None,
+    }))
 
 
 def _load_models():

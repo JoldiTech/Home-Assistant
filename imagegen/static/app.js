@@ -325,6 +325,9 @@ function renderImageOnly() {
     <h2>generate an image</h2>
     <form id="image-form">
       <textarea id="image-prompt" rows="3" placeholder="describe the image..." autofocus required></textarea>
+      <textarea id="image-negative" rows="2" placeholder="avoid in the image (optional - a sensible default is applied if empty)"></textarea>
+      <label><input type="checkbox" id="image-assist"> prompt assist - the local LLM adds artistic
+        direction (composition, lighting, style) to your idea first (+~15s)</label>
       <label for="image-quality">quality</label>
       <select id="image-quality">
         <option value="quick">quick (~15s)</option>
@@ -333,6 +336,7 @@ function renderImageOnly() {
       </select>
       <button type="submit">generate</button>
     </form>
+    <div id="used-prompt"></div>
     <div id="image-status"></div>
     <div id="gallery-panel" class="wide"><h3>images this session</h3><div id="gallery"></div></div>`;
   $("back").addEventListener("click", (e) => { e.preventDefault(); showModePicker(); });
@@ -352,11 +356,16 @@ async function onImageSubmit(e) {
   const btn = e.target.querySelector("button");
   btn.disabled = true;
   const quality = $("image-quality").value;
+  const assist = $("image-assist").checked;
+  const negRaw = $("image-negative").value.trim();
   const eta = { quick: "~15s", balanced: "~30s", best: "~55s" }[quality] || "";
-  $("image-status").textContent = `generating (${quality})... ${eta}`;
+  $("image-status").textContent = `generating (${quality}${assist ? " + assist" : ""})... ${eta}`;
   try {
-    const { image } = await apiCall("/api/image", { prompt, quality });
+    const payload = { prompt, quality, assist };
+    if (negRaw) payload.negative = negRaw;
+    const { image, used_prompt } = await apiCall("/api/image", payload);
     appendGalleryImage(image);
+    $("used-prompt").textContent = used_prompt ? `assist used: ${used_prompt}` : "";
     $("image-status").textContent = "";
   } catch (err) {
     $("image-status").textContent = err.message || "generation failed";
