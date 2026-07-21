@@ -228,8 +228,10 @@ function renderInitState(status) {
   const area = $("init-area");
   const modeButtons = $("mode-buttons");
   if (status === "ready") {
-    area.innerHTML = "";
+    area.innerHTML = `<p id="chat-status"><a href="#" id="unload-btn">shut down models</a>
+      &mdash; frees the GPU and RAM; your chats &amp; images stay until logout</p>`;
     modeButtons.style.display = "flex";
+    $("unload-btn").addEventListener("click", (e) => { e.preventDefault(); doUnload(); });
   } else if (status === "loading") {
     area.innerHTML = `<p id="chat-status">initializing models... (~20s)</p>`;
     modeButtons.style.display = "none";
@@ -251,6 +253,11 @@ async function startInit() {
   const { status } = await apiCall("/api/initialize", {});
   renderInitState(status);
   if (status === "loading") setTimeout(checkInit, 2000);
+}
+
+async function doUnload() {
+  const { status } = await apiCall("/api/unload", {});
+  renderInitState(status);
 }
 
 async function openMode(mode) {

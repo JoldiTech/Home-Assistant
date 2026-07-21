@@ -687,6 +687,43 @@ def _business_sections(biz: dict) -> str:
     return "\n".join(parts)
 
 
+# --- GPU coordination with Chloe (imagegen) -----------------------------------
+
+def _free_vram_mb() -> int:
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return int(r.stdout.strip().splitlines()[0])
+    except Exception:
+        return -1  # can't tell - proceed and let the load attempt decide
+
+def _ensure_gpu(min_free_mb: int, wait_s: int = 180) -> bool:
+    """If VRAM is short, ask Chloe (imagegen, loopback :8189) to release the
+    GPU - her models unload without losing any session state - then wait for
+    the memory to actually come back. Best-effort: callers still have their
+    own failure paths."""
+    free = _free_vram_mb()
+    if free < 0 or free >= min_free_mb:
+        return True
+    _warn(f"only {free}MB VRAM free (need {min_free_mb}) - asking Chloe to release the GPU")
+    try:
+        req = urllib.request.Request("http://127.0.0.1:8189/api/release-gpu", method="POST")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            _warn(f"imagegen release-gpu: {r.read().decode()[:120]}")
+    except Exception as e:
+        _warn(f"imagegen release-gpu unreachable ({e}) - waiting anyway")
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        time.sleep(5)
+        free = _free_vram_mb()
+        if free >= min_free_mb:
+            return True
+    _warn(f"VRAM still short after {wait_s}s ({free}MB free)")
+    return False
+
+
 # --- transcription ------------------------------------------------------------
 
 def _transcribe(date_str: str) -> tuple[str, Path]:
@@ -701,6 +738,8 @@ def _transcribe(date_str: str) -> tuple[str, Path]:
             and not os.environ.get("FORCE_RETRANSCRIBE")):
         _warn(f"reusing existing transcript {log_path}")
         return log_path.read_text(), log_path
+    # large-v3 has no CPU fallback: make sure Chloe isn't holding the card.
+    _ensure_gpu(4200)
     _warn(f"transcribing {date_str}...")
     proc = subprocess.run(
         [sys.executable, str(TRANSCRIBE_SCRIPT), date_str],
@@ -782,6 +821,9 @@ def _strip_think(text: str) -> str:
 def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
                allowed_names: set, context_text: str = "") -> str:
     _warn("loading summarizer...")
+    # Prefer a clear card (fast GPU path); the layer-fallback below still
+    # covers the case where the VRAM never frees up.
+    _ensure_gpu(3800, wait_s=60)
     # Load with a fallback chain: the configured layer count, then fewer, then
     # CPU. Covers the edge case where Chloe's image tool is holding VRAM at run
     # time - the summary still completes (slower) instead of failing the job.

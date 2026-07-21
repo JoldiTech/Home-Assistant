@@ -613,7 +613,15 @@ async def image_only(request: Request):
     if not prompt:
         return JSONResponse({"error": "empty prompt"}, status_code=400)
 
-    image_b64 = await asyncio.get_event_loop().run_in_executor(_gpu_executor, _run_image, prompt)
+    try:
+        image_b64 = await asyncio.get_event_loop().run_in_executor(_gpu_executor, _run_image, prompt)
+    except RuntimeError:
+        # Almost always CUDA OOM - the nightly Captain's Log transcription
+        # holds ~4GB of the 6GB card while it runs.
+        return JSONResponse(
+            {"error": "GPU is busy (likely the nightly Captain's Log run) - try again in ~30 minutes"},
+            status_code=503,
+        )
     gallery = state["image"]["gallery"]
     gallery.append(image_b64)
     del gallery[:-MAX_GALLERY]
@@ -660,6 +668,58 @@ def _load_models():
         print(f"model load failed: {e}", flush=True)
         with _model_status_lock:
             _model_status = "error"
+
+
+def _unload_models():
+    """Free the GPU (and the chat model's RAM) without killing anything user-
+    visible: sessions, conversations, and galleries live in _sessions, not in
+    the model objects, so everything picks up where it left off after the next
+    Initialize. Runs on _gpu_executor so teardown happens on the same thread
+    (and CUDA context) that loaded the models."""
+    global image_pipe, llm, _model_status
+    with _gpu_lock:
+        image_pipe = None
+        llm = None
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    with _model_status_lock:
+        _model_status = "cold"
+    print("models unloaded, GPU released", flush=True)
+
+
+@app.post("/api/unload")
+async def unload(request: Request):
+    result = _require_session(request)
+    if isinstance(result, JSONResponse):
+        return result
+    with _model_status_lock:
+        busy = _model_status == "loading"
+    if not busy and _model_status != "cold":
+        await asyncio.get_event_loop().run_in_executor(_gpu_executor, _unload_models)
+    return JSONResponse(_encrypt({"status": _model_status}))
+
+
+@app.post("/api/release-gpu")
+async def release_gpu(request: Request):
+    # Internal coordination endpoint for the nightly Captain's Log pipeline:
+    # it asks Chloe to vacate the GPU before transcription. Requests proxied
+    # through the Cloudflare tunnel always carry CF-Connecting-IP (Cloudflare
+    # overwrites any client-supplied value), so its absence == a genuinely
+    # local caller. No session, no envelope - this endpoint holds no data.
+    if request.headers.get("cf-connecting-ip"):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    with _model_status_lock:
+        status = _model_status
+    released = False
+    if status == "ready" or status == "error":
+        await asyncio.get_event_loop().run_in_executor(_gpu_executor, _unload_models)
+        released = True
+    with _model_status_lock:
+        status = _model_status
+    return JSONResponse({"status": status, "released": released})
 
 
 @app.post("/api/initialize")
