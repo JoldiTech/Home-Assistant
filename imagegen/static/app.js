@@ -270,17 +270,11 @@ function showModePicker() {
   checkInit();
 }
 
-const PLACEMENT_LABELS = {
-  cpu: "CPU — image model keeps the GPU (default)",
-  gpu_partial: "GPU partial — faster chat, image generation may fail while loaded",
-  gpu_heavy: "GPU heavy — fastest chat, image generation unavailable while loaded",
-};
-
 function renderInitState(st) {
   const area = $("init-area");
   const modeButtons = $("mode-buttons");
   if (st.status === "ready") {
-    area.innerHTML = `<p id="chat-status">chat model: ${escapeText(st.chat_model)} (${escapeText(st.placement)})
+    area.innerHTML = `<p id="chat-status">chat model: ${escapeText(st.chat_model)}
       &mdash; <a href="#" id="unload-btn">shut down models</a>
       (frees the GPU and RAM; your chats &amp; images stay until logout)</p>`;
     modeButtons.style.display = "flex";
@@ -289,22 +283,18 @@ function renderInitState(st) {
     area.innerHTML = `<p id="chat-status">initializing models... (~30s)</p>`;
     modeButtons.style.display = "none";
   } else {
-    // cold OR error - both are startable; the server ships the picker
-    // options in both. Build <option>s as DOM nodes (no attribute-injection
-    // surface from model filenames).
+    // cold OR error - both are startable; the server ships the model list in
+    // both. Build <option>s as DOM nodes (no attribute-injection surface).
     modeButtons.style.display = "none";
     const errLine = st.status === "error" && st.error
-      ? `<p class="err">last attempt failed: ${escapeText(st.error)} — check the model/placement and try again</p>` : "";
+      ? `<p class="err">last attempt failed: ${escapeText(st.error)} — try again</p>` : "";
     area.innerHTML = `
-      <label for="chat-model-sel">chat model</label>
+      <label for="chat-model-sel">chat model (runs on CPU; the GPU is reserved for images)</label>
       <select id="chat-model-sel"></select>
-      <label for="chat-place-sel">chat model placement</label>
-      <select id="chat-place-sel"></select>
       <button id="init-btn">initialize system</button>
       ${errLine}
       <p id="chat-status">models aren't loaded yet - nothing uses memory until you start this</p>`;
     fillSelect($("chat-model-sel"), st.models || [st.chat_model], st.chat_model, (m) => m);
-    fillSelect($("chat-place-sel"), st.placements || ["cpu"], st.placement, (p) => PLACEMENT_LABELS[p] || p);
     $("init-btn").addEventListener("click", startInit);
   }
 }
@@ -328,7 +318,6 @@ async function checkInit() {
 async function startInit() {
   const st = await apiCall("/api/initialize", {
     chat_model: $("chat-model-sel") ? $("chat-model-sel").value : undefined,
-    chat_placement: $("chat-place-sel") ? $("chat-place-sel").value : undefined,
   });
   renderInitState(st);
   if (st.status === "loading") setTimeout(checkInit, 2000);

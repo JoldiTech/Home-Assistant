@@ -105,13 +105,17 @@ IMAGE_MODEL_PATH = os.environ.get(
 LLM_MODEL_PATH = os.environ.get(
     "LLM_MODEL_PATH", os.path.expanduser("~/imagegen/models/Gemma-4-12B-OBLITERATED.Q4_K_M.gguf")
 )
-# Chat-model picker: any .gguf in the models dir is selectable at Initialize,
-# with a CPU/GPU placement choice. GPU placement shares the 6GB card with
-# SDXL - partial offload speeds chat but crowds image generation; heavy
-# offload effectively claims the card for chat. Requires the CUDA build of
-# llama-cpp-python (torch's import preloads the bundled CUDA libs it needs).
+# Chat-model picker: any .gguf in the models dir is selectable at Initialize.
+# Chat is ALWAYS CPU-inference. This is not a limitation to "fix": imagegen-env
+# uses the CPU-ONLY build of llama-cpp-python ON PURPOSE. The CUDA build
+# reserves ~1GB of VRAM even at n_gpu_layers=0, and on the 6GB card that 1GB
+# is exactly enough to push SDXL's ~4.6GB generation peak into OOM - image
+# generation and GPU-offloaded chat cannot coexist here. CPU chat uses zero
+# VRAM, so SDXL owns the card and both work. (Rebuild note: install with
+# CMAKE_ARGS="-DGGML_CUDA=off" --no-binary llama-cpp-python; the prebuilt CPU
+# wheels are musl-linked and won't load on glibc.)
 GGUF_DIR = Path(LLM_MODEL_PATH).parent
-CHAT_PLACEMENTS = {"cpu": 0, "gpu_partial": 16, "gpu_heavy": 28}
+CHAT_GPU_LAYERS = 0  # CPU-only build ignores this; kept explicit
 PORT = int(os.environ.get("PORT", "8189"))
 
 SESSION_IDLE_TIMEOUT = 20 * 60  # session (and its conversation) dies after this much inactivity
@@ -249,7 +253,7 @@ llm = None
 _model_status_lock = threading.Lock()
 _model_status = "cold"  # cold -> loading -> ready; error -> back to a cold-like retry
 _model_error = ""       # last load failure, surfaced to the picker so the user can retry
-_chat_selection = {"model": Path(LLM_MODEL_PATH).name, "placement": "cpu"}
+_chat_selection = {"model": Path(LLM_MODEL_PATH).name}
 
 
 def _list_chat_models() -> list[str]:
@@ -263,15 +267,13 @@ def _init_payload() -> dict:
     with _model_status_lock:
         status = _model_status
         err = _model_error
-    payload = {"status": status, "chat_model": _chat_selection["model"],
-               "placement": _chat_selection["placement"]}
+    payload = {"status": status, "chat_model": _chat_selection["model"]}
     # Any state that isn't actively loading or ready is a state the user must
     # be able to (re)start from - so always ship the picker options there,
     # including 'error'. Otherwise a transient load failure strips the picker
     # to fallbacks AND leaves no way forward.
     if status not in ("loading", "ready"):
         payload["models"] = _list_chat_models()
-        payload["placements"] = list(CHAT_PLACEMENTS)
     if status == "error":
         payload["error"] = err
     return payload
@@ -974,8 +976,8 @@ def _load_models():
         print("image model ready", flush=True)
 
         chat_path = str(GGUF_DIR / _chat_selection["model"])
-        n_layers = CHAT_PLACEMENTS.get(_chat_selection["placement"], 0)
-        print(f"loading chat model {_chat_selection['model']} (gpu_layers={n_layers})...", flush=True)
+        n_layers = CHAT_GPU_LAYERS  # always 0 - CPU-only build (see note at top)
+        print(f"loading chat model {_chat_selection['model']} (CPU)...", flush=True)
         try:
             llm = Llama(model_path=chat_path, n_ctx=LLM_CONTEXT, n_threads=8,
                         n_gpu_layers=n_layers, verbose=False)
@@ -1071,11 +1073,8 @@ async def initialize(request: Request):
         # the picker. Only 'loading'/'ready' are guarded.
         if _model_status in ("cold", "error"):
             model = body.get("chat_model")
-            placement = body.get("chat_placement")
             if model in _list_chat_models():
                 _chat_selection["model"] = model
-            if placement in CHAT_PLACEMENTS:
-                _chat_selection["placement"] = placement
             _model_status = "loading"
             _model_error = ""
             # Load on _gpu_executor's thread specifically, so the CUDA
