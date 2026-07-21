@@ -96,93 +96,74 @@ SOURCE_LINE = (
 # Mirrors captains_log/README.md. Strict de-identification applies to AUDIO;
 # structured business records keep real names. This is the judgment the whole
 # system exists to do well.
-SYSTEM_PROMPT = """You write a store's daily "Captain's Log" - an operational \
-summary of the shop's day, NOT a transcript of who said what.
+SYSTEM_PROMPT = """You write the shop's daily Captain's Log - a SHORT \
+operational narrative in the spirit of a ship's log: what kind of day it was, \
+what actually happened, what the crew dealt with. It is a story of the day for \
+the owner to read in one minute - NOT a list of topics customers discussed.
 
-Your input mixes THREE kinds of material - treat them differently:
+Your input mixes THREE kinds of material:
 
 1. AUDIO - shop-floor speech transcribed from the camera mic. Lossy, garbled,
    and PRIVATE: everything overheard must be de-identified and filtered.
 2. POS lines - "[14:32] ⟦POS $23.50 — Earl Grey 2oz ×1⟧". Ground truth from
    the register, NOT audio. Amounts, items, and times are exact: never treat
-   them as garble, never alter them. Use them to confirm products heard on
-   audio and to connect a conversation to an actual sale (a sample offered on
-   audio, then the item in a POS line minutes later, is worth noting).
+   them as garble, never alter them.
 3. SLACK - staff work chat ("===== SLACK #channel ====="). A written business
-   record: staff names appearing there are fine to use in the log.
+   record giving extra context.
 
-NAME RULE: a person's name may appear in the log ONLY if it comes from a
-structured source (POS / SLACK). Anyone merely overheard on AUDIO stays
-anonymous - no customer or staff names from audio, ever. When you use a name
-from SLACK, attribute it in the bullet ("per Slack: ...") so its origin is
-auditable; an unattributed name is treated as an audio leak and removed.
+All three are just context for ONE story - never mention where a fact came
+from (no "per Slack", no "on audio", no source labels). Write it as what
+happened at the shop.
 
-INCLUDE:
-- Store rhythm: active hours, busy vs quiet stretches, overall traffic feel.
-- Product/topic interest: which teas, categories, and questions came up.
-- Operational events worth remembering: order/payment issues, stock/supply
-  mentions, equipment problems, notable large/curbside/wholesale orders.
-- Staff-surfaced business observations (from audio de-identified, from Slack
-  with names). Anything actionable for running the shop.
+WHAT BELONGS IN THE NARRATIVE (2-4 short paragraphs):
+- The shape of the day: active hours, busy vs quiet, overall rhythm - one or
+  two sentences, woven in, not a list of hour markers.
+- EVENTS: payment/order discrepancies, equipment problems, stock-outs, large
+  or unusual orders, deliveries, projects the staff worked on (packing runs,
+  training, installations), anything that would matter tomorrow.
+- What got handled: if a problem came up AND was resolved, say so in a clause.
 
-NEVER write (applies to AUDIO content - be strict):
-- Names or anything identifying a specific person overheard on audio.
-- Contact info (phone, email, address).
-- Health/medical details tied to an individual. You MAY note "a wellness-tea
-  consultation occurred" in the aggregate - never the person or their specifics.
-- ANY personal-life content overheard on the floor that is not about running the
-  tea shop. Drop it entirely - do NOT summarize it. This includes: someone's
-  schooling or college, jobs/side-businesses (e.g. solar sales), hobbies, art
-  fairs, museum or travel mentions, family, relationships, religion, politics,
-  people's personal struggles or feelings, and small talk.
-- Verbatim quotes that could identify someone. Gossip or interpersonal conflict.
+WHAT DOES NOT BELONG: routine retail. Customers asking about brewing, teas
+they browsed, product recommendations, samples handed out - that is every day
+at a tea shop. At most one clause of flavor ("steady stream of tea questions
+and tastings"); never enumerate products or topics. No bullet lists of
+"interest in X, Y, Z".
 
-RULES:
-- When in doubt, leave it out. A shorter, safer log beats an oversharing one.
-- Audio transcription is lossy. Only list a product from AUDIO if it is a
-  plausible real tea / herb / ingredient / blend - or if a POS line confirms
-  it. If an audio product name looks garbled ("breakfast assaulting piece",
-  "acrimon teat"), DROP it - never guess. POS product names are always real.
-- In "Notable / follow-ups", lead with the SINGLE most important actionable
-  item, stated specifically - especially any cash / payment / order discrepancy,
-  with its amount and what to reconcile. Then the rest. Merge duplicates into
-  one bullet per real event, not several.
-- Keep it operational: teas, categories, orders, payment/equipment issues, traffic.
-- MERGE, don't enumerate: each section gets at most 6 bullets. Combine
-  overlapping themes into one bullet; a bullet must state a specific fact or
-  action - delete filler like "discussion about inventory issues" that says
-  nothing. One real event = one bullet, across the whole log.
-- Output ONLY the markdown log in the exact format given. No preamble, no
-  <think> tags, no reasoning - just the log. /no_think"""
+Then ONE section, "## Unresolved", listing ONLY things still open at close:
+discrepancies to reconcile (with amounts), promised follow-ups, broken
+equipment, supplies to reorder. Something resolved during the day does NOT go
+here. 0-5 bullets, each a specific action someone could pick up tomorrow.
+
+PRIVACY (strict, applies to AUDIO):
+- A person's name may appear ONLY if it comes from SLACK or a business record
+  - anyone merely overheard on audio stays anonymous ("a customer", "a
+  wholesale account"). No contact info. No health details tied to a person.
+- NO personal-life content overheard on the floor (school, jobs, hobbies,
+  travel, family, relationships, religion, politics, feelings, small talk) -
+  drop it entirely. No verbatim quotes that could identify someone; no gossip.
+- Audio is lossy: never repeat a garbled phrase as fact; if a detail looks
+  like mis-transcription, drop it. When in doubt, leave it out.
+
+Output ONLY the markdown log in the exact format given. No preamble, no
+<think> tags, no reasoning - just the log. /no_think"""
 
 LOG_FORMAT = """# Captain's Log — {weekday} {date}
 
-**Hours active:** …
-**Traffic:** …
+<2-4 short narrative paragraphs>
 
-## Product & topics
-- …
-
-## Notable / follow-ups
-- …
-
-## Staff & ops notes
-- …
-
-""" + SOURCE_LINE
+## Unresolved
+- <0-5 specific open items>"""
 
 USER_TEMPLATE = """Write the Captain's Log for {weekday} {date} from this Tea One \
 transcript. AUDIO lines are plain text after [HH:00] markers; POS register lines \
-look like "[HH:MM] ⟦POS …⟧"; SLACK blocks may follow the transcript. Combine per \
-policy.
+look like "[HH:MM] ⟦POS …⟧"; SLACK blocks may follow the transcript.
 
 Use EXACTLY this format:
 
 """ + LOG_FORMAT + """
 
-The FIRST speech was captured at {first_ts} and the LAST at {last_ts}. Use these
-as the real "Hours active" (do NOT invent a wider window). Describe traffic
-relative to the [HH:00] time markers in the transcript.
+The FIRST speech was captured at {first_ts} and the LAST at {last_ts} - the day
+ran between those times; do not invent a wider window.
 
 TRANSCRIPT:
 {transcript}"""
@@ -191,12 +172,12 @@ NOTES_TEMPLATE = "Notes for time slice {i} of {n} (times are HH:00 markers):\n\n
 
 FINAL_FROM_NOTES = """Write the Captain's Log for {weekday} {date} from these \
 notes taken across the day's Tea One audio + POS lines (SLACK blocks may follow). \
-Merge and de-dupe them per policy into ONE log in EXACTLY this format:
+Merge them per policy into ONE log in EXACTLY this format:
 
 """ + LOG_FORMAT + """
 
-The FIRST speech was captured at {first_ts} and the LAST at {last_ts}. Use these
-as the real "Hours active" (do NOT invent a wider window).
+The FIRST speech was captured at {first_ts} and the LAST at {last_ts} - the day
+ran between those times; do not invent a wider window.
 
 NOTES:
 {notes}"""
@@ -207,18 +188,18 @@ about (say) an end-of-day payment discrepancy could not reference the earlier \
 order it concerns. You see the whole day at once - fix that.
 
 You are given RECORDS (orders, support tickets, calls - each with id, time,
-amount, items) and the DRAFT log. Where a draft bullet clearly refers to one
-of the records, append a parenthetical reference to that bullet, e.g.:
+amount, items) and the DRAFT log. Where a narrative sentence or Unresolved
+bullet clearly refers to one of the records, append a parenthetical
+reference, e.g.:
   "(likely order #58212, $43.50 at 2:14pm)"
   "(ticket #91: Jane Miller, 'Missing tin from order')"
 Write references in that plain style - never paste raw transcript syntax like
 "⟦POS ...⟧" into the log. Match on time proximity, dollar amounts, and item
 names. Rules:
-- Annotate ONLY bullets that describe a specific EVENT: a payment/order
-  discrepancy, a problem to reconcile, or one notable sale. NEVER attach ids
-  to product-interest lists, topic summaries, or SLACK bullets - a product
-  name is not an order, and Slack already states its own facts.
-- Annotate at most 3 bullets in the whole log. Zero is a fine answer.
+- Annotate ONLY a specific EVENT: a payment/order discrepancy, a problem to
+  reconcile, or one notable sale. NEVER attach ids to product mentions or
+  general narrative color - a product name is not an order.
+- Annotate at most 3 places in the whole log. Zero is a fine answer.
 - Use ONLY ids/amounts/names that appear in RECORDS - never invent one.
 - A match needs corroboration (time AND amount, or amount AND item). If not
   confident, leave the bullet exactly as it is.
@@ -226,49 +207,43 @@ names. Rules:
 - Change NOTHING else: no rewording, no adding or removing bullets.
 Output ONLY the annotated markdown log. /no_think"""
 
-REDACT_SYSTEM = """You are a privacy redactor for a tea shop's operational log. \
-You are given a draft Captain's Log. Return it UNCHANGED except remove any line \
-that violates the policy, then output the cleaned log in the same format.
+REDACT_TEMPLATE = """You are a privacy redactor for a tea shop's operational \
+log. You are given a draft Captain's Log. Return it UNCHANGED except for the \
+removals below, then output the cleaned log in the same format.
 
-The log mixes content from shop-floor AUDIO (must stay de-identified) with
-structured business records - POS lines, Slack staff chat, and record
-references like "(likely order #58212, $43.50 at 2:14pm)" or "(ticket #91:
-Jane Miller, …)". KEEP the structured material: names inside order/ticket
-references or explicitly attributed to Slack ("per Slack", "Slack update",
-"on Slack"), and every id / dollar amount / time in a parenthetical
-reference, are business records - do not strip them.
+ALLOWED NAMES - these come from written business records (staff chat, tickets,
+the time clock) and may stay in the log:
+{allowed_names}
 
-NAME AUDIT: any personal name NOT inside an order/ticket reference and NOT
-explicitly attributed to Slack was overheard on audio. Remove the name but
-keep the bullet if it is operational - rewrite as "a customer", "an account",
-"a staff member".
+NAME AUDIT: any OTHER personal name in the draft was overheard on shop-floor
+audio - remove the name but keep the sentence if it is operational, rewriting
+the person as "a customer", "a wholesale account", "a staff member".
 
-REMOVE any bullet that contains:
-- a name of someone merely overheard on audio (no record/Slack attribution);
+REMOVE entirely any sentence or bullet that contains:
 - personal-life content not about running the shop (schooling/college, jobs or
-  side-businesses like solar sales, hobbies, art fairs, museums, travel, family,
-  relationships, religion, politics, someone's feelings/struggles, small talk);
+  side-businesses, hobbies, art fairs, museums, travel, family, relationships,
+  religion, politics, someone's feelings/struggles, small talk);
 - health/medical details tied to a person;
-- something that reads like garbled audio rather than a real shop event.
+- a verbatim quote, or something that reads like garbled audio rather than a
+  real shop event.
 
-Also FIX garbled product names from the lossy mic: if a "product" is not a
-plausible real tea/herb/ingredient/flavor (e.g. "cold bread cookies", "mullet
-tea", "banana teas", a random phrase), delete just that item from its bullet -
-UNLESS it appears inside a ⟦POS …⟧ line or an order reference (register data
-is never garble). Keep genuine but unusual products (honey bush, rooibos,
-Russian Caravan, Tulsi, cactus nectar, rainbow splint). When unsure whether a
-tea is real, drop it - unless it is register-confirmed or named above.
+KEEP every id / dollar amount / time in parenthetical record references like
+"(likely order #58212, $43.50 at 2:14pm)" - those are business records.
+Fix garbled product names from the lossy mic: if a "product" is not a
+plausible real tea/herb/ingredient/flavor, drop just that mention - register
+(POS/order-reference) product names are never garble.
 
-Keep everything operational (teas, orders, payment/equipment issues, traffic).
 Do not add commentary. Output ONLY the cleaned markdown log. /no_think"""
 
 NOTES_SYSTEM = SYSTEM_PROMPT + (
     "\n\nFor THIS step you are taking rough notes on one slice of the day. Output a "
-    "short bullet list of what happened (products/topics discussed, traffic feel, "
-    "operational events, POS sales with amounts). De-identify audio content; keep "
-    "POS amounts/items exact. These slices are AUDIO + POS only - SLACK is not in "
-    "them - so notes must contain NO personal names at all (POS lines carry none; "
-    "any name you see was overheard). No format headers - just bullets."
+    "short bullet list of EVENTS only: problems, discrepancies (with amounts), "
+    "notable/large sales, equipment or stock issues, staff projects, plus one "
+    "bullet on traffic feel. Routine retail chit-chat (brewing questions, product "
+    "browsing) produces NO bullets. De-identify audio; keep POS amounts exact. "
+    "These slices are AUDIO + POS only - SLACK is not in them - so notes must "
+    "contain NO personal names at all (any name you see was overheard). "
+    "No format headers - just bullets."
 )
 
 
@@ -336,13 +311,14 @@ def _slack_api(token: str, method: str, params: dict) -> dict:
         return json.loads(r.read().decode("utf-8", "replace"))
 
 
-def _fetch_slack(env: dict, start_dt: datetime, end_dt: datetime) -> str:
+def _fetch_slack(env: dict, start_dt: datetime, end_dt: datetime) -> tuple[str, set]:
     """Staff messages in the business window, real display names, as labeled
-    blocks for the summarizer. Top-level channel messages only (v1)."""
+    blocks for the summarizer. Returns (text, names seen) - the names feed the
+    redactor's allowed list. Top-level channel messages only (v1)."""
     token = env.get("SLACK_BOT_TOKEN", "")
     channels = [c.strip() for c in env.get("SLACK_CHANNELS", "").split(",") if c.strip()]
     if not token or not channels:
-        return ""
+        return "", set()
 
     names: dict[str, str] = {}
 
@@ -398,7 +374,7 @@ def _fetch_slack(env: dict, start_dt: datetime, end_dt: datetime) -> str:
         if lines:
             lines.sort(key=lambda t: t[0])
             blocks.append(f"===== SLACK #{ch_name} =====\n" + "\n".join(l for _, l in lines))
-    return "\n\n".join(blocks)
+    return "\n\n".join(blocks), {n for n in names.values() if n and not n.startswith("U")}
 
 
 # --- weaving POS orders into the transcript -----------------------------------
@@ -457,6 +433,24 @@ def _scrub(s: str) -> str:
     return _SCRUB_PHONE.sub("[phone]", _SCRUB_EMAIL.sub("[email]", s or "")).strip()
 
 
+def _allowed_names(biz: dict, slack_names: set) -> set:
+    """Names from written business records - the only names the redactor may
+    keep in the log. Everything else is presumed overheard on audio."""
+    names = set(slack_names)
+    support = biz.get("support") or {}
+    for tkt in (support.get("created") or []) + (support.get("closed") or []):
+        for k in ("customer", "closed_by"):
+            if tkt.get(k):
+                names.add(str(tkt[k]))
+    for sft in (biz.get("timeclock") or {}).get("shifts") or []:
+        if sft.get("employee"):
+            names.add(str(sft["employee"]))
+    for c in (biz.get("calls") or {}).get("list") or []:
+        if c.get("caller_id"):
+            names.add(str(c["caller_id"]))
+    return {n.strip() for n in names if n.strip()}
+
+
 def _records_index(biz: dict) -> str:
     """Compact one-line-per-record digest of the day for the correlation pass."""
     lines = []
@@ -491,62 +485,56 @@ def _money(v) -> str:
 
 
 def _business_sections(biz: dict) -> str:
-    parts = ["## Business day (6pm–6pm MT)"]
+    """One compact stats block. Every line renders straight from JSON."""
+    parts = ["## By the numbers (6pm–6pm MT)"]
 
     s = biz.get("sales")
     if s:
         on, ins, pu = s.get("online") or {}, s.get("in_store") or {}, s.get("pickup") or {}
-        parts.append(
-            f"**Online:** {_money(on.get('retail_revenue'))} retail ({on.get('retail_orders', 0)} orders)"
-            + (f" + {_money(on.get('wholesale_revenue'))} wholesale ({on.get('wholesale_orders', 0)})"
-               if on.get("wholesale_orders") else "")
-        )
+        onN  = (on.get("retail_orders") or 0) + (on.get("wholesale_orders") or 0)
+        insN = (ins.get("retail_orders") or 0) + (ins.get("wholesale_orders") or 0)
+        onRev  = (on.get("retail_revenue") or 0) + (on.get("wholesale_revenue") or 0)
+        insRev = (ins.get("retail_revenue") or 0) + (ins.get("wholesale_revenue") or 0)
+        line = (f"**Sales:** online {_money(onRev)} ({onN} orders) · "
+                f"in-store {_money(insRev)} ({insN} orders)")
+        wsRev = (on.get("wholesale_revenue") or 0) + (pu.get("wholesale_revenue") or 0)
+        if wsRev:
+            line += f" · incl. wholesale {_money(wsRev)}"
         pickupN = (pu.get("retail_orders") or 0) + (pu.get("wholesale_orders") or 0)
-        parts.append(
-            f"**In-store:** {_money(ins.get('retail_revenue'))} retail ({ins.get('retail_orders', 0)} orders)"
-            + (f" + {_money(ins.get('wholesale_revenue'))} wholesale ({ins.get('wholesale_orders', 0)})"
-               if ins.get("wholesale_orders") else "")
-            + (f" · {pickupN} pickup order{'s' if pickupN != 1 else ''} "
-               f"({_money((pu.get('retail_revenue') or 0) + (pu.get('wholesale_revenue') or 0))})"
-               if pickupN else "")
-        )
+        if pickupN:
+            line += (f" · pickup {pickupN} "
+                     f"({_money((pu.get('retail_revenue') or 0) + (pu.get('wholesale_revenue') or 0))})")
+        parts.append(line)
     else:
-        parts.append("_Sales data unavailable._")
+        parts.append("**Sales:** _unavailable_")
 
     sh = biz.get("shipping")
     if sh:
         carriers = ", ".join(f"{name} {n}" for name, n in sorted(
             (sh.get("by_carrier") or {}).items(), key=lambda kv: -kv[1]))
         parts.append(
-            f"**Shipped:** {sh.get('orders_shipped', 0)} orders · "
-            f"{sh.get('labels_created', 0)} labels"
+            f"**Shipped:** {sh.get('orders_shipped', 0)} orders"
             + (f" ({sh.get('labels_voided', 0)} voided)" if sh.get("labels_voided") else "")
             + f" · postage {_money(sh.get('postage_cost'))}"
             + (f" — {carriers}" if carriers else "")
         )
     else:
-        parts.append("_Shipping data unavailable._")
+        parts.append("**Shipped:** _unavailable_")
 
     sup = biz.get("support")
-    parts.append("\n## Support")
     if sup:
-        parts.append(
-            f"{sup.get('tickets_created', 0)} new · {sup.get('inbound_messages', 0)} inbound messages · "
-            f"{sup.get('tickets_closed', 0)} closed · {sup.get('open_now', 0)} open now"
-        )
-        for tkt in sup.get("created") or []:
-            when = (tkt.get("time_local") or "")[11:16]
-            parts.append(f"- New #{tkt.get('id')} {when} — {_scrub(tkt.get('customer', ''))}: "
-                         f"\"{_scrub(tkt.get('subject', ''))}\" ({tkt.get('category', '')})")
-        for tkt in sup.get("closed") or []:
-            by = f" by {tkt.get('closed_by')}" if tkt.get("closed_by") else ""
-            parts.append(f"- Closed #{tkt.get('id')} — {_scrub(tkt.get('customer', ''))}: "
-                         f"\"{_scrub(tkt.get('subject', ''))}\"{by}")
+        line = (f"**Support:** {sup.get('tickets_created', 0)} new · "
+                f"{sup.get('inbound_messages', 0)} inbound · "
+                f"{sup.get('tickets_closed', 0)} closed · {sup.get('open_now', 0)} open")
+        parts.append(line)
+        for kind, lst in (("new", sup.get("created")), ("closed", sup.get("closed"))):
+            for tkt in lst or []:
+                parts.append(f"- {kind} #{tkt.get('id')} — {_scrub(tkt.get('customer', ''))}: "
+                             f"\"{_scrub(tkt.get('subject', ''))}\"")
     else:
-        parts.append("_Support data unavailable._")
+        parts.append("**Support:** _unavailable_")
 
     calls, texts = biz.get("calls"), biz.get("texts")
-    parts.append("\n## Comms")
     if calls or texts:
         bits = []
         if calls:
@@ -555,29 +543,24 @@ def _business_sections(biz: dict) -> str:
         if texts:
             bits.append(f"texts {texts.get('inbound', 0)} in / {texts.get('outbound', 0)} out")
             if texts.get("unreplied_now"):
-                bits.append(f"{texts['unreplied_now']} text{'s' if texts['unreplied_now'] != 1 else ''} awaiting reply")
-        parts.append("**" + " · ".join(bits) + "**")
-        if calls:
-            for action, n in sorted((calls.get("by_action") or {}).items(), key=lambda kv: -kv[1]):
-                parts.append(f"- {action}: {n}")
+                bits.append(f"{texts['unreplied_now']} awaiting reply")
+        parts.append("**Comms:** " + " · ".join(bits))
     else:
-        parts.append("_Call/text data unavailable._")
+        parts.append("**Comms:** _unavailable_")
 
     tc = biz.get("timeclock")
-    parts.append("\n## Staff")
     if tc:
-        parts.append(f"**{tc.get('total_hours', 0)} labor hours**")
-        for sft in tc.get("shifts") or []:
-            fmt12 = lambda s: datetime.strptime(s, "%Y-%m-%d %H:%M:%S").strftime("%-I:%M%p").lower() if s else "…"
-            brk = f", {sft['break_minutes']}m break" if sft.get("break_minutes") else ""
-            hrs = f" ({sft['hours']}h{brk})" if sft.get("hours") is not None else " (still clocked in)"
-            loc = f" — {sft['location']}" if sft.get("location") else ""
-            parts.append(f"- {sft.get('employee')}: {fmt12(sft.get('clock_in_local'))}–"
-                         f"{fmt12(sft.get('clock_out_local'))}{hrs}{loc}")
-        if tc.get("clocked_in_now"):
-            parts.append("Clocked in at log time: " + ", ".join(tc["clocked_in_now"]))
+        def fmt12(s):
+            return (datetime.strptime(s, "%Y-%m-%d %H:%M:%S").strftime("%-I:%M%p").lower()
+                    if s else "…")
+        crew = ", ".join(
+            f"{sft.get('employee')} {fmt12(sft.get('clock_in_local'))}–{fmt12(sft.get('clock_out_local'))}"
+            for sft in tc.get("shifts") or []
+        )
+        parts.append(f"**Staff:** {tc.get('total_hours', 0)}h — {crew}" if crew
+                     else f"**Staff:** {tc.get('total_hours', 0)}h")
     else:
-        parts.append("_Timeclock data unavailable._")
+        parts.append("**Staff:** _unavailable_")
 
     return "\n".join(parts)
 
@@ -674,7 +657,8 @@ def _strip_think(text: str) -> str:
     return text.replace("<think>", "").replace("</think>", "").strip()
 
 
-def _summarize(transcript: str, day: datetime, slack_text: str, records: str) -> str:
+def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
+               allowed_names: set) -> str:
     _warn("loading summarizer...")
     # Load with a fallback chain: the configured layer count, then fewer, then
     # CPU. Covers the edge case where Chloe's image tool is holding VRAM at run
@@ -735,9 +719,13 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str) ->
         draft = _gen(CORRELATE_SYSTEM, f"RECORDS:\n{records}\n\nDRAFT:\n{draft}", 1400)
 
     # Independent redaction pass: re-read the draft ONLY to strip anything
-    # personal/identifying/garbled that slipped through. Cheap on GPU (~seconds).
+    # personal/identifying/garbled that slipped through. The allowed-names list
+    # is computed from the structured data, so provenance doesn't depend on the
+    # draft carrying source labels. Cheap on GPU (~seconds).
     _warn("redaction pass...")
-    return _gen(REDACT_SYSTEM, f"Draft to clean:\n\n{draft}", 1400)
+    redact_system = REDACT_TEMPLATE.format(
+        allowed_names=", ".join(sorted(allowed_names)) if allowed_names else "(none)")
+    return _gen(redact_system, f"Draft to clean:\n\n{draft}", 1400)
 
 
 # --- git ----------------------------------------------------------------------
@@ -794,7 +782,7 @@ def main():
     window_start = window_end - timedelta(days=1)
 
     biz = _fetch_business(env, date_str)
-    slack_text = _fetch_slack(env, window_start, window_end)
+    slack_text, slack_names = _fetch_slack(env, window_start, window_end)
 
     transcript, log_path = _transcribe(date_str)
     have_speech = bool(transcript.strip())
@@ -806,15 +794,17 @@ def main():
 
     if have_speech:
         transcript = _weave_orders(transcript, biz.get("sales"), date_str)
-        markdown = _summarize(transcript, day, slack_text, _records_index(biz))
+        markdown = _summarize(transcript, day, slack_text, _records_index(biz),
+                              _allowed_names(biz, slack_names))
     else:
         _warn(f"{date_str}: no speech captured - business sections only")
         markdown = (
             f"# Captain's Log — {day:%A} {date_str}\n\n"
-            f"_No speech captured today._\n\n{SOURCE_LINE}"
+            f"_No speech captured today._"
         )
 
-    markdown = markdown.rstrip() + "\n\n" + _business_sections(biz)
+    markdown = (markdown.rstrip() + "\n\n" + _business_sections(biz)
+                + "\n\n" + SOURCE_LINE)
     _commit_and_push(date_str, markdown, env)
 
     # Transcripts stay on this box (never in git) so test reruns skip the
