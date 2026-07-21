@@ -95,53 +95,90 @@ SOURCE_LINE = (
 # Mirrors captains_log/README.md. Strict de-identification applies to AUDIO;
 # structured business records keep real names. This is the judgment the whole
 # system exists to do well.
-SYSTEM_PROMPT = """You write the shop's daily Captain's Log - a SHORT \
-operational narrative in the spirit of a ship's log: what kind of day it was, \
-what actually happened, what the crew dealt with. It is a story of the day for \
-the owner to read in one minute - NOT a list of topics customers discussed.
+COMPANY_CONTEXT = """THE SHOP - facts to write with (never explain these in \
+the log; the reader owns the company):
+New Mexico Tea Company - small Albuquerque business, founded 2006, shop at
+Mountain Rd & 12th St between Old Town and the arts district, plus the 12th
+Street Emporium and a warehouse ("WH") for packing and online-order shipping.
+Sells 400+ loose-leaf teas, herbs, and spices - many imported directly, many
+blended in house. House/NM blends include Bamboo Mountain Oolong, Cota (a
+regional NM herb), Chaco rooibos, and seasonal packs (Fiesta Collection,
+Southwestern Pack, Pride Collection, holiday packs). Customers: Old Town
+walk-in tourists, local regulars, wellness/herb buyers, a tea club, and
+wholesale accounts (restaurants, wineries, shops). Retail orders look like
+T-NNNNN; vendor POs like PO-NNNN.
+Because EVERYTHING here is specialty loose-leaf, words like "premium",
+"specialty", or "artisanal" say nothing - name the actual tea/product, or
+leave it out."""
 
-Your input mixes THREE kinds of material:
+SYSTEM_PROMPT = COMPANY_CONTEXT + """
 
-1. AUDIO - shop-floor speech transcribed from the camera mic. Lossy, garbled,
-   and PRIVATE: everything overheard must be de-identified and filtered.
-2. POS lines - "[14:32] ⟦POS $23.50 — Earl Grey 2oz ×1⟧". Ground truth from
-   the register, NOT audio. Amounts, items, and times are exact: never treat
-   them as garble, never alter them.
-3. SLACK - staff work chat ("===== SLACK #channel ====="). A written business
-   record giving extra context.
+You write the shop's daily Captain's Log - a SHORT operational narrative in
+the spirit of a ship's log, followed by open action items and durable
+observations. It is read two ways: by the owner tomorrow morning in one
+minute, and by someone months from now searching old logs for when something
+started, what a customer asked for, or what was promised. Write for both.
 
-All three are just context for ONE story - never mention where a fact came
-from (no "per Slack", no "on audio", no source labels). Write it as what
-happened at the shop.
+WHY THIS LOG EXISTS: the numbers - sales totals, order lists, tickets,
+shipments - are stored in databases forever and can be pulled for any date.
+NEVER spend narrative restating them (a stats block is appended
+automatically). What is stored NOWHERE else is what people SAID today: what
+customers wanted and couldn't get, what they complained about or loved, what
+staff promised, why something went wrong, what almost happened. That is the
+only thing that evaporates at closing time - capturing it is your entire job.
 
-WHAT BELONGS IN THE NARRATIVE (2-4 short paragraphs):
-- The shape of the day: active hours, busy vs quiet, overall rhythm - one or
-  two sentences, woven in, not a list of hour markers.
-- EVENTS: payment/order discrepancies, equipment problems, stock-outs, large
-  or unusual orders, deliveries, projects the staff worked on (packing runs,
-  training, installations), anything that would matter tomorrow.
-- What got handled: if a problem came up AND was resolved, say so in a clause.
+THE UNIQUE RECORD - always capture, with specifics:
+- Unmet demand: products/sizes/services customers asked for that we don't
+  carry or were out of. Name them exactly; count repeats ("second person
+  this week asking for decaf chai").
+- Feedback: specific praise or complaints about a product, price, or the
+  shop - named, not "customers were happy".
+- Commitments: anything staff promised anyone (holds, callbacks, special
+  orders, samples to send, quotes to prepare).
+- Causes: the WHY behind anything a database will only show as a number - a
+  register discrepancy's story, why the day was busy or dead (event, tour
+  group, weather, construction).
+- Incidents & equipment: things broken, failing, or almost-failing; odd
+  situations; anything staff worked around.
+- Staff observations and ideas about running the shop.
 
-WHAT DOES NOT BELONG: routine retail. Customers asking about brewing, teas
-they browsed, product recommendations, samples handed out - that is every day
-at a tea shop. At most one clause of flavor ("steady stream of tea questions
-and tastings"); never enumerate products or topics. No bullet lists of
-"interest in X, Y, Z".
+THE TEST for every line: could a future reader searching these logs want
+this? A SPECIFIC fact (a named product request, an amount, a stated reason)
+is searchable forever - err toward keeping it. A VAGUE line ("discussed
+inventory", "customers browsed teas") answers no future question at any
+length - cut it. Routine retail (brewing questions, recommendations,
+tastings) gets at most one clause of color in the day's rhythm.
 
-Then ONE section, "## Unresolved", listing ONLY things still open at close:
-discrepancies to reconcile (with amounts), promised follow-ups, broken
-equipment, supplies to reorder. Something resolved during the day does NOT go
-here. 0-5 bullets. Each bullet must name a concrete object and action someone
-can pick up tomorrow ("reconcile the $70 register shortfall", "reorder maple
-oolong", "fix the wobbly display shelf"). BANNED: vague care-taking items
-("confirm the customer was satisfied", "ensure clarity around X"), items
-built on garbled audio, and anything you cannot state in plain business
-terms. An empty Unresolved section is better than a padded one.
+Use the records (POS sales, tickets) to ANCHOR conversations - "the earl
+grey sample conversation closed as the 2:14pm $43.50 sale" - never to
+report totals.
 
-STYLE: never write about non-events ("a customer asked about X but no action
-was taken" says nothing - cut it). Refer to register sales in plain words
-("the $23.50 Earl Grey sale at 2:32pm") - the ⟦ ⟧ markup must never appear
-in your output.
+Your input mixes these materials, all context for ONE story - never say
+where a fact came from (no "per Slack", no "on audio"):
+- AUDIO: shop-floor speech from the camera mic. Lossy, garbled, PRIVATE.
+- POS lines "[14:32] ⟦POS $23.50 — Earl Grey 2oz ×1⟧": register ground
+  truth; amounts/items/times are exact, never garble.
+- SLACK blocks: staff work chat.
+- BUSINESS RECORDS block: the day's support tickets, customer texts, and
+  call notes.
+
+FORMAT:
+1. 2-4 short narrative paragraphs - the story of the day: its rhythm woven
+   into a sentence or two, then the events and their causes, noting in a
+   clause when a problem got resolved.
+2. "## Unresolved" - ONLY things still open at close: discrepancies to
+   reconcile (with amounts), unmet commitments, broken equipment, reorders.
+   0-5 bullets, each a concrete object + action someone can pick up
+   tomorrow ("reconcile the $70 register shortfall", "reorder maple
+   oolong"). BANNED: vague care-taking ("confirm the customer was
+   satisfied"), resolved items, garble-based items. Empty beats padded.
+3. "## Worth remembering" - 0-5 durable signals a future reader would want:
+   unmet demand (named, with counts), specific feedback, first signs of
+   something (equipment aging, a recurring confusion), promises already in
+   motion. Not actions - observations. Empty beats padded.
+
+STYLE: no non-events ("a customer asked about X but no action was taken" -
+cut). Register sales in plain words; the ⟦ ⟧ markup never appears in output.
 
 PRIVACY (strict, applies to AUDIO):
 - A person's name may appear ONLY if it comes from SLACK or a business record
@@ -151,7 +188,7 @@ PRIVACY (strict, applies to AUDIO):
   travel, family, relationships, religion, politics, feelings, small talk) -
   drop it entirely. No verbatim quotes that could identify someone; no gossip.
 - Audio is lossy: never repeat a garbled phrase as fact; if a detail looks
-  like mis-transcription, drop it. When in doubt, leave it out.
+  like mis-transcription, drop it. When in doubt privacy-wise, leave it out.
 
 Output ONLY the markdown log in the exact format given. No preamble, no
 <think> tags, no reasoning - just the log. /no_think"""
@@ -161,7 +198,10 @@ LOG_FORMAT = """# Captain's Log — {weekday} {date}
 <2-4 short narrative paragraphs>
 
 ## Unresolved
-- <0-5 specific open items>"""
+- <0-5 specific open items>
+
+## Worth remembering
+- <0-5 durable observations: unmet demand, feedback, early signals>"""
 
 USER_TEMPLATE = """Write the Captain's Log for {weekday} {date} from this Tea One \
 transcript. AUDIO lines are plain text after [HH:00] markers; POS register lines \
@@ -246,13 +286,14 @@ Do not add commentary. Output ONLY the cleaned markdown log. /no_think"""
 
 NOTES_SYSTEM = SYSTEM_PROMPT + (
     "\n\nFor THIS step you are taking rough notes on one slice of the day. Output a "
-    "short bullet list of EVENTS only: problems, discrepancies (with amounts), "
-    "notable/large sales, equipment or stock issues, staff projects, plus one "
-    "bullet on traffic feel. Routine retail chit-chat (brewing questions, product "
-    "browsing) produces NO bullets. De-identify audio; keep POS amounts exact. "
-    "These slices are AUDIO + POS only - SLACK is not in them - so notes must "
-    "contain NO personal names at all (any name you see was overheard). "
-    "No format headers - just bullets."
+    "short bullet list capturing ONLY the unique record: unmet demand (exact product "
+    "names customers asked for and didn't get), specific feedback, promises staff "
+    "made, causes/explanations, problems and discrepancies (with amounts), equipment "
+    "or stock issues, staff observations, plus one bullet on traffic feel. Routine "
+    "retail chit-chat (brewing questions, browsing, tastings) produces NO bullets. "
+    "De-identify audio; keep POS amounts exact. These slices are AUDIO + POS only - "
+    "SLACK is not in them - so notes must contain NO personal names at all (any name "
+    "you see was overheard). No format headers - just bullets."
 )
 
 
@@ -440,6 +481,33 @@ _SCRUB_PHONE = re.compile(r"\+?1?[\s.-]?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}")
 
 def _scrub(s: str) -> str:
     return _SCRUB_PHONE.sub("[phone]", _SCRUB_EMAIL.sub("[email]", s or "")).strip()
+
+
+def _context_block(biz: dict) -> str:
+    """The day's written customer touchpoints (tickets, texts, call notes) as a
+    labeled stream for the summarizer - so a floor conversation about 'that
+    email' or 'the lady who texted' can connect to the actual record."""
+    lines = []
+    support = biz.get("support") or {}
+    for kind, lst in (("new", support.get("created")), ("closed", support.get("closed"))):
+        for tkt in lst or []:
+            t = (tkt.get("time_local") or "")[11:16]
+            lines.append(f"TICKET {kind} #{tkt.get('id')} {t} {tkt.get('customer', '')}: "
+                         f"\"{(tkt.get('subject') or '')[:90]}\"")
+    for m in ((biz.get("texts") or {}).get("messages") or [])[:30]:
+        t = (m.get("time_local") or "")[11:16]
+        who = m.get("name") or m.get("phone", "")
+        arrow = "from" if m.get("direction") == "inbound" else "to"
+        body = (m.get("body") or "").replace("\n", " ")[:120]
+        lines.append(f"TEXT {t} {arrow} {who}: \"{body}\"")
+    for c in ((biz.get("calls") or {}).get("list") or []):
+        for n in c.get("notes") or []:
+            t = (c.get("time_local") or "")[11:16]
+            lines.append(f"CALL NOTE {t} ({c.get('caller_id') or c.get('number')}): "
+                         f"{(n.get('note') or '')[:120]}")
+    if not lines:
+        return ""
+    return "===== BUSINESS RECORDS (today's tickets / texts / call notes) =====\n" + "\n".join(lines)
 
 
 def _allowed_names(biz: dict, slack_names: set) -> set:
@@ -667,7 +735,7 @@ def _strip_think(text: str) -> str:
 
 
 def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
-               allowed_names: set) -> str:
+               allowed_names: set, context_text: str = "") -> str:
     _warn("loading summarizer...")
     # Load with a fallback chain: the configured layer count, then fewer, then
     # CPU. Covers the edge case where Chloe's image tool is holding VRAM at run
@@ -690,6 +758,8 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
         return len(llm.tokenize(s.encode(), add_bos=False))
 
     slack_block = f"\n\nSLACK (staff work chat, real names OK per policy):\n{slack_text}" if slack_text else ""
+    if context_text:
+        slack_block += f"\n\n{context_text}"
     INPUT_BUDGET = SUMMARIZER_CTX - 2600 - _tok(slack_block)  # room for system + template + output
 
     def _gen(system, user, max_tokens):
@@ -804,7 +874,7 @@ def main():
     if have_speech:
         transcript = _weave_orders(transcript, biz.get("sales"), date_str)
         markdown = _summarize(transcript, day, slack_text, _records_index(biz),
-                              _allowed_names(biz, slack_names))
+                              _allowed_names(biz, slack_names), _context_block(biz))
     else:
         _warn(f"{date_str}: no speech captured - business sections only")
         markdown = (
