@@ -20,8 +20,14 @@ const PBKDF2_SALT = new TextEncoder().encode("imagegen-e2e-v1");
 // either end ever sent is undecryptable forever (forward secrecy).
 let kSess = null;
 let currentMode = null;
+let imagesEnabled = true;   // false in GPU-chat mode (SDXL not loaded)
 
 const $ = (id) => document.getElementById(id);
+
+const CHAT_MODE_LABELS = {
+  cpu_images: "CPU chat + images (chat on CPU, GPU runs image generation)",
+  gpu_chat: "GPU chat, no images (fast chat on the GPU; image generation off)",
+};
 
 async function deriveKeys(password) {
   const passBytes = new TextEncoder().encode(password);
@@ -274,27 +280,36 @@ function renderInitState(st) {
   const area = $("init-area");
   const modeButtons = $("mode-buttons");
   if (st.status === "ready") {
-    area.innerHTML = `<p id="chat-status">chat model: ${escapeText(st.chat_model)}
+    imagesEnabled = st.images !== false;
+    const modeNote = imagesEnabled ? "CPU chat + images" : "GPU chat (images off)";
+    area.innerHTML = `<p id="chat-status">chat model: ${escapeText(st.chat_model)} — ${modeNote}
       &mdash; <a href="#" id="unload-btn">shut down models</a>
-      (frees the GPU and RAM; your chats &amp; images stay until logout)</p>`;
+      (frees the GPU and RAM; your chats stay until logout)</p>`;
     modeButtons.style.display = "flex";
+    // "image only" is meaningless in GPU-chat mode (SDXL isn't loaded).
+    const imgBtn = document.querySelector('[data-mode="image"]');
+    if (imgBtn) imgBtn.style.display = imagesEnabled ? "" : "none";
     $("unload-btn").addEventListener("click", (e) => { e.preventDefault(); doUnload(); });
   } else if (st.status === "loading") {
     area.innerHTML = `<p id="chat-status">initializing models... (~30s)</p>`;
     modeButtons.style.display = "none";
   } else {
-    // cold OR error - both are startable; the server ships the model list in
-    // both. Build <option>s as DOM nodes (no attribute-injection surface).
+    // cold OR error - both are startable; the server ships the model + mode
+    // lists in both. Build <option>s as DOM nodes (no attribute injection).
     modeButtons.style.display = "none";
     const errLine = st.status === "error" && st.error
       ? `<p class="err">last attempt failed: ${escapeText(st.error)} — try again</p>` : "";
     area.innerHTML = `
-      <label for="chat-model-sel">chat model (runs on CPU; the GPU is reserved for images)</label>
+      <label for="chat-model-sel">chat model</label>
       <select id="chat-model-sel"></select>
+      <label for="chat-mode-sel">mode</label>
+      <select id="chat-mode-sel"></select>
       <button id="init-btn">initialize system</button>
       ${errLine}
       <p id="chat-status">models aren't loaded yet - nothing uses memory until you start this</p>`;
     fillSelect($("chat-model-sel"), st.models || [st.chat_model], st.chat_model, (m) => m);
+    fillSelect($("chat-mode-sel"), st.modes || ["cpu_images"], st.mode || "cpu_images",
+               (m) => CHAT_MODE_LABELS[m] || m);
     $("init-btn").addEventListener("click", startInit);
   }
 }
@@ -318,6 +333,7 @@ async function checkInit() {
 async function startInit() {
   const st = await apiCall("/api/initialize", {
     chat_model: $("chat-model-sel") ? $("chat-model-sel").value : undefined,
+    chat_mode: $("chat-mode-sel") ? $("chat-mode-sel").value : undefined,
   });
   renderInitState(st);
   if (st.status === "loading") setTimeout(checkInit, 2000);
@@ -423,6 +439,11 @@ async function onImageSubmit(e) {
 // --- chat / chat+images modes --------------------------------------------------
 
 function renderChat() {
+  const imgControls = imagesEnabled
+    ? `<button type="button" id="get-image-btn" title="render the current moment of the conversation">get image</button>`
+    : "";
+  const gallery = imagesEnabled
+    ? `<div id="gallery-panel"><h3>images this session</h3><div id="gallery"></div></div>` : "";
   $("app").innerHTML = `
     <p><a href="#" id="back">&larr; back</a> &nbsp; <a href="#" id="reset">new conversation</a></p>
     <h2>conversation</h2>
@@ -431,22 +452,29 @@ function renderChat() {
         <div id="transcript"></div>
         <form id="chat-form">
           <textarea id="chat-message" rows="2" placeholder="say something..." autofocus required></textarea>
-          <button type="submit">send</button>
-          <button type="button" id="get-image-btn" title="render the current moment of the conversation">get image</button>
+          <button type="submit" id="send-btn">send</button>
+          <button type="button" id="stop-btn" style="display:none">stop</button>
+          ${imgControls}
         </form>
         <div id="chat-status"></div>
       </div>
-      <div id="gallery-panel"><h3>images this session</h3><div id="gallery"></div></div>
+      ${gallery}
     </div>`;
   $("back").addEventListener("click", (e) => { e.preventDefault(); showModePicker(); });
   $("reset").addEventListener("click", async (e) => {
     e.preventDefault();
     await apiCall("/api/reset", { mode: currentMode });
     $("transcript").innerHTML = "";
-    $("gallery").innerHTML = "";
+    if ($("gallery")) $("gallery").innerHTML = "";
   });
   $("chat-form").addEventListener("submit", onChatSubmit);
-  $("get-image-btn").addEventListener("click", onGetImage);
+  $("stop-btn").addEventListener("click", onChatStop);
+  if ($("get-image-btn")) $("get-image-btn").addEventListener("click", onGetImage);
+}
+
+async function onChatStop() {
+  $("stop-btn").disabled = true;
+  try { await apiCall("/api/chat-stop", {}); } catch (e) { /* stream ends on its own */ }
 }
 
 async function onGetImage() {
@@ -511,8 +539,11 @@ async function onChatSubmit(e) {
   if (!message) return;
   $("chat-message").value = "";
   appendMessage("user", message);
-  const btn = e.target.querySelector("button[type=submit]");
+  const btn = $("send-btn");
   btn.disabled = true;
+  const stopBtn = $("stop-btn");
+  stopBtn.style.display = "";
+  stopBtn.disabled = false;
   $("chat-status").textContent = "thinking...";
   const span = appendMessage("assistant", "");
   try {
@@ -558,6 +589,7 @@ async function onChatSubmit(e) {
     $("chat-status").textContent = err.message || "failed to get a reply";
   } finally {
     btn.disabled = false;
+    if ($("stop-btn")) $("stop-btn").style.display = "none";
   }
 }
 

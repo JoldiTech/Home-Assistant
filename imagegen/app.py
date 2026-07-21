@@ -41,6 +41,7 @@ import io
 import json
 import os
 import secrets
+import subprocess
 import threading
 import time
 from collections import defaultdict, deque
@@ -48,6 +49,11 @@ from pathlib import Path
 
 import logging
 import warnings
+
+# SDXL's UNet fills most of the 6GB card during generation; expandable
+# segments cut allocator fragmentation so the peak fits with margin instead
+# of OOMing on the last few MB. Must be set before torch initializes CUDA.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -115,7 +121,27 @@ LLM_MODEL_PATH = os.environ.get(
 # CMAKE_ARGS="-DGGML_CUDA=off" --no-binary llama-cpp-python; the prebuilt CPU
 # wheels are musl-linked and won't load on glibc.)
 GGUF_DIR = Path(LLM_MODEL_PATH).parent
-CHAT_GPU_LAYERS = 0  # CPU-only build ignores this; kept explicit
+CHAT_GPU_LAYERS = 0  # CPU-only in-process build ignores this; kept explicit
+
+# Two init modes, chosen at Initialize:
+#   cpu_images - SDXL on the GPU + chat on CPU (in-process CPU-only llama).
+#                Image generation works; chat is CPU-speed. The default.
+#   gpu_chat   - chat model offloaded to the GPU (fast) via a SUBPROCESS that
+#                runs under transcribe-env (CUDA llama build); SDXL is NOT
+#                loaded, so "get image" is disabled. On a 6GB card these are
+#                mutually exclusive - a GPU chat model and SDXL can't coexist.
+CHAT_MODES = ("cpu_images", "gpu_chat")
+GPU_CHAT_PY = os.environ.get("GPU_CHAT_PY", os.path.expanduser("~/transcribe-env/bin/python"))
+CHAT_WORKER_PATH = str(Path(__file__).resolve().parent / "chat_worker.py")
+GPU_CHAT_LAYERS = int(os.environ.get("GPU_CHAT_LAYERS", "28"))
+GPU_CHAT_CTX = int(os.environ.get("GPU_CHAT_CTX", "4096"))
+# The GPU chat worker runs under transcribe-env, whose CUDA llama build needs
+# the torch-bundled CUDA runtime on LD_LIBRARY_PATH (same trick the captains-
+# log runner uses to load the summarizer on the GPU).
+import glob as _glob
+_GPU_CHAT_NVIDIA_LIBS = ":".join(
+    _glob.glob(os.path.expanduser("~/transcribe-env/lib/python*/site-packages/nvidia/*/lib"))
+)
 PORT = int(os.environ.get("PORT", "8189"))
 
 SESSION_IDLE_TIMEOUT = 20 * 60  # session (and its conversation) dies after this much inactivity
@@ -250,10 +276,13 @@ _llm_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 image_pipe = None
 llm = None
+_chat_worker = None            # Popen for GPU-chat mode; None otherwise
+_chat_worker_layers = 0        # gpu layers the worker actually loaded (fallback-aware)
+_worker_lock = threading.Lock()  # serializes one chat turn at a time over the worker pipe
 _model_status_lock = threading.Lock()
 _model_status = "cold"  # cold -> loading -> ready; error -> back to a cold-like retry
 _model_error = ""       # last load failure, surfaced to the picker so the user can retry
-_chat_selection = {"model": Path(LLM_MODEL_PATH).name}
+_chat_selection = {"model": Path(LLM_MODEL_PATH).name, "mode": "cpu_images"}
 
 
 def _list_chat_models() -> list[str]:
@@ -272,8 +301,11 @@ def _init_payload() -> dict:
     # be able to (re)start from - so always ship the picker options there,
     # including 'error'. Otherwise a transient load failure strips the picker
     # to fallbacks AND leaves no way forward.
+    payload["mode"] = _chat_selection["mode"]
+    payload["images"] = (image_pipe is not None)  # get-image is only usable when True
     if status not in ("loading", "ready"):
         payload["models"] = _list_chat_models()
+        payload["modes"] = list(CHAT_MODES)
     if status == "error":
         payload["error"] = err
     return payload
@@ -731,6 +763,73 @@ def _is_oom(exc: Exception) -> bool:
     return "out of memory" in s or "oom" in s or "cuda error" in s or "alloc" in s
 
 
+def _cpu_token_stream(messages, cancel):
+    """Yield raw delta strings from the in-process CPU chat model. Breaking the
+    loop (on cancel) stops llama.cpp - the generator is lazy, so not pulling
+    the next token stops evaluation."""
+    with _llm_lock:
+        if llm is None:
+            raise RuntimeError("models were shut down - re-initialize")
+        for chunk in llm.create_chat_completion(
+                messages=messages, max_tokens=LLM_MAX_TOKENS, stream=True,
+                temperature=0.75, top_p=0.9, repeat_penalty=1.18):
+            if cancel.is_set():
+                break
+            delta = (chunk["choices"][0].get("delta") or {}).get("content")
+            if delta:
+                yield delta
+
+
+def _gpu_token_stream(messages, cancel):
+    """Yield raw delta strings from the GPU worker subprocess. A cancel is
+    forwarded to the worker over stdin; the worker stops within one token and
+    the turn ends cleanly (worker stays healthy for the next turn)."""
+    import select
+    with _worker_lock:
+        p = _chat_worker
+        if p is None or p.poll() is not None:
+            raise RuntimeError("chat worker is not running - re-initialize")
+        p.stdin.write(json.dumps({"messages": messages, "max_tokens": LLM_MAX_TOKENS}) + "\n")
+        p.stdin.flush()
+        sent_cancel = False
+        while True:
+            r, _, _ = select.select([p.stdout], [], [], 0.1)
+            if cancel.is_set() and not sent_cancel:
+                try:
+                    p.stdin.write(json.dumps({"cancel": True}) + "\n")
+                    p.stdin.flush()
+                except Exception:
+                    pass
+                sent_cancel = True
+            if not r:
+                continue
+            line = p.stdout.readline()
+            if not line:
+                raise RuntimeError("chat worker died mid-stream")
+            msg = json.loads(line)
+            if msg.get("done"):
+                break
+            if msg.get("error"):
+                raise RuntimeError(msg["error"])
+            delta = msg.get("delta")
+            if delta and not cancel.is_set():
+                yield delta
+
+
+@app.post("/api/chat-stop")
+async def chat_stop(request: Request):
+    """Stop the in-flight reply for this session. Idempotent - a no-op if
+    nothing is generating."""
+    result = _require_session(request)
+    if isinstance(result, JSONResponse):
+        return result
+    _token, state = result
+    ev = state["chat"].get("cancel")
+    if ev is not None:
+        ev.set()
+    return JSONResponse(_encrypt({"ok": True}))
+
+
 @app.post("/api/chat")
 async def chat(request: Request):
     """Streaming chat. The reply arrives as newline-delimited AES-GCM
@@ -757,6 +856,10 @@ async def chat(request: Request):
         system_prompt = _prompts["system_prompt"]
     messages = [{"role": "system", "content": system_prompt},
                 *history[-MAX_HISTORY:]]
+    # A fresh cancel event per turn; /api/chat-stop sets it.
+    cancel = threading.Event()
+    state["chat"]["cancel"] = cancel
+    gpu_mode = _chat_selection["mode"] == "gpu_chat"
 
     q: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
@@ -764,45 +867,35 @@ async def chat(request: Request):
     def produce():
         raw, emitted = "", ""
         try:
-            with _llm_lock:
-                if llm is None:
-                    # Model was unloaded (idle release, shutdown, or the
-                    # nightly captain's-log GPU handoff) between the ready
-                    # check and here. Fail cleanly, not with an AttributeError.
-                    loop.call_soon_threadsafe(q.put_nowait, {"error": "models were shut down - re-initialize"})
-                    loop.call_soon_threadsafe(q.put_nowait, {"done": True})
-                    return
-                for chunk in llm.create_chat_completion(
-                        messages=messages, max_tokens=LLM_MAX_TOKENS, stream=True,
-                        temperature=0.75, top_p=0.9, repeat_penalty=1.18):
-                    delta = (chunk["choices"][0].get("delta") or {}).get("content")
-                    if not delta:
-                        continue
-                    raw += delta
-                    cleaned = _clean_llm_text(raw)
-                    # Hold back a trailing partial marker ("<|chan...") so it
-                    # never flashes on screen before the regex can catch it.
-                    tail = cleaned[-14:]
-                    if "<" in tail:
-                        cleaned = cleaned[:len(cleaned) - (len(tail) - tail.index("<"))]
-                    if cleaned.startswith(emitted):
-                        d = cleaned[len(emitted):]
-                        if d:
-                            emitted = cleaned
-                            loop.call_soon_threadsafe(q.put_nowait, {"delta": d})
-                    else:
-                        # A late marker re-segmented the text: retract.
+            source = _gpu_token_stream(messages, cancel) if gpu_mode else _cpu_token_stream(messages, cancel)
+            for delta in source:
+                raw += delta
+                cleaned = _clean_llm_text(raw)
+                # Hold back a trailing partial marker ("<|chan...") so it never
+                # flashes on screen before the regex can catch it.
+                tail = cleaned[-14:]
+                if "<" in tail:
+                    cleaned = cleaned[:len(cleaned) - (len(tail) - tail.index("<"))]
+                if cleaned.startswith(emitted):
+                    d = cleaned[len(emitted):]
+                    if d:
                         emitted = cleaned
-                        loop.call_soon_threadsafe(q.put_nowait, {"replace": cleaned})
+                        loop.call_soon_threadsafe(q.put_nowait, {"delta": d})
+                else:
+                    # A late marker re-segmented the text: retract.
+                    emitted = cleaned
+                    loop.call_soon_threadsafe(q.put_nowait, {"replace": cleaned})
             final = _clean_llm_text(raw)
-            with _state_lock:
-                history.append({"role": "assistant", "content": final})
-                del history[:-MAX_HISTORY]
+            # Keep the partial reply on stop, so context continues coherently.
+            if final:
+                with _state_lock:
+                    history.append({"role": "assistant", "content": final})
+                    del history[:-MAX_HISTORY]
             if final != emitted:
                 loop.call_soon_threadsafe(q.put_nowait, {"replace": final})
         except Exception as e:
             print(f"chat stream failed: {e}", flush=True)
-            loop.call_soon_threadsafe(q.put_nowait, {"error": "generation failed"})
+            loop.call_soon_threadsafe(q.put_nowait, {"error": str(e)[:160] if "re-initialize" in str(e) else "generation failed"})
         loop.call_soon_threadsafe(q.put_nowait, {"done": True})
 
     loop.run_in_executor(_llm_executor, produce)
@@ -828,6 +921,10 @@ async def chat_image(request: Request):
         return result
     if _model_status != "ready":
         return JSONResponse({"error": "not initialized"}, status_code=503)
+    if image_pipe is None:
+        return JSONResponse(
+            {"error": "images are off in GPU-chat mode - shut down models and re-initialize in 'CPU chat + images' to generate"},
+            status_code=409)
     token, state = result
     _decrypt(await request.json())  # envelope validated; no params needed
 
@@ -899,6 +996,10 @@ async def image_only(request: Request):
         return result
     if _model_status != "ready":
         return JSONResponse({"error": "not initialized"}, status_code=503)
+    if image_pipe is None:
+        return JSONResponse(
+            {"error": "images are off in GPU-chat mode - re-initialize in 'CPU chat + images'"},
+            status_code=409)
     token, state = result
     body = _decrypt(await request.json())
     prompt = (body.get("prompt") or "").strip()[:2000]
@@ -946,56 +1047,91 @@ async def image_only(request: Request):
     }))
 
 
+def _spawn_chat_worker(chat_path: str):
+    """Start the GPU chat subprocess (transcribe-env python + CUDA llama) and
+    block until it signals ready. Raises on failure."""
+    global _chat_worker, _chat_worker_layers
+    print(f"starting GPU chat worker for {_chat_selection['model']}...", flush=True)
+    env = {**os.environ}
+    if _GPU_CHAT_NVIDIA_LIBS:
+        env["LD_LIBRARY_PATH"] = _GPU_CHAT_NVIDIA_LIBS + ":" + env.get("LD_LIBRARY_PATH", "")
+    p = subprocess.Popen(
+        [GPU_CHAT_PY, CHAT_WORKER_PATH, chat_path, str(GPU_CHAT_LAYERS), str(GPU_CHAT_CTX)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1, env=env,
+    )
+    line = p.stdout.readline()
+    if not line:
+        p.kill()
+        raise RuntimeError("chat worker exited before signalling ready")
+    msg = json.loads(line)
+    if not msg.get("ready"):
+        p.kill()
+        raise RuntimeError(msg.get("error", "chat worker failed to load model"))
+    _chat_worker = p
+    _chat_worker_layers = int(msg.get("gpu_layers", 0))
+    print(f"GPU chat worker ready ({_chat_worker_layers} layers on GPU)", flush=True)
+
+
+def _kill_worker():
+    global _chat_worker, _chat_worker_layers
+    with _worker_lock:
+        p = _chat_worker
+        _chat_worker = None
+        _chat_worker_layers = 0
+    if p is not None:
+        try:
+            p.stdin.close()
+        except Exception:
+            pass
+        p.terminate()
+        try:
+            p.wait(timeout=5)
+        except Exception:
+            p.kill()
+
+
 def _load_models():
     # Runs on the shared executor, kicked off by /api/initialize - nothing
-    # loads at process startup, so the idle process footprint is near-zero
-    # until someone actually asks for it (see the "Initialize" button in the
-    # UI). Both models are loaded together since either mode can be opened
-    # once ready; there is currently no auto-unload - they stay resident
-    # until the process restarts.
+    # loads at process startup, so the idle footprint is near-zero until
+    # someone asks. Two modes (see CHAT_MODES): cpu_images loads SDXL + the
+    # in-process CPU chat model; gpu_chat loads ONLY the GPU chat worker (no
+    # SDXL). They can't coexist on the 6GB card.
     global image_pipe, llm, _model_status, _model_error
+    mode = _chat_selection["mode"]
+    chat_path = str(GGUF_DIR / _chat_selection["model"])
     try:
-        print("loading SDXL checkpoint (GPU)...", flush=True)
-        image_pipe = StableDiffusionXLPipeline.from_single_file(
-            IMAGE_MODEL_PATH, torch_dtype=torch.float16, use_safetensors=True
-        )
-        # Speed, no model change: DPM++ 2M Karras converges in fewer steps than
-        # the default scheduler, and TAESD (a tiny distilled VAE) decodes far
-        # faster than the full SDXL VAE and removes the VAE-decode VRAM spike
-        # that used to flirt with OOM on the 6GB card. Set the VAE BEFORE
-        # enable_model_cpu_offload so the offload hooks attach to it.
-        image_pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-            image_pipe.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++"
-        )
-        image_pipe.vae = AutoencoderTiny.from_pretrained("madebyollin/taesdxl", torch_dtype=torch.float16)
-        # NOTE: the plus-face IP-Adapter is NOT loaded here - its ~0.7GB of
-        # attention weights push the SDXL UNet past the 6GB card and every
-        # generation OOMs. Reference mode is moving to the FaceID (LoRA)
-        # variant, which fuses into existing weights instead.
-        image_pipe.enable_model_cpu_offload()
-        print("image model ready", flush=True)
+        if mode == "gpu_chat":
+            _spawn_chat_worker(chat_path)  # GPU; SDXL stays unloaded
+        else:
+            print("loading SDXL checkpoint (GPU)...", flush=True)
+            image_pipe = StableDiffusionXLPipeline.from_single_file(
+                IMAGE_MODEL_PATH, torch_dtype=torch.float16, use_safetensors=True
+            )
+            # Speed, no model change: DPM++ 2M Karras converges in fewer steps
+            # than the default scheduler, and TAESD (a tiny distilled VAE)
+            # decodes far faster than the full SDXL VAE and removes the
+            # VAE-decode VRAM spike that used to flirt with OOM on the 6GB
+            # card. Set the VAE BEFORE enable_model_cpu_offload so the offload
+            # hooks attach to it.
+            image_pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+                image_pipe.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++"
+            )
+            image_pipe.vae = AutoencoderTiny.from_pretrained("madebyollin/taesdxl", torch_dtype=torch.float16)
+            image_pipe.enable_model_cpu_offload()
+            print("image model ready", flush=True)
 
-        chat_path = str(GGUF_DIR / _chat_selection["model"])
-        n_layers = CHAT_GPU_LAYERS  # always 0 - CPU-only build (see note at top)
-        print(f"loading chat model {_chat_selection['model']} (CPU)...", flush=True)
-        try:
+            print(f"loading chat model {_chat_selection['model']} (CPU)...", flush=True)
             llm = Llama(model_path=chat_path, n_ctx=LLM_CONTEXT, n_threads=8,
-                        n_gpu_layers=n_layers, verbose=False)
-        except Exception as e:
-            if n_layers:
-                print(f"GPU chat load failed ({e}); falling back to CPU", flush=True)
-                llm = Llama(model_path=chat_path, n_ctx=LLM_CONTEXT, n_threads=8,
-                            n_gpu_layers=0, verbose=False)
-            else:
-                raise
-        print("chat model ready", flush=True)
+                        n_gpu_layers=CHAT_GPU_LAYERS, verbose=False)
+            print("chat model ready", flush=True)
         with _model_status_lock:
             _model_status = "ready"
             _model_error = ""
     except Exception as e:
         print(f"model load failed: {e}", flush=True)
-        # Drop any half-loaded state (e.g. SDXL loaded but the chat model
-        # failed) so a retry starts clean and doesn't strand VRAM/RAM.
+        # Drop any half-loaded state so a retry starts clean and doesn't
+        # strand VRAM/RAM or a zombie worker.
+        _kill_worker()
         image_pipe = None
         llm = None
         gc.collect()
@@ -1015,6 +1151,7 @@ def _unload_models():
     Initialize. Runs on _gpu_executor so teardown happens on the same thread
     (and CUDA context) that loaded the models."""
     global image_pipe, llm, _model_status
+    _kill_worker()  # GPU-chat subprocess, if any
     with _gpu_lock:
         image_pipe = None
         llm = None
@@ -1075,6 +1212,9 @@ async def initialize(request: Request):
             model = body.get("chat_model")
             if model in _list_chat_models():
                 _chat_selection["model"] = model
+            mode = body.get("chat_mode")
+            if mode in CHAT_MODES:
+                _chat_selection["mode"] = mode
             _model_status = "loading"
             _model_error = ""
             # Load on _gpu_executor's thread specifically, so the CUDA
