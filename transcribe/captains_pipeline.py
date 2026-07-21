@@ -86,10 +86,9 @@ DEFAULT_DASHBOARD = "https://dashboard.nmteaco.com"
 DATALOG_ENDPOINTS = ("sales", "shipping", "support", "calls", "texts", "timeclock")
 
 SOURCE_LINE = (
-    "_Source: Tea One mic → UniFi Protect → faster-whisper large-v3 (GPU) → "
-    "de-identified by a local instruct model on the AI box. Raw transcript "
-    "discarded after this log was written. Business data: dashboard datalog "
-    "API + Slack._"
+    "_Source: Tea One mic → faster-whisper large-v3 → de-identified by a local "
+    "model on the AI box · business data from the dashboard datalog API and "
+    "Slack. Raw transcript never leaves the box._"
 )
 
 # --- policy (the summarizer MUST follow this) ---------------------------------
@@ -132,7 +131,17 @@ and tastings"); never enumerate products or topics. No bullet lists of
 Then ONE section, "## Unresolved", listing ONLY things still open at close:
 discrepancies to reconcile (with amounts), promised follow-ups, broken
 equipment, supplies to reorder. Something resolved during the day does NOT go
-here. 0-5 bullets, each a specific action someone could pick up tomorrow.
+here. 0-5 bullets. Each bullet must name a concrete object and action someone
+can pick up tomorrow ("reconcile the $70 register shortfall", "reorder maple
+oolong", "fix the wobbly display shelf"). BANNED: vague care-taking items
+("confirm the customer was satisfied", "ensure clarity around X"), items
+built on garbled audio, and anything you cannot state in plain business
+terms. An empty Unresolved section is better than a padded one.
+
+STYLE: never write about non-events ("a customer asked about X but no action
+was taken" says nothing - cut it). Refer to register sales in plain words
+("the $23.50 Earl Grey sale at 2:32pm") - the ⟦ ⟧ markup must never appear
+in your output.
 
 PRIVACY (strict, applies to AUDIO):
 - A person's name may appear ONLY if it comes from SLACK or a business record
@@ -803,6 +812,8 @@ def main():
             f"_No speech captured today._"
         )
 
+    # Belt-and-braces: the weave markup must never ship, whatever the LLM does.
+    markdown = markdown.replace("⟦", "").replace("⟧", "")
     markdown = (markdown.rstrip() + "\n\n" + _business_sections(biz)
                 + "\n\n" + SOURCE_LINE)
     _commit_and_push(date_str, markdown, env)
