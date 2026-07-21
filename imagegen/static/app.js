@@ -271,19 +271,36 @@ function showModePicker() {
   checkInit();
 }
 
-function renderInitState(status) {
+const PLACEMENT_LABELS = {
+  cpu: "CPU — image model keeps the GPU (default)",
+  gpu_partial: "GPU partial — faster chat, image generation may fail while loaded",
+  gpu_heavy: "GPU heavy — fastest chat, image generation unavailable while loaded",
+};
+
+function renderInitState(st) {
   const area = $("init-area");
   const modeButtons = $("mode-buttons");
-  if (status === "ready") {
-    area.innerHTML = `<p id="chat-status"><a href="#" id="unload-btn">shut down models</a>
-      &mdash; frees the GPU and RAM; your chats &amp; images stay until logout</p>`;
+  if (st.status === "ready") {
+    area.innerHTML = `<p id="chat-status">chat model: ${escapeText(st.chat_model)} (${escapeText(st.placement)})
+      &mdash; <a href="#" id="unload-btn">shut down models</a>
+      (frees the GPU and RAM; your chats &amp; images stay until logout)</p>`;
     modeButtons.style.display = "flex";
     $("unload-btn").addEventListener("click", (e) => { e.preventDefault(); doUnload(); });
-  } else if (status === "loading") {
-    area.innerHTML = `<p id="chat-status">initializing models... (~20s)</p>`;
+  } else if (st.status === "loading") {
+    area.innerHTML = `<p id="chat-status">initializing models... (~30s)</p>`;
     modeButtons.style.display = "none";
   } else {
-    area.innerHTML = `<button id="init-btn">initialize system</button>
+    const models = st.models || [st.chat_model];
+    const modelOpts = models.map((m) =>
+      `<option value="${escapeText(m)}" ${m === st.chat_model ? "selected" : ""}>${escapeText(m)}</option>`).join("");
+    const placeOpts = (st.placements || ["cpu"]).map((p) =>
+      `<option value="${p}" ${p === st.placement ? "selected" : ""}>${PLACEMENT_LABELS[p] || p}</option>`).join("");
+    area.innerHTML = `
+      <label for="chat-model-sel">chat model</label>
+      <select id="chat-model-sel">${modelOpts}</select>
+      <label for="chat-place-sel">chat model placement</label>
+      <select id="chat-place-sel">${placeOpts}</select>
+      <button id="init-btn">initialize system</button>
       <p id="chat-status">models aren't loaded yet - nothing uses memory until you start this</p>`;
     modeButtons.style.display = "none";
     $("init-btn").addEventListener("click", startInit);
@@ -291,20 +308,23 @@ function renderInitState(status) {
 }
 
 async function checkInit() {
-  const { status } = await apiCall("/api/init-status", {});
-  renderInitState(status);
-  if (status === "loading") setTimeout(checkInit, 2000);
+  const st = await apiCall("/api/init-status", {});
+  renderInitState(st);
+  if (st.status === "loading") setTimeout(checkInit, 2000);
 }
 
 async function startInit() {
-  const { status } = await apiCall("/api/initialize", {});
-  renderInitState(status);
-  if (status === "loading") setTimeout(checkInit, 2000);
+  const st = await apiCall("/api/initialize", {
+    chat_model: $("chat-model-sel") ? $("chat-model-sel").value : undefined,
+    chat_placement: $("chat-place-sel") ? $("chat-place-sel").value : undefined,
+  });
+  renderInitState(st);
+  if (st.status === "loading") setTimeout(checkInit, 2000);
 }
 
 async function doUnload() {
-  const { status } = await apiCall("/api/unload", {});
-  renderInitState(status);
+  const st = await apiCall("/api/unload", {});
+  renderInitState(st);
 }
 
 async function openMode(mode) {

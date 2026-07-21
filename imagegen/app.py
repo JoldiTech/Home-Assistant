@@ -105,6 +105,13 @@ IMAGE_MODEL_PATH = os.environ.get(
 LLM_MODEL_PATH = os.environ.get(
     "LLM_MODEL_PATH", os.path.expanduser("~/imagegen/models/Gemma-4-12B-OBLITERATED.Q4_K_M.gguf")
 )
+# Chat-model picker: any .gguf in the models dir is selectable at Initialize,
+# with a CPU/GPU placement choice. GPU placement shares the 6GB card with
+# SDXL - partial offload speeds chat but crowds image generation; heavy
+# offload effectively claims the card for chat. Requires the CUDA build of
+# llama-cpp-python (torch's import preloads the bundled CUDA libs it needs).
+GGUF_DIR = Path(LLM_MODEL_PATH).parent
+CHAT_PLACEMENTS = {"cpu": 0, "gpu_partial": 16, "gpu_heavy": 28}
 PORT = int(os.environ.get("PORT", "8189"))
 
 SESSION_IDLE_TIMEOUT = 20 * 60  # session (and its conversation) dies after this much inactivity
@@ -241,6 +248,25 @@ image_pipe = None
 llm = None
 _model_status_lock = threading.Lock()
 _model_status = "cold"  # cold -> loading -> ready -> error
+_chat_selection = {"model": Path(LLM_MODEL_PATH).name, "placement": "cpu"}
+
+
+def _list_chat_models() -> list[str]:
+    try:
+        return sorted(f.name for f in GGUF_DIR.glob("*.gguf"))
+    except OSError:
+        return [Path(LLM_MODEL_PATH).name]
+
+
+def _init_payload() -> dict:
+    with _model_status_lock:
+        status = _model_status
+    payload = {"status": status, "chat_model": _chat_selection["model"],
+               "placement": _chat_selection["placement"]}
+    if status == "cold":
+        payload["models"] = _list_chat_models()
+        payload["placements"] = list(CHAT_PLACEMENTS)
+    return payload
 
 
 def _client_ip(request: Request) -> str:
@@ -861,14 +887,19 @@ def _load_models():
         image_pipe.enable_model_cpu_offload()
         print("image model ready", flush=True)
 
-        print("loading Gemma-4-12B-OBLITERATED (CPU)...", flush=True)
-        llm = Llama(
-            model_path=LLM_MODEL_PATH,
-            n_ctx=LLM_CONTEXT,
-            n_threads=8,
-            n_gpu_layers=0,  # deliberately CPU-only - see module docstring
-            verbose=False,
-        )
+        chat_path = str(GGUF_DIR / _chat_selection["model"])
+        n_layers = CHAT_PLACEMENTS.get(_chat_selection["placement"], 0)
+        print(f"loading chat model {_chat_selection['model']} (gpu_layers={n_layers})...", flush=True)
+        try:
+            llm = Llama(model_path=chat_path, n_ctx=LLM_CONTEXT, n_threads=8,
+                        n_gpu_layers=n_layers, verbose=False)
+        except Exception as e:
+            if n_layers:
+                print(f"GPU chat load failed ({e}); falling back to CPU", flush=True)
+                llm = Llama(model_path=chat_path, n_ctx=LLM_CONTEXT, n_threads=8,
+                            n_gpu_layers=0, verbose=False)
+            else:
+                raise
         print("chat model ready", flush=True)
         with _model_status_lock:
             _model_status = "ready"
@@ -907,7 +938,7 @@ async def unload(request: Request):
         busy = _model_status == "loading"
     if not busy and _model_status != "cold":
         await asyncio.get_event_loop().run_in_executor(_gpu_executor, _unload_models)
-    return JSONResponse(_encrypt({"status": _model_status}))
+    return JSONResponse(_encrypt(_init_payload()))
 
 
 @app.post("/api/release-gpu")
@@ -935,16 +966,22 @@ async def initialize(request: Request):
     result = _require_session(request)
     if isinstance(result, JSONResponse):
         return result
+    body = _decrypt(await request.json())
     global _model_status
     with _model_status_lock:
         if _model_status == "cold":
+            model = body.get("chat_model")
+            placement = body.get("chat_placement")
+            if model in _list_chat_models():
+                _chat_selection["model"] = model
+            if placement in CHAT_PLACEMENTS:
+                _chat_selection["placement"] = placement
             _model_status = "loading"
             # Load on _gpu_executor's thread specifically, so the CUDA
             # context SDXL initializes here is the same one every later
             # _run_image call reuses - not a different thread's context.
             asyncio.get_event_loop().run_in_executor(_gpu_executor, _load_models)
-        status = _model_status
-    return JSONResponse(_encrypt({"status": status}))
+    return JSONResponse(_encrypt(_init_payload()))
 
 
 @app.post("/api/init-status")
@@ -952,7 +989,7 @@ async def init_status(request: Request):
     result = _require_session(request)
     if isinstance(result, JSONResponse):
         return result
-    return JSONResponse(_encrypt({"status": _model_status}))
+    return JSONResponse(_encrypt(_init_payload()))
 
 
 if __name__ == "__main__":
