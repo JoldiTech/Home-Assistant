@@ -53,6 +53,8 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from diffusers import AutoencoderTiny, DPMSolverMultistepScheduler, StableDiffusionXLPipeline
+from diffusers.image_processor import IPAdapterMaskProcessor
+from PIL import Image as PILImage
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -130,6 +132,11 @@ IMG_DEFAULT_NEGATIVE = (
     "limbs, mutated hands, watermark, signature, text, jpeg artifacts, "
     "worst quality, cartoon, 3d render"
 )
+IP_ADAPTER_DIR = os.environ.get(
+    "IP_ADAPTER_DIR", os.path.expanduser("~/imagegen/models/ip_adapter")
+)
+IMG_REF_MAX = 2          # 1 ref = subject likeness; 2 refs = left/right masked
+IMG_REF_DEFAULT_STRENGTH = 0.6
 LLM_MAX_TOKENS = 512
 LLM_CONTEXT = 8192
 
@@ -627,15 +634,48 @@ def _expand_image_prompt(user_prompt: str) -> str:
         return user_prompt
 
 
+def _decode_ref(b64: str):
+    """Reference photo from the request: decode, orient, downscale. Lives only
+    in this request - never written anywhere."""
+    img = PILImage.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+    img.thumbnail((768, 768))
+    return img
+
+
 def _run_image(prompt: str, quality: str = IMG_DEFAULT_PRESET,
-               negative: str | None = None) -> str:
+               negative: str | None = None, refs: list | None = None,
+               ref_strength: float = IMG_REF_DEFAULT_STRENGTH) -> str:
     p = IMG_PRESETS.get(quality, IMG_PRESETS[IMG_DEFAULT_PRESET])
     neg = IMG_DEFAULT_NEGATIVE if negative is None else negative
+    refs = refs or []
+    kwargs = {}
     with _gpu_lock:
+        if len(refs) >= 2:
+            # Two references -> two people: each conditions its own half of
+            # the frame (left = first upload, right = second), which is what
+            # keeps them two distinct people instead of one blended face.
+            half_l = PILImage.new("L", (IMG_SIZE, IMG_SIZE), 0)
+            half_l.paste(255, (0, 0, IMG_SIZE // 2, IMG_SIZE))
+            half_r = PILImage.new("L", (IMG_SIZE, IMG_SIZE), 0)
+            half_r.paste(255, (IMG_SIZE // 2, 0, IMG_SIZE, IMG_SIZE))
+            masks = IPAdapterMaskProcessor().preprocess(
+                [half_l, half_r], height=IMG_SIZE, width=IMG_SIZE)
+            masks = [masks.reshape(1, masks.shape[0], masks.shape[2], masks.shape[3])]
+            image_pipe.set_ip_adapter_scale([[ref_strength, ref_strength]])
+            kwargs = {"ip_adapter_image": [[refs[0], refs[1]]],
+                      "cross_attention_kwargs": {"ip_adapter_masks": masks}}
+        elif len(refs) == 1:
+            image_pipe.set_ip_adapter_scale(ref_strength)
+            kwargs = {"ip_adapter_image": refs[0]}
+        else:
+            # Adapter is loaded, so an image arg is mandatory - a black dummy
+            # at scale 0.0 is a no-op.
+            image_pipe.set_ip_adapter_scale(0.0)
+            kwargs = {"ip_adapter_image": PILImage.new("RGB", (224, 224), 0)}
         image = image_pipe(
             prompt=prompt, negative_prompt=neg or None,
             num_inference_steps=p["steps"], guidance_scale=p["guidance"],
-            height=IMG_SIZE, width=IMG_SIZE,
+            height=IMG_SIZE, width=IMG_SIZE, **kwargs,
         ).images[0]
         # 6GB is a tight budget for SDXL's VAE-decode memory spike specifically -
         # release cached (but unused) allocator blocks between calls rather than
@@ -756,6 +796,17 @@ async def image_only(request: Request):
     if negative is not None:
         negative = str(negative).strip()[:1000]
 
+    refs = []
+    for ref_b64 in (body.get("refs") or [])[:IMG_REF_MAX]:
+        try:
+            refs.append(_decode_ref(str(ref_b64)))
+        except Exception:
+            return JSONResponse({"error": "could not read a reference image"}, status_code=400)
+    try:
+        ref_strength = min(1.0, max(0.1, float(body.get("ref_strength", IMG_REF_DEFAULT_STRENGTH))))
+    except (TypeError, ValueError):
+        ref_strength = IMG_REF_DEFAULT_STRENGTH
+
     final_prompt = prompt
     if body.get("assist"):
         final_prompt = await asyncio.get_event_loop().run_in_executor(
@@ -763,7 +814,7 @@ async def image_only(request: Request):
 
     try:
         image_b64 = await asyncio.get_event_loop().run_in_executor(
-            _gpu_executor, _run_image, final_prompt, quality, negative)
+            _gpu_executor, _run_image, final_prompt, quality, negative, refs, ref_strength)
     except RuntimeError:
         # Almost always CUDA OOM - the nightly Captain's Log transcription
         # holds ~4GB of the 6GB card while it runs.
@@ -802,8 +853,18 @@ def _load_models():
             image_pipe.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++"
         )
         image_pipe.vae = AutoencoderTiny.from_pretrained("madebyollin/taesdxl", torch_dtype=torch.float16)
+        # IP-Adapter (plus-face): photo-reference conditioning. Loaded BEFORE
+        # cpu_offload so the offload hooks cover the CLIP image encoder too.
+        # When no reference is supplied, generation passes a black dummy image
+        # at scale 0.0 (a loaded adapter requires an ip_adapter_image arg).
+        image_pipe.load_ip_adapter(
+            IP_ADAPTER_DIR, subfolder="sdxl_models",
+            weight_name="ip-adapter-plus-face_sdxl_vit-h.safetensors",
+            image_encoder_folder="models/image_encoder",
+        )
+        image_pipe.set_ip_adapter_scale(0.0)
         image_pipe.enable_model_cpu_offload()
-        print("image model ready", flush=True)
+        print("image model ready (with IP-Adapter)", flush=True)
 
         print("loading Gemma-4-12B-OBLITERATED (CPU)...", flush=True)
         llm = Llama(

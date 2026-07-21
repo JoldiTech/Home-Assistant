@@ -328,6 +328,13 @@ function renderImageOnly() {
       <textarea id="image-negative" rows="2" placeholder="avoid in the image (optional - a sensible default is applied if empty)"></textarea>
       <label><input type="checkbox" id="image-assist"> prompt assist - the local LLM adds artistic
         direction (composition, lighting, style) to your idea first (+~15s)</label>
+      <label for="image-refs">reference photo(s) - optional, up to 2. One photo steers the
+        subject's look; with two, the FIRST person appears on the LEFT, the second on the
+        RIGHT. Headshots work best. Never stored.</label>
+      <input type="file" id="image-refs" accept="image/*" multiple>
+      <label for="image-ref-strength">reference strength: <span id="ref-strength-val">0.6</span>
+        (higher = closer likeness, but the prompt steers less)</label>
+      <input type="range" id="image-ref-strength" min="0.1" max="1.0" step="0.05" value="0.6">
       <label for="image-quality">quality</label>
       <select id="image-quality">
         <option value="quick">quick (~15s)</option>
@@ -346,7 +353,20 @@ function renderImageOnly() {
     $("gallery").innerHTML = "";
   });
   $("image-form").addEventListener("submit", onImageSubmit);
+  $("image-ref-strength").addEventListener("input", (e) => {
+    $("ref-strength-val").textContent = e.target.value;
+  });
   loadState("image");
+}
+
+function fileToB64(file) {
+  return new Promise((resolve, reject) => {
+    if (file.size > 10 * 1024 * 1024) { reject(new Error("reference image over 10MB")); return; }
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(",")[1]);
+    r.onerror = () => reject(new Error("could not read reference image"));
+    r.readAsDataURL(file);
+  });
 }
 
 async function onImageSubmit(e) {
@@ -363,6 +383,11 @@ async function onImageSubmit(e) {
   try {
     const payload = { prompt, quality, assist };
     if (negRaw) payload.negative = negRaw;
+    const refFiles = Array.from($("image-refs").files || []).slice(0, 2);
+    if (refFiles.length) {
+      payload.refs = await Promise.all(refFiles.map(fileToB64));
+      payload.ref_strength = parseFloat($("image-ref-strength").value);
+    }
     const { image, used_prompt } = await apiCall("/api/image", payload);
     appendGalleryImage(image);
     $("used-prompt").textContent = used_prompt ? `assist used: ${used_prompt}` : "";
