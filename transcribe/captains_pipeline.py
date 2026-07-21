@@ -129,8 +129,9 @@ only thing that evaporates at closing time - capturing it is your entire job.
 
 THE UNIQUE RECORD - always capture, with specifics:
 - Unmet demand: products/sizes/services customers asked for that we don't
-  carry or were out of. Name them exactly; count repeats ("second person
-  this week asking for decaf chai").
+  carry or were out of. Name them exactly; count repeats within the day
+  ("third ask for decaf chai today"). You only see ONE day - never claim
+  cross-day patterns ("this week", "again").
 - Feedback: specific praise or complaints about a product, price, or the
   shop - named, not "customers were happy".
 - Commitments: anything staff promised anyone (holds, callbacks, special
@@ -179,6 +180,14 @@ FORMAT:
 
 STYLE: no non-events ("a customer asked about X but no action was taken" -
 cut). Register sales in plain words; the ⟦ ⟧ markup never appears in output.
+
+GROUNDING - the cardinal rule: every event, cause, number, and product in
+your output must trace to a specific input line. NEVER invent an explanation
+that isn't stated - no guessed festivals, weather, tour groups, or events.
+A busy day with no stated reason is just "busy"; a shortfall with no stated
+cause is "unexplained". Counts too: one mention is "a customer", not
+"several" - only count what you can point to. An invented cause or inflated
+count poisons a permanent record; an honest gap does not.
 
 PRIVACY (strict, applies to AUDIO):
 - A person's name may appear ONLY if it comes from SLACK or a business record
@@ -250,8 +259,9 @@ names. Rules:
   general narrative color - a product name is not an order.
 - Annotate at most 3 places in the whole log. Zero is a fine answer.
 - Use ONLY ids/amounts/names that appear in RECORDS - never invent one.
-- A match needs corroboration (time AND amount, or amount AND item). If not
-  confident, leave the bullet exactly as it is.
+- A match needs corroboration (time AND amount, or amount AND item). A
+  mismatched amount is a NON-match: never attach a $175.97 order to a $70
+  discrepancy. If not confident, leave the bullet exactly as it is.
 - Prefix inferred links with "likely" unless the amount matches exactly.
 - Change NOTHING else: no rewording, no adding or removing bullets.
 Output ONLY the annotated markdown log. /no_think"""
