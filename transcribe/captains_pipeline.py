@@ -14,7 +14,11 @@ entirely on the AI box - no Claude/cloud session in the loop:
     -> redaction pass, then append deterministic business sections (numbers
        never pass through the LLM)
     -> commit the Captain's Log markdown to the private repo's captains-log branch
-    -> delete the raw transcript
+
+Raw transcripts stay in ~/captains_transcripts/ on this box (never in git) and
+are reused on reruns — transcription is the ~30 min stage, the LLM stages are
+minutes. FORCE_RETRANSCRIBE=1 redoes the audio; DELETE_TRANSCRIPTS=1 restores
+the old delete-on-success behavior.
 
 The business day is 6pm-6pm Mountain: the log for date D covers 6pm on D-1
 through 6pm on D (after-hours online orders / emails / texts are handled at
@@ -559,7 +563,17 @@ def _business_sections(biz: dict) -> str:
 # --- transcription ------------------------------------------------------------
 
 def _transcribe(date_str: str) -> tuple[str, Path]:
-    """Run transcribe_day.py in its own process; return (transcript_text, log_path)."""
+    """Run transcribe_day.py in its own process; return (transcript_text, log_path).
+
+    Transcription is by far the longest stage (~30 min for a full day), so an
+    existing transcript for the date is reused — reruns for prompt/pipeline
+    testing only pay for the LLM stages. Set FORCE_RETRANSCRIBE=1 to redo the
+    audio (e.g. after a transcription-quality change)."""
+    log_path = Path.home() / "captains_transcripts" / f"tea_one_{date_str}.log"
+    if (log_path.exists() and log_path.stat().st_size > 0
+            and not os.environ.get("FORCE_RETRANSCRIBE")):
+        _warn(f"reusing existing transcript {log_path}")
+        return log_path.read_text(), log_path
     _warn(f"transcribing {date_str}...")
     proc = subprocess.run(
         [sys.executable, str(TRANSCRIBE_SCRIPT), date_str],
@@ -567,7 +581,6 @@ def _transcribe(date_str: str) -> tuple[str, Path]:
     )
     if proc.returncode != 0:
         raise RuntimeError(f"transcription failed: {proc.stderr[-2000:]}")
-    log_path = Path.home() / "captains_transcripts" / f"tea_one_{date_str}.log"
     return proc.stdout, log_path
 
 
@@ -767,7 +780,6 @@ def main():
 
     if not have_speech and not have_data:
         _warn(f"{date_str}: no speech and no business data - nothing to log")
-        log_path.unlink(missing_ok=True)
         return
 
     if have_speech:
@@ -783,9 +795,13 @@ def main():
     markdown = markdown.rstrip() + "\n\n" + _business_sections(biz)
     _commit_and_push(date_str, markdown, env)
 
-    # Only after the summary is safely committed: delete the raw transcript.
-    log_path.unlink(missing_ok=True)
-    _warn(f"{date_str}: done, raw transcript deleted")
+    # Transcripts stay on this box (never in git) so test reruns skip the
+    # ~30 min re-transcription. DELETE_TRANSCRIPTS=1 restores delete-on-success.
+    if os.environ.get("DELETE_TRANSCRIPTS"):
+        log_path.unlink(missing_ok=True)
+        _warn(f"{date_str}: done, raw transcript deleted")
+    else:
+        _warn(f"{date_str}: done, transcript kept at {log_path}")
 
 
 if __name__ == "__main__":

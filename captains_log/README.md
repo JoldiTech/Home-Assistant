@@ -119,5 +119,9 @@ All on the AI box in `/etc/nmteaco/captains.env` (mode 600, never committed):
 
 ## Retention
 
-The raw transcript is **ephemeral** — deleted each night once the day's log is
-safely in git. These dated summaries are the only durable record.
+Raw transcripts live only on the AI box (`~/captains_transcripts/`, never in
+git) and are **kept** so test reruns skip the ~30 min re-transcription — the
+pipeline reuses an existing day-file and only pays for the LLM stages
+(`FORCE_RETRANSCRIBE=1` redoes the audio; `DELETE_TRANSCRIPTS=1` restores
+delete-on-success). GitHub still only ever holds the sanitized dated
+summaries.
