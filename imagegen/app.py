@@ -247,7 +247,8 @@ _llm_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 image_pipe = None
 llm = None
 _model_status_lock = threading.Lock()
-_model_status = "cold"  # cold -> loading -> ready -> error
+_model_status = "cold"  # cold -> loading -> ready; error -> back to a cold-like retry
+_model_error = ""       # last load failure, surfaced to the picker so the user can retry
 _chat_selection = {"model": Path(LLM_MODEL_PATH).name, "placement": "cpu"}
 
 
@@ -261,11 +262,18 @@ def _list_chat_models() -> list[str]:
 def _init_payload() -> dict:
     with _model_status_lock:
         status = _model_status
+        err = _model_error
     payload = {"status": status, "chat_model": _chat_selection["model"],
                "placement": _chat_selection["placement"]}
-    if status == "cold":
+    # Any state that isn't actively loading or ready is a state the user must
+    # be able to (re)start from - so always ship the picker options there,
+    # including 'error'. Otherwise a transient load failure strips the picker
+    # to fallbacks AND leaves no way forward.
+    if status not in ("loading", "ready"):
         payload["models"] = _list_chat_models()
         payload["placements"] = list(CHAT_PLACEMENTS)
+    if status == "error":
+        payload["error"] = err
     return payload
 
 
@@ -924,7 +932,7 @@ def _load_models():
     # UI). Both models are loaded together since either mode can be opened
     # once ready; there is currently no auto-unload - they stay resident
     # until the process restarts.
-    global image_pipe, llm, _model_status
+    global image_pipe, llm, _model_status, _model_error
     try:
         print("loading SDXL checkpoint (GPU)...", flush=True)
         image_pipe = StableDiffusionXLPipeline.from_single_file(
@@ -962,10 +970,21 @@ def _load_models():
         print("chat model ready", flush=True)
         with _model_status_lock:
             _model_status = "ready"
+            _model_error = ""
     except Exception as e:
         print(f"model load failed: {e}", flush=True)
+        # Drop any half-loaded state (e.g. SDXL loaded but the chat model
+        # failed) so a retry starts clean and doesn't strand VRAM/RAM.
+        image_pipe = None
+        llm = None
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
         with _model_status_lock:
             _model_status = "error"
+            _model_error = str(e)[:200]
 
 
 def _unload_models():
@@ -1026,9 +1045,12 @@ async def initialize(request: Request):
     if isinstance(result, JSONResponse):
         return result
     body = _decrypt(await request.json())
-    global _model_status
+    global _model_status, _model_error
     with _model_status_lock:
-        if _model_status == "cold":
+        # Startable from a fresh process (cold) OR after a failed attempt
+        # (error) - a transient load failure (e.g. GPU busy) must not brick
+        # the picker. Only 'loading'/'ready' are guarded.
+        if _model_status in ("cold", "error"):
             model = body.get("chat_model")
             placement = body.get("chat_placement")
             if model in _list_chat_models():
@@ -1036,6 +1058,7 @@ async def initialize(request: Request):
             if placement in CHAT_PLACEMENTS:
                 _chat_selection["placement"] = placement
             _model_status = "loading"
+            _model_error = ""
             # Load on _gpu_executor's thread specifically, so the CUDA
             # context SDXL initializes here is the same one every later
             # _run_image call reuses - not a different thread's context.

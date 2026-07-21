@@ -289,20 +289,33 @@ function renderInitState(st) {
     area.innerHTML = `<p id="chat-status">initializing models... (~30s)</p>`;
     modeButtons.style.display = "none";
   } else {
-    const models = st.models || [st.chat_model];
-    const modelOpts = models.map((m) =>
-      `<option value="${escapeText(m)}" ${m === st.chat_model ? "selected" : ""}>${escapeText(m)}</option>`).join("");
-    const placeOpts = (st.placements || ["cpu"]).map((p) =>
-      `<option value="${p}" ${p === st.placement ? "selected" : ""}>${PLACEMENT_LABELS[p] || p}</option>`).join("");
+    // cold OR error - both are startable; the server ships the picker
+    // options in both. Build <option>s as DOM nodes (no attribute-injection
+    // surface from model filenames).
+    modeButtons.style.display = "none";
+    const errLine = st.status === "error" && st.error
+      ? `<p class="err">last attempt failed: ${escapeText(st.error)} — check the model/placement and try again</p>` : "";
     area.innerHTML = `
       <label for="chat-model-sel">chat model</label>
-      <select id="chat-model-sel">${modelOpts}</select>
+      <select id="chat-model-sel"></select>
       <label for="chat-place-sel">chat model placement</label>
-      <select id="chat-place-sel">${placeOpts}</select>
+      <select id="chat-place-sel"></select>
       <button id="init-btn">initialize system</button>
+      ${errLine}
       <p id="chat-status">models aren't loaded yet - nothing uses memory until you start this</p>`;
-    modeButtons.style.display = "none";
+    fillSelect($("chat-model-sel"), st.models || [st.chat_model], st.chat_model, (m) => m);
+    fillSelect($("chat-place-sel"), st.placements || ["cpu"], st.placement, (p) => PLACEMENT_LABELS[p] || p);
     $("init-btn").addEventListener("click", startInit);
+  }
+}
+
+function fillSelect(sel, values, selected, labelFn) {
+  for (const v of values) {
+    const opt = document.createElement("option");
+    opt.value = v;              // safe: set as a property, never parsed as HTML
+    opt.textContent = labelFn(v);
+    if (v === selected) opt.selected = true;
+    sel.appendChild(opt);
   }
 }
 
