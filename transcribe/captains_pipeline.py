@@ -25,9 +25,10 @@ through 6pm on D (after-hours online orders / emails / texts are handled at
 next opening, so they land on the next day's log). The audio transcript still
 covers store hours of calendar day D.
 
-Privacy: strict de-identification applies to CAPTURED AUDIO only. Structured
-business records (POS orders, Slack, tickets, timeclock, call/text metadata)
-keep real names - that's the point of having them.
+Privacy: the rule is linkage, not names. Names tied to operational facts
+(promises, holds, orders) stay - they're the point. What never survives is a
+named person tied to sensitive content (health, personal life, attributed
+remarks); the redaction pass breaks the link, keeping the event.
 
 Usage:  python3 captains_pipeline.py 2026-07-20
         (date optional; defaults to today, America/Denver)
@@ -92,9 +93,9 @@ SOURCE_LINE = (
 )
 
 # --- policy (the summarizer MUST follow this) ---------------------------------
-# Mirrors captains_log/README.md. Strict de-identification applies to AUDIO;
-# structured business records keep real names. This is the judgment the whole
-# system exists to do well.
+# Mirrors captains_log/README.md. Privacy = no linkage between a named person
+# and sensitive content; names on operational facts are welcome. This is the
+# judgment the whole system exists to do well.
 COMPANY_CONTEXT = """THE SHOP - facts to write with (never explain these in \
 the log; the reader owns the company):
 New Mexico Tea Company - small Albuquerque business, founded 2006, shop at
@@ -192,15 +193,21 @@ cause is "unexplained". Counts too: one mention is "a customer", not
 "several" - only count what you can point to. An invented cause or inflated
 count poisons a permanent record; an honest gap does not.
 
-PRIVACY (strict, applies to AUDIO):
-- A person's name may appear ONLY if it comes from SLACK or a business record
-  - anyone merely overheard on audio stays anonymous ("a customer", "a
-  wholesale account"). No contact info. No health details tied to a person.
-- NO personal-life content overheard on the floor (school, jobs, hobbies,
-  travel, family, relationships, religion, politics, feelings, small talk) -
-  drop it entirely. No verbatim quotes that could identify someone; no gossip.
+PRIVACY - the rule is about LINKAGE, not names:
+- Names are fine, and often the point: a promise, hold, special order, or
+  callback NEEDS the name to be actionable ("send samples to Nancy Brown").
+- What must NEVER appear is a named person tied to sensitive or personal
+  content: health/medical details, personal-life circumstances, complaints
+  about other people, or "so-and-so said/felt X". Keep the operational fact,
+  break the link - "a customer asked about teas safe during pregnancy" is
+  fine; naming her in that sentence is not. No contact info ever.
+- Personal-life chatter that has NO operational value (school, jobs, hobbies,
+  travel, family, relationships, religion, politics, feelings, small talk)
+  still gets dropped entirely - not because of names, because it's noise.
+- No gossip; no attributing opinions or verbatim remarks to a named person.
 - Audio is lossy: never repeat a garbled phrase as fact; if a detail looks
-  like mis-transcription, drop it. When in doubt privacy-wise, leave it out.
+  like mis-transcription, drop it. When in doubt privacy-wise, keep the
+  event and drop the identifying half.
 
 Output ONLY the markdown log in the exact format given. No preamble, no
 <think> tags, no reasoning - just the log. /no_think"""
@@ -273,23 +280,21 @@ REDACT_TEMPLATE = """You are a privacy redactor for a tea shop's operational \
 log. You are given a draft Captain's Log. Return it UNCHANGED except for the \
 removals below, then output the cleaned log in the same format.
 
-ALLOWED NAMES - these come from written business records (staff chat, tickets,
-the time clock) and may stay in the log:
-{allowed_names}
-
-NAME AUDIT: the list above is EXHAUSTIVE. Any name not on it - however it
-got into the draft, including a customer introducing themselves on the shop
-floor - was overheard on audio: remove the name but keep the sentence if it
-is operational, rewriting the person as "a customer", "a wholesale account",
-"a staff member".
+THE PRIVACY RULE IS ABOUT LINKAGE, NOT NAMES. Names attached to operational
+facts stay - "send samples to Nancy Brown", "hold two tins for the Duran
+account" are the point of the log. What must never survive is a NAMED person
+tied to sensitive content: health/medical details, personal-life
+circumstances, or "so-and-so said/felt X". Fix by breaking the link - keep
+the event, drop the name from THAT sentence ("a customer asked about teas
+safe during pregnancy") - not by deleting the whole fact.
 
 REMOVE entirely any sentence or bullet that contains:
-- personal-life content not about running the shop (schooling/college, jobs or
+- personal-life content with no operational value (schooling/college, jobs or
   side-businesses, hobbies, art fairs, museums, travel, family, relationships,
   religion, politics, someone's feelings/struggles, small talk);
-- health/medical details tied to a person;
-- a verbatim quote, or something that reads like garbled audio rather than a
-  real shop event.
+- contact info (phone, email, address) for any individual;
+- a verbatim quote attributed to a person, gossip, or something that reads
+  like garbled audio rather than a real shop event.
 
 KEEP every id / dollar amount / time in parenthetical record references like
 "(likely order #58212, $43.50 at 2:14pm)" - those are business records.
@@ -306,9 +311,9 @@ NOTES_SYSTEM = SYSTEM_PROMPT + (
     "made, causes/explanations, problems and discrepancies (with amounts), equipment "
     "or stock issues, staff observations, plus one bullet on traffic feel. Routine "
     "retail chit-chat (brewing questions, browsing, tastings) produces NO bullets. "
-    "De-identify audio; keep POS amounts exact. These slices are AUDIO + POS only - "
-    "SLACK is not in them - so notes must contain NO personal names at all (any name "
-    "you see was overheard). No format headers - just bullets."
+    "Keep POS amounts exact. Names are fine when they carry an operational fact "
+    "(a promise, hold, or order); never pair a name with personal or health "
+    "content. No format headers - just bullets."
 )
 
 
@@ -560,24 +565,6 @@ def _validate_annotations(markdown: str, biz: dict) -> str:
     return "\n".join(out)
 
 
-def _allowed_names(biz: dict, slack_names: set) -> set:
-    """Names from written business records - the only names the redactor may
-    keep in the log. Everything else is presumed overheard on audio."""
-    names = set(slack_names)
-    support = biz.get("support") or {}
-    for tkt in (support.get("created") or []) + (support.get("closed") or []):
-        for k in ("customer", "closed_by"):
-            if tkt.get(k):
-                names.add(str(tkt[k]))
-    for sft in (biz.get("timeclock") or {}).get("shifts") or []:
-        if sft.get("employee"):
-            names.add(str(sft["employee"]))
-    for c in (biz.get("calls") or {}).get("list") or []:
-        if c.get("caller_id"):
-            names.add(str(c["caller_id"]))
-    return {n.strip() for n in names if n.strip()}
-
-
 def _records_index(biz: dict) -> str:
     """Compact one-line-per-record digest of the day for the correlation pass."""
     lines = []
@@ -824,7 +811,7 @@ def _strip_think(text: str) -> str:
 
 
 def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
-               allowed_names: set, context_text: str = "") -> str:
+               context_text: str = "") -> str:
     _warn("loading summarizer...")
     # Prefer a clear card (fast GPU path); the layer-fallback below still
     # covers the case where the VRAM never frees up.
@@ -889,14 +876,11 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
         _warn("correlation pass...")
         draft = _gen(CORRELATE_SYSTEM, f"RECORDS:\n{records}\n\nDRAFT:\n{draft}", 1800)
 
-    # Independent redaction pass: re-read the draft ONLY to strip anything
-    # personal/identifying/garbled that slipped through. The allowed-names list
-    # is computed from the structured data, so provenance doesn't depend on the
-    # draft carrying source labels. Cheap on GPU (~seconds).
+    # Independent redaction pass: re-read the draft ONLY to break name-to-
+    # sensitive-content links and strip personal-life/garble that slipped
+    # through. Cheap on GPU (~seconds).
     _warn("redaction pass...")
-    redact_system = REDACT_TEMPLATE.format(
-        allowed_names=", ".join(sorted(allowed_names)) if allowed_names else "(none)")
-    return _gen(redact_system, f"Draft to clean:\n\n{draft}", 1800)
+    return _gen(REDACT_TEMPLATE, f"Draft to clean:\n\n{draft}", 1800)
 
 
 # --- git ----------------------------------------------------------------------
@@ -966,7 +950,7 @@ def main():
     if have_speech:
         transcript = _weave_orders(transcript, biz.get("sales"), date_str)
         markdown = _summarize(transcript, day, slack_text, _records_index(biz),
-                              _allowed_names(biz, slack_names), _context_block(biz))
+                              _context_block(biz))
     else:
         _warn(f"{date_str}: no speech captured - business sections only")
         markdown = (

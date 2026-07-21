@@ -58,28 +58,22 @@ raw transcript deleted
 
 ## Privacy policy (the summarizer MUST follow this)
 
-**Strict de-identification applies to captured voice only.** Structured
-business records keep real names — that's their value.
+**The rule is linkage, not names.** A name attached to an operational fact is
+welcome — "send samples to Nancy Brown", "hold two tins for the Duran
+account" are exactly what makes the log actionable. What must never appear is
+a **named person tied to sensitive content**: health/medical details,
+personal-life circumstances, or attributed remarks ("so-and-so said/felt X").
+The fix is breaking the link, not deleting the fact — "a customer asked about
+teas safe during pregnancy" stays; naming her in that sentence doesn't.
 
-| Source | Names | Treatment |
-| --- | --- | --- |
-| Camera-mic audio | **never** | de-identify, drop personal-life content, garble-filter |
-| POS orders | n/a (no customer data fetched) | exact amounts/items, never garble-filtered |
-| Slack staff chat | real names OK | business record |
-| Support tickets | real customer names OK | emails/phones scrubbed from subjects |
-| Calls / texts | caller names & numbers OK | metadata only (no call audio) |
-| Timeclock | real staff names OK | hours, breaks, locations |
+Still dropped entirely, name or no name:
 
-Audio rules (unchanged in spirit from day one):
-
-- No names or anything identifying a person overheard on the floor.
-- No contact info; no health/medical details tied to an individual.
-- No personal-life content (school, side-jobs, hobbies, travel, family,
-  relationships, religion, politics, feelings, small talk) — drop it entirely.
-- No verbatim quotes that could identify someone; no gossip.
-- When in doubt, leave it out. If audio and this policy ever conflict with a
-  business record, the record's facts are safe; the overheard context is not.
-- If call *audio* is ever added, it gets the same strict treatment as mic audio.
+- Personal-life chatter with no operational value (school, jobs, hobbies,
+  travel, family, relationships, religion, politics, feelings, small talk).
+- Contact info (phone, email, address) for any individual.
+- Verbatim quotes attributed to a person; gossip.
+- Garbled audio presented as fact — a detail that looks mis-transcribed is
+  dropped, never guessed at. Register (POS) product names are never garble.
 
 ## Format
 
