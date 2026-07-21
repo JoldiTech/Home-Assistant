@@ -245,6 +245,36 @@ The history endpoint's `minimal_response` shrinks payloads but **omits `entity_i
 on repeated rows** — don't use it when you need to know which camera each row
 belongs to.
 
+### Store open/close automations (lights & music)
+
+- `script.store_open` → `all_lights_on` + `music_on`; `script.store_close` →
+  `all_lights_off` + `music_off`. `all_lights_on/off` template-target **every**
+  `light.*` plus every `switch.*` whose name contains "light" plus
+  `switch.smart_strip` — running `store_close` blacks out the whole store.
+- Triggers: WallMote Quad button 4 = store open, button 3 = store close
+  (`zwave_js_value_notification`, Central Scene). A morning automation also runs
+  `store_open` on the first person seen 9–10am on Tea Two Neo.
+- `input_select.store_state` (Open/Closed/Armed) is an **orphaned helper** —
+  nothing acts on it since 2026-07-19.
+
+### ⚠️ Incident 2026-07-19: live automation experiment blacked out the store
+
+A session working through this token created `automation.store_state_apply`
+(bare `state:` trigger on `input_select.store_state`, no conditions, action =
+`script.store_close`) at 9:48am **while the store was staffed**. Setting the
+select killed every light twice (9:48:57, 9:53:20 — the second firing happened
+during edit/delete because a bare state trigger also fires on attribute/metadata
+updates); employees had to mash WallMote button 4 to recover. Rules learned:
+
+- **Service calls via this token are attributed to the "New Mexico Tea Company"
+  user** — indistinguishable from the store dashboard. Your actions ARE
+  production actions.
+- **Never create/enable/test automations that touch lights or music during
+  business hours** (roughly 9am–7pm MT, any day people are on camera). Create
+  new automations with `initial_state: false` or test after hours.
+- Automations acting on state helpers must use explicit `to:` triggers plus
+  guard conditions — never a bare `state:` trigger wired to `store_close`.
+
 ### Repo conventions
 
 - Scripts live in `scripts/`, are standard-library-only Python 3, and read
