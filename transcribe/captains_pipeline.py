@@ -214,8 +214,14 @@ of the records, append a parenthetical reference to that bullet, e.g.:
 Write references in that plain style - never paste raw transcript syntax like
 "⟦POS ...⟧" into the log. Match on time proximity, dollar amounts, and item
 names. Rules:
+- Annotate ONLY bullets that describe a specific EVENT: a payment/order
+  discrepancy, a problem to reconcile, or one notable sale. NEVER attach ids
+  to product-interest lists, topic summaries, or SLACK bullets - a product
+  name is not an order, and Slack already states its own facts.
+- Annotate at most 3 bullets in the whole log. Zero is a fine answer.
 - Use ONLY ids/amounts/names that appear in RECORDS - never invent one.
-- If no confident match exists, leave the bullet exactly as it is.
+- A match needs corroboration (time AND amount, or amount AND item). If not
+  confident, leave the bullet exactly as it is.
 - Prefix inferred links with "likely" unless the amount matches exactly.
 - Change NOTHING else: no rewording, no adding or removing bullets.
 Output ONLY the annotated markdown log. /no_think"""
