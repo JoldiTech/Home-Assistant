@@ -706,6 +706,12 @@ def _decode_ref(b64: str):
     return img
 
 
+class ReferenceUnavailable(Exception):
+    """Reference-photo generation was requested but the feature isn't loaded.
+    Deliberately NOT a RuntimeError so it doesn't get swallowed by the CUDA-OOM
+    handler and mis-reported as 'GPU is busy'."""
+
+
 def _run_image(prompt: str, quality: str = IMG_DEFAULT_PRESET,
                negative: str | None = None, refs: list | None = None,
                ref_strength: float = IMG_REF_DEFAULT_STRENGTH) -> str:
@@ -713,9 +719,8 @@ def _run_image(prompt: str, quality: str = IMG_DEFAULT_PRESET,
     neg = IMG_DEFAULT_NEGATIVE if negative is None else negative
     refs = refs or []
     if refs:
-        raise RuntimeError(
-            "reference mode is being reworked - the first adapter didn't fit "
-            "the 6GB card; the lighter FaceID version is coming"
+        raise ReferenceUnavailable(
+            "reference photos aren't enabled yet - this is not a GPU-busy error"
         )
     with _gpu_lock:
         image = image_pipe(
@@ -1031,6 +1036,8 @@ async def image_only(request: Request):
     try:
         image_b64 = await asyncio.get_event_loop().run_in_executor(
             _gpu_executor, _run_image, final_prompt, quality, negative, refs, ref_strength)
+    except ReferenceUnavailable as e:
+        return JSONResponse({"error": str(e)}, status_code=501)
     except RuntimeError:
         # Almost always CUDA OOM - the nightly Captain's Log transcription
         # holds ~4GB of the 6GB card while it runs.
