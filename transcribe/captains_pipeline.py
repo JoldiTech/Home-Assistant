@@ -36,7 +36,7 @@ Secrets from /etc/nmteaco/captains.env (mode 600), never hardcoded:
   GITHUB_TOKEN        fine-grained PAT with contents:read+write on the repo
   GITHUB_REPO         e.g. JoldiTech/Home-Assistant  (optional; default below)
   DATALOG_API_TOKEN   bearer token for the dashboard datalog endpoints
-  DASHBOARD_BASE_URL  optional; default https://www.nmteaco.com
+  DASHBOARD_BASE_URL  optional; default https://dashboard.nmteaco.com
   SLACK_BOT_TOKEN     optional; bot token with channels:history + users:read
   SLACK_CHANNELS      optional; comma-separated channel IDs to read
 
@@ -150,9 +150,9 @@ inventory", "customers browsed teas") answers no future question at any
 length - cut it. Routine retail (brewing questions, recommendations,
 tastings) gets at most one clause of color in the day's rhythm.
 
-Use the records (POS sales, tickets) to ANCHOR conversations - "the earl
-grey sample conversation closed as the 2:14pm $43.50 sale" - never to
-report totals.
+Use the records (POS sales, tickets) to ANCHOR conversations - a sample
+offered on audio that shows up minutes later as a register sale is one
+connected observation - never to report totals.
 
 Your input mixes these materials, all context for ONE story - never say
 where a fact came from (no "per Slack", no "on audio"):
@@ -170,9 +170,12 @@ FORMAT:
 2. "## Unresolved" - ONLY things still open at close: discrepancies to
    reconcile (with amounts), unmet commitments, broken equipment, reorders.
    0-5 bullets, each a concrete object + action someone can pick up
-   tomorrow ("reconcile the $70 register shortfall", "reorder maple
-   oolong"). BANNED: vague care-taking ("confirm the customer was
-   satisfied"), resolved items, garble-based items. Empty beats padded.
+   tomorrow ("reconcile the $NN register shortfall", "reorder [the
+   out-of-stock product]") - fill the brackets from TODAY'S input only;
+   these are format examples, never content. BANNED: vague care-taking
+   ("confirm the customer was satisfied"), resolved items, garble-based
+   items, and any item whose amount or product you cannot point to in the
+   input. Empty beats padded.
 3. "## Worth remembering" - 0-5 durable signals a future reader would want:
    unmet demand (named, with counts), specific feedback, first signs of
    something (equipment aging, a recurring confusion), promises already in
@@ -274,9 +277,11 @@ ALLOWED NAMES - these come from written business records (staff chat, tickets,
 the time clock) and may stay in the log:
 {allowed_names}
 
-NAME AUDIT: any OTHER personal name in the draft was overheard on shop-floor
-audio - remove the name but keep the sentence if it is operational, rewriting
-the person as "a customer", "a wholesale account", "a staff member".
+NAME AUDIT: the list above is EXHAUSTIVE. Any name not on it - however it
+got into the draft, including a customer introducing themselves on the shop
+floor - was overheard on audio: remove the name but keep the sentence if it
+is operational, rewriting the person as "a customer", "a wholesale account",
+"a staff member".
 
 REMOVE entirely any sentence or bullet that contains:
 - personal-life content not about running the shop (schooling/college, jobs or
@@ -882,7 +887,7 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
         while _tok(records) > SUMMARIZER_CTX - 3000 and "\n" in records:
             records = records.rsplit("\n", max(1, records.count("\n") // 4))[0]
         _warn("correlation pass...")
-        draft = _gen(CORRELATE_SYSTEM, f"RECORDS:\n{records}\n\nDRAFT:\n{draft}", 1400)
+        draft = _gen(CORRELATE_SYSTEM, f"RECORDS:\n{records}\n\nDRAFT:\n{draft}", 1800)
 
     # Independent redaction pass: re-read the draft ONLY to strip anything
     # personal/identifying/garbled that slipped through. The allowed-names list
@@ -891,7 +896,7 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
     _warn("redaction pass...")
     redact_system = REDACT_TEMPLATE.format(
         allowed_names=", ".join(sorted(allowed_names)) if allowed_names else "(none)")
-    return _gen(redact_system, f"Draft to clean:\n\n{draft}", 1400)
+    return _gen(redact_system, f"Draft to clean:\n\n{draft}", 1800)
 
 
 # --- git ----------------------------------------------------------------------
