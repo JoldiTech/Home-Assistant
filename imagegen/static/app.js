@@ -109,8 +109,13 @@ async function apiCall(path, payload) {
     showLogin("session expired - enter password again");
     throw new Error("session expired");
   }
-  const envelope = await res.json();
-  return decryptEnvelope(envelope);
+  const raw = await res.json();
+  if (!res.ok) {
+    // Error bodies (503 GPU-busy, 500) are plain JSON, not envelopes -
+    // surface the server's actual reason instead of a generic failure.
+    throw new Error(raw.error || `request failed (${res.status})`);
+  }
+  return decryptEnvelope(raw);
 }
 
 // --- login ------------------------------------------------------------------
@@ -346,7 +351,7 @@ async function onImageSubmit(e) {
     appendGalleryImage(image);
     $("image-status").textContent = "";
   } catch (err) {
-    $("image-status").textContent = "generation failed";
+    $("image-status").textContent = err.message || "generation failed";
   } finally {
     btn.disabled = false;
   }
