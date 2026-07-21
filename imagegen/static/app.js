@@ -1,20 +1,24 @@
 "use strict";
 /*
- * All crypto happens here, in the browser. The derived keys never persist
- * anywhere - not localStorage/sessionStorage/IndexedDB; a page reload wipes
- * them from memory, by design. The server stores ONLY the auth half of the
- * PBKDF2 output (a login verifier that cannot decrypt anything); the
- * encryption half is delivered to it at login, wrapped under a key derived
- * from the auth half + the challenge nonce, so Cloudflare relays only
- * ciphertext it can never unwrap and the server holds the encryption key
- * in RAM only. Nothing stored on the server's disk can decrypt the prompts.
+ * All crypto happens here, in the browser. No key persists anywhere - not
+ * localStorage/sessionStorage/IndexedDB; a page reload wipes memory, by
+ * design. The server stores ONLY the auth half of the PBKDF2 output (a
+ * login verifier that cannot decrypt anything). Every login runs an
+ * ephemeral ECDH exchange; all traffic rides a session key bound to BOTH
+ * the password and that one-time secret, so once this tab closes, recorded
+ * ciphertext is undecryptable forever - even with the password (forward
+ * secrecy). The prompt-store key crosses only wrapped under the session
+ * key and lives in server RAM only.
  */
 
 const PBKDF2_ITERATIONS = 210000;
 const PBKDF2_SALT = new TextEncoder().encode("imagegen-e2e-v1");
 
-let kAuth = null; // raw bytes, HMAC key for the login proof only
-let kEnc = null; // CryptoKey, AES-GCM key for every request/response after login
+// The only key kept after login: the per-session AES-GCM key, bound to the
+// password AND an ephemeral ECDH exchange. It exists in this variable and the
+// server's session table, nowhere else - when this tab closes, everything
+// either end ever sent is undecryptable forever (forward secrecy).
+let kSess = null;
 let currentMode = null;
 
 const $ = (id) => document.getElementById(id);
@@ -34,17 +38,30 @@ async function deriveKeys(password) {
   return { authBytes, encBytes, encKey };
 }
 
-// Wrap the raw enc key for transit: AES-GCM under HMAC(kAuth, "wrap-enc-key" || nonce).
-// Cloudflare never sees kAuth, so it can't unwrap; the server (which stores
-// kAuth as its login verifier) can.
-async function wrapEncKey(authBytes, nonceBytes, encBytes) {
-  const label = new TextEncoder().encode("wrap-enc-key");
-  const input = new Uint8Array(label.length + nonceBytes.length);
-  input.set(label); input.set(nonceBytes, label.length);
-  const wrapBytes = await hmacProof(authBytes, input);
-  const wrapKey = await crypto.subtle.importKey("raw", wrapBytes, "AES-GCM", false, ["encrypt"]);
+// Ephemeral ECDH + password-bound session key:
+//   kSess = HMAC(kAuth, "session-v1" || nonce || ECDH_shared)
+// The DH share provides forward secrecy (both ephemeral privates die with
+// the session); mixing kAuth authenticates the exchange, so a relay that
+// doesn't know the password can't man-in-the-middle it.
+async function deriveSessionKey(authBytes, nonceBytes, serverPubB64) {
+  const myPair = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
+  const serverPub = await crypto.subtle.importKey(
+    "raw", b64d(serverPubB64), { name: "ECDH", namedCurve: "P-256" }, false, []);
+  const sharedBits = await crypto.subtle.deriveBits({ name: "ECDH", public: serverPub }, myPair.privateKey, 256);
+  const label = new TextEncoder().encode("session-v1");
+  const shared = new Uint8Array(sharedBits);
+  const input = new Uint8Array(label.length + nonceBytes.length + shared.length);
+  input.set(label); input.set(nonceBytes, label.length); input.set(shared, label.length + nonceBytes.length);
+  const kSessBytes = await hmacProof(authBytes, input);
+  const sessKey = await crypto.subtle.importKey("raw", kSessBytes, "AES-GCM", false, ["encrypt", "decrypt"]);
+  const myPubRaw = new Uint8Array(await crypto.subtle.exportKey("raw", myPair.publicKey));
+  return { sessKey, clientPubB64: b64e(myPubRaw) };
+}
+
+// The prompt-store key travels wrapped under the session key.
+async function wrapEncKey(sessKey, encBytes) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, wrapKey, encBytes);
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, sessKey, encBytes);
   return { ek_iv: b64e(iv), ek_ct: b64e(new Uint8Array(ct)) };
 }
 
@@ -70,14 +87,14 @@ function b64d(str) {
 async function encryptEnvelope(obj) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const plaintext = new TextEncoder().encode(JSON.stringify(obj));
-  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, kEnc, plaintext);
+  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, kSess, plaintext);
   return { nonce: b64e(iv), ciphertext: b64e(new Uint8Array(ciphertext)) };
 }
 
 async function decryptEnvelope(envelope) {
   const iv = b64d(envelope.nonce);
   const ciphertext = b64d(envelope.ciphertext);
-  const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, kEnc, ciphertext);
+  const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, kSess, ciphertext);
   return JSON.parse(new TextDecoder().decode(plaintext));
 }
 
@@ -99,8 +116,7 @@ async function apiCall(path, payload) {
 // --- login ------------------------------------------------------------------
 
 function showLogin(error) {
-  kAuth = null;
-  kEnc = null;
+  kSess = null;
   currentMode = null;
   $("app").innerHTML = `
     <h2>locked</h2>
@@ -124,23 +140,25 @@ async function onLoginSubmit(e) {
   const btn = e.target.querySelector("button");
   btn.disabled = true;
   try {
-    const { authBytes, encBytes, encKey } = await deriveKeys(password);
+    const { authBytes, encBytes } = await deriveKeys(password);
     const chRes = await fetch("/api/challenge", { method: "POST" });
-    const { nonce } = await chRes.json();
+    const { nonce, server_pub } = await chRes.json();
     const nonceBytes = b64d(nonce);
     const proof = await hmacProof(authBytes, nonceBytes);
-    const { ek_iv, ek_ct } = await wrapEncKey(authBytes, nonceBytes, encBytes);
+    const { sessKey, clientPubB64 } = await deriveSessionKey(authBytes, nonceBytes, server_pub);
+    const { ek_iv, ek_ct } = await wrapEncKey(sessKey, encBytes);
     const loginRes = await fetch("/api/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ nonce, proof: b64e(proof), ek_iv, ek_ct }),
+      body: JSON.stringify({ nonce, proof: b64e(proof), client_pub: clientPubB64, ek_iv, ek_ct }),
     });
     if (!loginRes.ok) {
       showLogin("incorrect password");
       return;
     }
-    kAuth = authBytes;
-    kEnc = encKey;
+    // Only the session key survives past this point - the password-derived
+    // halves are dropped so nothing longer-lived than the session exists here.
+    kSess = sessKey;
     showModePicker();
   } catch (err) {
     showLogin("something went wrong, try again");

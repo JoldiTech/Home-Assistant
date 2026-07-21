@@ -12,12 +12,15 @@ Design constraints (deliberate, do not "fix"):
     browser derives two independent PBKDF2 halves from it: an auth key and
     an encryption key. The server persists ONLY the auth half - a login
     verifier that can check a challenge/response proof but cannot decrypt
-    anything. The encryption key arrives at login wrapped under
-    HMAC(auth_key, nonce) and lives in server RAM only: a fresh process is
-    locked out of the prompt store until someone who knows the password
-    logs in. Every request/response body after login is an AES-GCM envelope
-    under that key - Cloudflare's edge (or anything else on the path, or
-    anything reading this box's disk) only ever has ciphertext.
+    anything. Each login also runs an ephemeral ECDH exchange; the session
+    key is HMAC(auth_key, nonce || DH-shared), so every envelope after login
+    is bound to BOTH the password and a one-time secret that dies with the
+    session - recorded traffic stays undecryptable forever, even by someone
+    who later learns the password (forward secrecy). The prompt-store key
+    arrives wrapped under the session key and lives in server RAM only: a
+    fresh process is locked out of the prompt store until someone who knows
+    the password logs in. Cloudflare's edge (or anything else on the path,
+    or anything reading this box's disk) only ever has ciphertext.
   - The browser never persists the derived key anywhere (no localStorage/
     sessionStorage) - only an in-memory JS variable - so a page reload
     requires the password again by construction, not by policy.
@@ -29,6 +32,7 @@ Design constraints (deliberate, do not "fix"):
 import asyncio
 import base64
 import concurrent.futures
+import contextvars
 import gc
 import hashlib
 import hmac
@@ -45,7 +49,9 @@ import logging
 import warnings
 
 import torch
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from diffusers import AutoencoderTiny, DPMSolverMultistepScheduler, StableDiffusionXLPipeline
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -254,15 +260,22 @@ def _touch_session(token: str) -> dict | None:
         return s
 
 
+# Envelopes are encrypted under the PER-SESSION key (password + ephemeral
+# ECDH), set into this contextvar by _require_session for the current request
+# task. Forward secrecy: the session key dies with the session on both ends,
+# so recorded traffic is permanently undecryptable - even with the password.
+_current_aesgcm: contextvars.ContextVar = contextvars.ContextVar("session_aesgcm", default=None)
+
+
 def _encrypt(obj, aesgcm=None) -> dict:
-    aesgcm = aesgcm or _aesgcm
+    aesgcm = aesgcm or _current_aesgcm.get() or _aesgcm
     nonce = os.urandom(12)
     ciphertext = aesgcm.encrypt(nonce, json.dumps(obj).encode(), None)
     return {"nonce": base64.b64encode(nonce).decode(), "ciphertext": base64.b64encode(ciphertext).decode()}
 
 
 def _decrypt(envelope: dict, aesgcm=None):
-    aesgcm = aesgcm or _aesgcm
+    aesgcm = aesgcm or _current_aesgcm.get() or _aesgcm
     nonce = base64.b64decode(envelope["nonce"])
     ciphertext = base64.b64decode(envelope["ciphertext"])
     return json.loads(aesgcm.decrypt(nonce, ciphertext, None))
@@ -319,6 +332,11 @@ async def index():
 async def challenge():
     nonce = os.urandom(16)
     nonce_b64 = base64.b64encode(nonce).decode()
+    # Fresh ephemeral ECDH pair per challenge - the private half lives only in
+    # this dict entry and dies with the challenge/login. Mixed into the session
+    # key, it gives every session forward secrecy.
+    eph_priv = ec.generate_private_key(ec.SECP256R1())
+    server_pub = eph_priv.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
     now = time.time()
     with _state_lock:
         # opportunistic sweep of expired challenges and idle sessions - a
@@ -326,12 +344,12 @@ async def challenge():
         # without this, sessions nobody ever revisits (e.g. every page
         # reload starts a fresh login here, by design - see app.js) would
         # sit in memory, galleries and all, until the process restarts.
-        for k in [k for k, exp in _challenges.items() if exp < now]:
+        for k in [k for k, ch in _challenges.items() if ch["exp"] < now]:
             del _challenges[k]
         for tok in [tok for tok, s in _sessions.items() if now - s["last_seen"] > SESSION_IDLE_TIMEOUT]:
             del _sessions[tok]
-        _challenges[nonce_b64] = now + CHALLENGE_TTL
-    return {"nonce": nonce_b64}
+        _challenges[nonce_b64] = {"exp": now + CHALLENGE_TTL, "priv": eph_priv}
+    return {"nonce": nonce_b64, "server_pub": base64.b64encode(server_pub).decode()}
 
 
 @app.post("/api/login")
@@ -345,8 +363,8 @@ async def login(request: Request):
     proof_b64 = body.get("proof", "")
 
     with _state_lock:
-        expiry = _challenges.pop(nonce_b64, None)
-    if expiry is None or expiry < time.time():
+        ch = _challenges.pop(nonce_b64, None)
+    if ch is None or ch["exp"] < time.time():
         _record_failure(ip)
         return JSONResponse({"error": "expired or invalid challenge"}, status_code=401)
 
@@ -357,14 +375,22 @@ async def login(request: Request):
         _record_failure(ip)
         return JSONResponse({"error": "incorrect password"}, status_code=401)
 
-    # Unwrap the browser-delivered encryption key, then prove it by test-
-    # decrypting the prompt store. This binds login to the actual password:
-    # someone holding only the stored verifier (K_AUTH) can forge the HMAC
-    # proof, but cannot supply an enc key that decrypts prompts.enc.
+    # Session key = HMAC(K_AUTH, nonce || ECDH-shared). The DH share gives
+    # forward secrecy (both ephemeral privates die with the session; recorded
+    # traffic is undecryptable forever, password or not); mixing K_AUTH
+    # authenticates the DH so a man-in-the-middle relay without the password
+    # can't sit between the two ends. The browser's enc key arrives wrapped
+    # under this session key, and login is only complete if that key actually
+    # test-decrypts the prompt store - a stolen verifier can't fake that.
     global K_ENC, _aesgcm, _prompts
     try:
-        wrap_key = hmac.new(K_AUTH, b"wrap-enc-key" + nonce, hashlib.sha256).digest()
-        ek = AESGCM(wrap_key).decrypt(
+        client_pub = ec.EllipticCurvePublicKey.from_encoded_point(
+            ec.SECP256R1(), base64.b64decode(body.get("client_pub", ""))
+        )
+        shared = ch["priv"].exchange(ec.ECDH(), client_pub)
+        k_sess = hmac.new(K_AUTH, b"session-v1" + nonce + shared, hashlib.sha256).digest()
+        sess_aesgcm = AESGCM(k_sess)
+        ek = sess_aesgcm.decrypt(
             base64.b64decode(body.get("ek_iv", "")),
             base64.b64decode(body.get("ek_ct", "")),
             None,
@@ -396,7 +422,8 @@ async def login(request: Request):
 
     token = base64.urlsafe_b64encode(os.urandom(32)).decode()
     with _state_lock:
-        _sessions[token] = {"last_seen": time.time(), **_new_conversation_state()}
+        _sessions[token] = {"last_seen": time.time(), "aesgcm": sess_aesgcm,
+                            **_new_conversation_state()}
 
     resp = JSONResponse({"ok": True})
     # Session cookie only - no Max-Age, so the browser drops it when it closes.
@@ -413,6 +440,8 @@ def _require_session(request: Request) -> tuple[str, dict] | JSONResponse:
     state = _touch_session(token)
     if state is None:
         return JSONResponse({"error": "session expired"}, status_code=401)
+    # Route this request's envelopes through the session's own key.
+    _current_aesgcm.set(state.get("aesgcm"))
     return token, state
 
 
@@ -474,12 +503,11 @@ async def change_password(request: Request):
     if isinstance(result, JSONResponse):
         return result
     global K_AUTH, K_ENC, _aesgcm
-    # The request is encrypted under the CURRENT (old) key; capture it so the
-    # ack can be encrypted under it too - the browser is still holding the old
-    # key and won't re-derive until it re-logs-in. The password itself never
-    # arrives: the browser derives the new key pair and sends the halves
-    # (length policy is enforced client-side; the server can't see length).
-    old_aesgcm = _aesgcm
+    # Request and ack ride THIS session's envelope key (which survives until
+    # the session-clear below). The password itself never arrives: the browser
+    # derives the new key pair and sends the halves (length policy is enforced
+    # client-side; the server can't see length).
+    old_aesgcm = _current_aesgcm.get() or _aesgcm
     body = _decrypt(await request.json(), aesgcm=old_aesgcm)
     try:
         new_k_auth = base64.b64decode(body.get("new_k_auth", ""))
