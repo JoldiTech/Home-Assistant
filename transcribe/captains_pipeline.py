@@ -129,9 +129,9 @@ only thing that evaporates at closing time - capturing it is your entire job.
 
 THE UNIQUE RECORD - always capture, with specifics:
 - Unmet demand: products/sizes/services customers asked for that we don't
-  carry or were out of. Name them exactly; count repeats within the day
-  ("third ask for decaf chai today"). You only see ONE day - never claim
-  cross-day patterns ("this week", "again").
+  carry or were out of. Name them exactly as asked; if the SAME product is
+  asked for more than once in the input, say how many times. You only see
+  ONE day - never claim cross-day patterns ("this week", "again").
 - Feedback: specific praise or complaints about a product, price, or the
   shop - named, not "customers were happy".
 - Commitments: anything staff promised anyone (holds, callbacks, special
@@ -520,6 +520,41 @@ def _context_block(biz: dict) -> str:
     return "===== BUSINESS RECORDS (today's tickets / texts / call notes) =====\n" + "\n".join(lines)
 
 
+_ANNOT_RE = re.compile(r"\s*\((?:likely\s+)?(order|ticket)\s*#([A-Za-z0-9\-]+)[^)]*\)")
+
+
+def _validate_annotations(markdown: str, biz: dict) -> str:
+    """Deterministic guard behind the correlation pass: drop any record
+    reference whose id isn't in the day's records, and any order reference
+    whose amount contradicts the amount already stated in the same line
+    (the 8B model keeps attaching $20.99 orders to $70 shortfalls no matter
+    what the prompt says)."""
+    amounts = {}
+    for o in ((biz.get("sales") or {}).get("orders") or []):
+        amounts[str(o.get("id"))] = float(o.get("total") or 0)
+    sup = biz.get("support") or {}
+    ticket_ids = {str(t.get("id"))
+                  for t in (sup.get("created") or []) + (sup.get("closed") or [])}
+
+    out = []
+    for line in markdown.splitlines():
+        def repl(m, line=line):
+            kind, rid = m.group(1).lower(), m.group(2)
+            if kind == "ticket":
+                return m.group(0) if rid in ticket_ids else ""
+            if rid not in amounts:
+                return ""
+            line_amts = [float(a.replace(",", ""))
+                         for a in re.findall(r"\$([\d,]+(?:\.\d+)?)", line[:m.start()])]
+            if line_amts:
+                rec = amounts[rid]
+                if all(abs(rec - a) > 0.25 * max(rec, a, 1.0) for a in line_amts):
+                    return ""
+            return m.group(0)
+        out.append(_ANNOT_RE.sub(repl, line))
+    return "\n".join(out)
+
+
 def _allowed_names(biz: dict, slack_names: set) -> set:
     """Names from written business records - the only names the redactor may
     keep in the log. Everything else is presumed overheard on audio."""
@@ -892,8 +927,10 @@ def main():
             f"_No speech captured today._"
         )
 
-    # Belt-and-braces: the weave markup must never ship, whatever the LLM does.
+    # Belt-and-braces: the weave markup must never ship, whatever the LLM does,
+    # and record references must point at real, amount-consistent records.
     markdown = markdown.replace("⟦", "").replace("⟧", "")
+    markdown = _validate_annotations(markdown, biz)
     markdown = (markdown.rstrip() + "\n\n" + _business_sections(biz)
                 + "\n\n" + SOURCE_LINE)
     _commit_and_push(date_str, markdown, env)
