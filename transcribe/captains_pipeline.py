@@ -113,7 +113,9 @@ Your input mixes THREE kinds of material - treat them differently:
 
 NAME RULE: a person's name may appear in the log ONLY if it comes from a
 structured source (POS / SLACK). Anyone merely overheard on AUDIO stays
-anonymous - no customer or staff names from audio, ever.
+anonymous - no customer or staff names from audio, ever. When you use a name
+from SLACK, attribute it in the bullet ("per Slack: ...") so its origin is
+auditable; an unattributed name is treated as an audio leak and removed.
 
 INCLUDE:
 - Store rhythm: active hours, busy vs quiet stretches, overall traffic feel.
@@ -146,6 +148,10 @@ RULES:
   with its amount and what to reconcile. Then the rest. Merge duplicates into
   one bullet per real event, not several.
 - Keep it operational: teas, categories, orders, payment/equipment issues, traffic.
+- MERGE, don't enumerate: each section gets at most 6 bullets. Combine
+  overlapping themes into one bullet; a bullet must state a specific fact or
+  action - delete filler like "discussion about inventory issues" that says
+  nothing. One real event = one bullet, across the whole log.
 - Output ONLY the markdown log in the exact format given. No preamble, no
   <think> tags, no reasoning - just the log. /no_think"""
 
@@ -205,7 +211,9 @@ amount, items) and the DRAFT log. Where a draft bullet clearly refers to one
 of the records, append a parenthetical reference to that bullet, e.g.:
   "(likely order #58212, $43.50 at 2:14pm)"
   "(ticket #91: Jane Miller, 'Missing tin from order')"
-Match on time proximity, dollar amounts, and item names. Rules:
+Write references in that plain style - never paste raw transcript syntax like
+"⟦POS ...⟧" into the log. Match on time proximity, dollar amounts, and item
+names. Rules:
 - Use ONLY ids/amounts/names that appear in RECORDS - never invent one.
 - If no confident match exists, leave the bullet exactly as it is.
 - Prefix inferred links with "likely" unless the amount matches exactly.
@@ -220,8 +228,14 @@ The log mixes content from shop-floor AUDIO (must stay de-identified) with
 structured business records - POS lines, Slack staff chat, and record
 references like "(likely order #58212, $43.50 at 2:14pm)" or "(ticket #91:
 Jane Miller, …)". KEEP the structured material: names inside order/ticket
-references or attributed to Slack, and every id / dollar amount / time in a
-parenthetical reference, are business records - do not strip them.
+references or explicitly attributed to Slack ("per Slack", "Slack update",
+"on Slack"), and every id / dollar amount / time in a parenthetical
+reference, are business records - do not strip them.
+
+NAME AUDIT: any personal name NOT inside an order/ticket reference and NOT
+explicitly attributed to Slack was overheard on audio. Remove the name but
+keep the bullet if it is operational - rewrite as "a customer", "an account",
+"a staff member".
 
 REMOVE any bullet that contains:
 - a name of someone merely overheard on audio (no record/Slack attribution);
@@ -246,7 +260,9 @@ NOTES_SYSTEM = SYSTEM_PROMPT + (
     "\n\nFor THIS step you are taking rough notes on one slice of the day. Output a "
     "short bullet list of what happened (products/topics discussed, traffic feel, "
     "operational events, POS sales with amounts). De-identify audio content; keep "
-    "POS amounts/items exact. No format headers - just bullets."
+    "POS amounts/items exact. These slices are AUDIO + POS only - SLACK is not in "
+    "them - so notes must contain NO personal names at all (POS lines carry none; "
+    "any name you see was overheard). No format headers - just bullets."
 )
 
 
