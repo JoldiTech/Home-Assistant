@@ -289,8 +289,7 @@ def _record_failure(ip: str) -> None:
 
 def _new_conversation_state() -> dict:
     return {
-        "chat": {"history": []},
-        "chat_images": {"history": [], "gallery": [], "jobs": {}},
+        "chat": {"history": [], "gallery": [], "jobs": {}},
         "image": {"gallery": []},
     }
 
@@ -514,7 +513,7 @@ async def reset(request: Request):
     body = _decrypt(await request.json())
     mode = body.get("mode")
     with _state_lock:
-        if mode in ("chat", "chat_images", "image"):
+        if mode in ("chat", "image"):
             state[mode] = _new_conversation_state()[mode]
     return JSONResponse(_encrypt({"ok": True}))
 
@@ -633,28 +632,6 @@ def _clean_llm_text(text: str) -> str:
     return text.strip()
 
 
-def _build_image_prompt_from_message(message: str) -> str:
-    """Image prompt from what the USER just said (no LLM call), so image
-    generation can start immediately and run on the GPU in parallel with the
-    reply on the CPU. No LLM here on purpose - an LLM call would contend with
-    the reply on the single LLM thread and re-serialize the two. Lead with the
-    configured look, then the user's line as the scene; cap under CLIP's limit."""
-    appearance = _prompts["image_prompt_prefix"]
-    scene = message.strip().replace("\n", " ")[:180]
-    return f"{appearance}. {scene}"[:240]
-
-
-PROMPT_ASSIST_SYSTEM = (
-    "You ADD artistic direction to a Stable Diffusion XL prompt. You will see "
-    "the user's image idea. Output ONLY comma-separated additions to append "
-    "after it - NEVER restate or rewrite their idea. Add: shot type, "
-    "composition, lighting, color palette, mood, lens/film or art style. If "
-    "their idea names a fictional character, ALSO add the actor's real name "
-    "as one addition (diffusion models know actors, not characters). Max ~35 "
-    "words of additions (CLIP truncates long prompts). No sentences, no "
-    "preamble - just the comma-separated fragments."
-)
-
 
 def _expand_image_prompt(user_prompt: str) -> str:
     """Optional 'prompt assist': the local chat LLM (CPU) generates artistic-
@@ -753,41 +730,64 @@ async def chat(request: Request):
     return JSONResponse(_encrypt({"reply": reply}))
 
 
-@app.post("/api/chat-images")
-async def chat_images(request: Request):
+@app.post("/api/chat-image")
+async def chat_image(request: Request):
+    """'Get image' in conversation mode: distill the scene from the last few
+    messages (local LLM), prepend the configured character appearance, render
+    in the background. The client polls /api/image-status (mode 'chat')."""
     result = _require_session(request)
     if isinstance(result, JSONResponse):
         return result
     if _model_status != "ready":
         return JSONResponse({"error": "not initialized"}, status_code=503)
     token, state = result
-    body = _decrypt(await request.json())
-    message = (body.get("message") or "").strip()[:4000]
-    if not message:
-        return JSONResponse({"error": "empty message"}, status_code=400)
+    _decrypt(await request.json())  # envelope validated; no params needed
 
-    mode_state = state["chat_images"]
+    mode_state = state["chat"]
     history = mode_state["history"]
-    history.append({"role": "user", "content": message})
+    if not history:
+        return JSONResponse({"error": "no conversation yet"}, status_code=400)
 
-    # Kick the image off the USER's message FIRST, so it renders on the GPU in
-    # PARALLEL with the reply generating on the CPU (different hardware, genuine
-    # overlap). The image reflects what the user said - the reply doesn't exist
-    # yet when the image starts, which is the inherent cost of parallelism. The
-    # client polls /api/image-status on the returned job_id.
+    loop = asyncio.get_event_loop()
+    scene = await loop.run_in_executor(_llm_executor, _distill_scene, history[-6:])
+    with _config_lock:
+        appearance = _prompts["image_prompt_prefix"]
+    image_prompt = f"{appearance}. {scene}"[:400]
+
     job_id = secrets.token_urlsafe(8)
     jobs = mode_state["jobs"]
     jobs[job_id] = {"status": "pending", "image": None}
     for old_id in list(jobs)[:-10]:
         del jobs[old_id]
-    image_prompt = _build_image_prompt_from_message(message)
-    loop = asyncio.get_event_loop()
     loop.run_in_executor(_gpu_executor, _run_image_job, job_id, image_prompt, mode_state)
+    return JSONResponse(_encrypt({"job_id": job_id}))
 
-    reply = await loop.run_in_executor(_llm_executor, _run_llm, history[-MAX_HISTORY:])
-    history.append({"role": "assistant", "content": reply})
-    del history[:-MAX_HISTORY]
-    return JSONResponse(_encrypt({"reply": reply, "job_id": job_id}))
+
+SCENE_SYSTEM = (
+    "You describe the single image implied by the CURRENT moment of a "
+    "conversation between a user and their assistant companion. From the last "
+    "messages, output a concise scene for an image generator: where she is, "
+    "what she is doing, pose, setting, clothing if mentioned, mood, time of "
+    "day. Do NOT describe her face or body (her appearance is added "
+    "separately). Comma-separated fragments, max ~30 words. Output ONLY the "
+    "scene description."
+)
+
+
+def _distill_scene(history: list[dict]) -> str:
+    convo = "\n".join(f"{m['role']}: {m['content'][:300]}" for m in history)
+    try:
+        with _llm_lock:
+            completion = llm.create_chat_completion(
+                messages=[{"role": "system", "content": SCENE_SYSTEM},
+                          {"role": "user", "content": convo}],
+                max_tokens=90, temperature=0.6, top_p=0.9, repeat_penalty=1.15,
+            )
+        scene = _clean_llm_text(completion["choices"][0]["message"]["content"]).strip('"')
+        return scene or "a candid moment from the conversation"
+    except Exception as e:
+        print(f"scene distill failed: {e}", flush=True)
+        return "a candid moment from the conversation"
 
 
 @app.post("/api/image-status")

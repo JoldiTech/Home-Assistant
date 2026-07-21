@@ -260,7 +260,6 @@ function showModePicker() {
     <div id="init-area"></div>
     <div class="modes" id="mode-buttons" style="display:none">
       <button data-mode="chat">conversation</button>
-      <button data-mode="chat_images">conversation with images</button>
       <button data-mode="image">image only</button>
     </div>
     <p style="margin-top:2rem"><a href="#" id="settings-link">settings</a></p>`;
@@ -332,7 +331,7 @@ async function openMode(mode) {
   if (mode === "image") {
     renderImageOnly();
   } else {
-    renderChat(mode === "chat_images");
+    renderChat();
     await loadState(mode);
   }
 }
@@ -421,29 +420,45 @@ async function onImageSubmit(e) {
 
 // --- chat / chat+images modes --------------------------------------------------
 
-function renderChat(withImages) {
+function renderChat() {
   $("app").innerHTML = `
     <p><a href="#" id="back">&larr; back</a> &nbsp; <a href="#" id="reset">new conversation</a></p>
-    <h2>${withImages ? "conversation with images" : "conversation"}</h2>
+    <h2>conversation</h2>
     <div class="chat-layout">
       <div class="chat-main">
         <div id="transcript"></div>
         <form id="chat-form">
           <textarea id="chat-message" rows="2" placeholder="say something..." autofocus required></textarea>
           <button type="submit">send</button>
+          <button type="button" id="get-image-btn" title="render the current moment of the conversation">get image</button>
         </form>
         <div id="chat-status"></div>
       </div>
-      ${withImages ? '<div id="gallery-panel"><h3>images this session</h3><div id="gallery"></div></div>' : ""}
+      <div id="gallery-panel"><h3>images this session</h3><div id="gallery"></div></div>
     </div>`;
   $("back").addEventListener("click", (e) => { e.preventDefault(); showModePicker(); });
   $("reset").addEventListener("click", async (e) => {
     e.preventDefault();
     await apiCall("/api/reset", { mode: currentMode });
     $("transcript").innerHTML = "";
-    if (withImages) $("gallery").innerHTML = "";
+    $("gallery").innerHTML = "";
   });
-  $("chat-form").addEventListener("submit", (e) => onChatSubmit(e, withImages));
+  $("chat-form").addEventListener("submit", onChatSubmit);
+  $("get-image-btn").addEventListener("click", onGetImage);
+}
+
+async function onGetImage() {
+  const btn = $("get-image-btn");
+  btn.disabled = true;
+  $("chat-status").textContent = "picturing the scene... (~45s: the LLM reads the conversation, then the image renders)";
+  try {
+    const { job_id } = await apiCall("/api/chat-image", {});
+    if (job_id) pollImageJob(job_id, () => { $("chat-status").textContent = ""; });
+  } catch (err) {
+    $("chat-status").textContent = err.message || "image failed";
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function openLightbox(b64png) {
@@ -487,21 +502,17 @@ async function loadState(mode) {
   }
 }
 
-async function onChatSubmit(e, withImages) {
+async function onChatSubmit(e) {
   e.preventDefault();
   const message = $("chat-message").value.trim();
   if (!message) return;
   $("chat-message").value = "";
   appendMessage("user", message);
-  const btn = e.target.querySelector("button");
+  const btn = e.target.querySelector("button[type=submit]");
   btn.disabled = true;
   $("chat-status").textContent = "thinking...";
   try {
-    const path = withImages ? "/api/chat-images" : "/api/chat";
-    const result = await apiCall(path, { message });
-    // The image (chat-images) is already rendering on the GPU in parallel;
-    // start polling for it right away.
-    if (withImages && result.job_id) pollImageJob(result.job_id);
+    const result = await apiCall("/api/chat", { message });
     appendMessage("assistant", result.reply);
     $("chat-status").textContent = "";
   } catch (err) {
@@ -519,7 +530,7 @@ function appendPlaceholder() {
   return div;
 }
 
-async function pollImageJob(jobId) {
+async function pollImageJob(jobId, onDone) {
   const mode = currentMode;
   const placeholder = appendPlaceholder();
   const poll = async () => {
@@ -529,6 +540,7 @@ async function pollImageJob(jobId) {
       result = await apiCall("/api/image-status", { mode, job_id: jobId });
     } catch (err) {
       placeholder.remove();
+      if (onDone) onDone();
       return;
     }
     if (result.status === "pending") {
@@ -538,8 +550,10 @@ async function pollImageJob(jobId) {
       img.src = "data:image/png;base64," + result.image;
       img.addEventListener("click", () => openLightbox(result.image));
       placeholder.replaceWith(img);
+      if (onDone) onDone();
     } else {
       placeholder.remove();
+      if (onDone) onDone();
     }
   };
   setTimeout(poll, 2000);
