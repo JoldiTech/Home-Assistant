@@ -712,9 +712,21 @@ def _run_image_job(job_id: str, prompt: str, mode_state: dict):
             gallery = mode_state["gallery"]
             gallery.append(image_b64)
             del gallery[:-MAX_GALLERY]
-    except Exception:
+    except Exception as e:
+        # Surface WHY - a silently vanishing image is the worst UX. The usual
+        # cause on the 6GB card is VRAM exhaustion when the chat model is on
+        # the GPU (a GPU placement) or the nightly captain's-log run holds it.
+        msg = ("out of GPU memory - the chat model is using the GPU. Shut down "
+               "models and re-initialize with CPU placement to free it for images."
+               if _is_oom(e) else "image generation failed")
+        print(f"image job failed: {e}", flush=True)
         with _state_lock:
-            jobs[job_id] = {"status": "error", "image": None}
+            jobs[job_id] = {"status": "error", "image": None, "error": msg}
+
+
+def _is_oom(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return "out of memory" in s or "oom" in s or "cuda error" in s or "alloc" in s
 
 
 @app.post("/api/chat")
@@ -751,6 +763,13 @@ async def chat(request: Request):
         raw, emitted = "", ""
         try:
             with _llm_lock:
+                if llm is None:
+                    # Model was unloaded (idle release, shutdown, or the
+                    # nightly captain's-log GPU handoff) between the ready
+                    # check and here. Fail cleanly, not with an AttributeError.
+                    loop.call_soon_threadsafe(q.put_nowait, {"error": "models were shut down - re-initialize"})
+                    loop.call_soon_threadsafe(q.put_nowait, {"done": True})
+                    return
                 for chunk in llm.create_chat_completion(
                         messages=messages, max_tokens=LLM_MAX_TOKENS, stream=True,
                         temperature=0.75, top_p=0.9, repeat_penalty=1.18):

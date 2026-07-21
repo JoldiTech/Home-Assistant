@@ -466,7 +466,8 @@ async function onGetImage() {
   $("chat-status").textContent = "picturing the scene... (~45s: the LLM reads the conversation, then the image renders)";
   try {
     const { job_id } = await apiCall("/api/chat-image", {});
-    if (job_id) pollImageJob(job_id, () => { $("chat-status").textContent = ""; });
+    if (job_id) pollImageJob(job_id, (errMsg) => { $("chat-status").textContent = errMsg || ""; });
+    else $("chat-status").textContent = "";
   } catch (err) {
     $("chat-status").textContent = err.message || "image failed";
   } finally {
@@ -589,7 +590,7 @@ async function pollImageJob(jobId, onDone) {
       result = await apiCall("/api/image-status", { mode, job_id: jobId });
     } catch (err) {
       placeholder.remove();
-      if (onDone) onDone();
+      if (onDone) onDone(err.message || "image failed");
       return;
     }
     if (result.status === "pending") {
@@ -602,7 +603,7 @@ async function pollImageJob(jobId, onDone) {
       if (onDone) onDone();
     } else {
       placeholder.remove();
-      if (onDone) onDone();
+      if (onDone) onDone(result.error || "image generation failed");
     }
   };
   setTimeout(poll, 2000);
