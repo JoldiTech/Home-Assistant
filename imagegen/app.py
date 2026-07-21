@@ -33,6 +33,7 @@ import asyncio
 import base64
 import concurrent.futures
 import contextvars
+import re
 import gc
 import hashlib
 import hmac
@@ -585,7 +586,25 @@ def _run_llm(history: list[dict]) -> str:
             top_p=0.9,
             repeat_penalty=1.18,
         )
-    return completion["choices"][0]["message"]["content"].strip()
+    return _clean_llm_text(completion["choices"][0]["message"]["content"])
+
+
+# This checkpoint emits internal channel markers (<|channel>thought <channel|>...)
+# that llama.cpp's chat handler usually strips but demonstrably not always.
+# Defense: split on any channel-marker variant, keep the last substantial
+# segment (the reply follows the final marker), drop leading channel labels.
+_CHANNEL_RE = re.compile(r"<[|/]?channel[|]?>", re.IGNORECASE)
+
+
+def _clean_llm_text(text: str) -> str:
+    parts = [p for p in _CHANNEL_RE.split(text) if p.strip()]
+    if len(parts) > 1:
+        text = parts[-1]
+    elif parts:
+        text = parts[0]
+    text = re.sub(r"^\s*(thought|thinking|analysis|final|assistant)\b[:.\s]*", "",
+                  text, flags=re.IGNORECASE)
+    return text.strip()
 
 
 def _build_image_prompt_from_message(message: str) -> str:
@@ -625,7 +644,7 @@ def _expand_image_prompt(user_prompt: str) -> str:
                 ],
                 max_tokens=110, temperature=0.5, top_p=0.9, repeat_penalty=1.15,
             )
-        additions = completion["choices"][0]["message"]["content"].strip().strip('"').strip(",. ")
+        additions = _clean_llm_text(completion["choices"][0]["message"]["content"]).strip('"').strip(",. ")
         if not additions:
             return user_prompt
         return f"{user_prompt}, {additions}"[:400]
@@ -648,34 +667,16 @@ def _run_image(prompt: str, quality: str = IMG_DEFAULT_PRESET,
     p = IMG_PRESETS.get(quality, IMG_PRESETS[IMG_DEFAULT_PRESET])
     neg = IMG_DEFAULT_NEGATIVE if negative is None else negative
     refs = refs or []
-    kwargs = {}
+    if refs:
+        raise RuntimeError(
+            "reference mode is being reworked - the first adapter didn't fit "
+            "the 6GB card; the lighter FaceID version is coming"
+        )
     with _gpu_lock:
-        if len(refs) >= 2:
-            # Two references -> two people: each conditions its own half of
-            # the frame (left = first upload, right = second), which is what
-            # keeps them two distinct people instead of one blended face.
-            half_l = PILImage.new("L", (IMG_SIZE, IMG_SIZE), 0)
-            half_l.paste(255, (0, 0, IMG_SIZE // 2, IMG_SIZE))
-            half_r = PILImage.new("L", (IMG_SIZE, IMG_SIZE), 0)
-            half_r.paste(255, (IMG_SIZE // 2, 0, IMG_SIZE, IMG_SIZE))
-            masks = IPAdapterMaskProcessor().preprocess(
-                [half_l, half_r], height=IMG_SIZE, width=IMG_SIZE)
-            masks = [masks.reshape(1, masks.shape[0], masks.shape[2], masks.shape[3])]
-            image_pipe.set_ip_adapter_scale([[ref_strength, ref_strength]])
-            kwargs = {"ip_adapter_image": [[refs[0], refs[1]]],
-                      "cross_attention_kwargs": {"ip_adapter_masks": masks}}
-        elif len(refs) == 1:
-            image_pipe.set_ip_adapter_scale(ref_strength)
-            kwargs = {"ip_adapter_image": refs[0]}
-        else:
-            # Adapter is loaded, so an image arg is mandatory - a black dummy
-            # at scale 0.0 is a no-op.
-            image_pipe.set_ip_adapter_scale(0.0)
-            kwargs = {"ip_adapter_image": PILImage.new("RGB", (224, 224), 0)}
         image = image_pipe(
             prompt=prompt, negative_prompt=neg or None,
             num_inference_steps=p["steps"], guidance_scale=p["guidance"],
-            height=IMG_SIZE, width=IMG_SIZE, **kwargs,
+            height=IMG_SIZE, width=IMG_SIZE,
         ).images[0]
         # 6GB is a tight budget for SDXL's VAE-decode memory spike specifically -
         # release cached (but unused) allocator blocks between calls rather than
@@ -853,18 +854,12 @@ def _load_models():
             image_pipe.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++"
         )
         image_pipe.vae = AutoencoderTiny.from_pretrained("madebyollin/taesdxl", torch_dtype=torch.float16)
-        # IP-Adapter (plus-face): photo-reference conditioning. Loaded BEFORE
-        # cpu_offload so the offload hooks cover the CLIP image encoder too.
-        # When no reference is supplied, generation passes a black dummy image
-        # at scale 0.0 (a loaded adapter requires an ip_adapter_image arg).
-        image_pipe.load_ip_adapter(
-            IP_ADAPTER_DIR, subfolder="sdxl_models",
-            weight_name="ip-adapter-plus-face_sdxl_vit-h.safetensors",
-            image_encoder_folder="models/image_encoder",
-        )
-        image_pipe.set_ip_adapter_scale(0.0)
+        # NOTE: the plus-face IP-Adapter is NOT loaded here - its ~0.7GB of
+        # attention weights push the SDXL UNet past the 6GB card and every
+        # generation OOMs. Reference mode is moving to the FaceID (LoRA)
+        # variant, which fuses into existing weights instead.
         image_pipe.enable_model_cpu_offload()
-        print("image model ready (with IP-Adapter)", flush=True)
+        print("image model ready", flush=True)
 
         print("loading Gemma-4-12B-OBLITERATED (CPU)...", flush=True)
         llm = Llama(
