@@ -324,11 +324,22 @@ deployed to `~/transcribe/` on the AI box and run as the
   Integrations API, creds from `/etc/nmteaco/protect.env`) — no HA in the audio
   path. `condition_on_previous_text=False` + strict VAD to avoid hallucination
   loops.
+- **Business data:** the pipeline also pulls the **6pm–6pm MT business day**
+  (log for date D = 6pm D-1 → 6pm D) from the dashboard's **datalog API**
+  (`/dashboard/tools/datalog/{sales,shipping,support,calls,texts,timeclock}.php`,
+  bearer `DATALOG_API_TOKEN`) plus Slack staff chat. In-store POS orders are
+  woven into the transcript by timestamp (`[14:14] ⟦POS $43.50 — Earl Grey ×1⟧`)
+  so the summarizer can tie conversations to actual sales; dollar/count sections
+  are appended deterministically (never through the LLM). All fetches fail soft.
+  Full design: `captains_log/README.md`.
 - **Summarizer:** `Qwen3-8B-Q4_K_M.gguf` (`~/transcribe/models/`, not in git) via
   llama-cpp-python (CUDA), ~30 GPU layers with a `[30, 20, 0]` fallback chain so
   the job still finishes (slower) if Chloe is holding VRAM. Timestamps are
   compacted to hourly markers + hierarchical chunk→notes→merge so a full day fits
-  the context, then a redaction pass strips names/personal-life/garbled products.
+  the context. A **correlation pass** then links draft bullets to specific
+  order/ticket/call ids from the day's records, and a redaction pass strips
+  names/personal-life/garble — **audio-derived content only**; names from
+  structured sources (Slack, tickets, timeclock, POS references) stay.
 - **Output:** one Markdown day-file `captains_log/YYYY-MM-DD.md` pushed to the
   **`captains-log` branch** of this repo (persistent clone `~/ha-captains-repo`,
   auth via a fine-grained PAT in `/etc/nmteaco/captains.env`). The transcription
@@ -344,9 +355,11 @@ deployed to `~/transcribe/` on the AI box and run as the
   `curl -X POST -H "X-Trigger-Token: <tok>" -d '{"date":"YYYY-MM-DD"}'
   http://127.0.0.1:8190/run`. Fire the whole HA→box path with
   `POST /api/services/rest_command/captains_log_run`.
-- **Secrets:** AI box `/etc/nmteaco/captains.env` (trigger token + GitHub write
-  PAT); HA `secrets.yaml` `aibox_trigger_token` + `/config/captains_gh.token`
-  (GitHub read PAT). None are committed.
+- **Secrets:** AI box `/etc/nmteaco/captains.env` (trigger token, GitHub write
+  PAT, `DATALOG_API_TOKEN`, optional `DASHBOARD_BASE_URL` / `SLACK_BOT_TOKEN` /
+  `SLACK_CHANNELS`); HA `secrets.yaml` `aibox_trigger_token` +
+  `/config/captains_gh.token` (GitHub read PAT). The datalog token's other half
+  lives in the dashboard's `/home/nmteaco/.env`. None are committed.
 
 ### Chloe / ephemeral generation tool (AI box)
 

@@ -1,100 +1,123 @@
 # Captain's Log
 
-A daily, **de-identified** operational summary of the Tea One store audio — a
-"captain's log of the day," not a transcript of everything said in the store.
+A daily operational summary of the shop — shop-floor audio distilled into a
+de-identified narrative, plus the day's hard business numbers (sales, shipping,
+support, calls/texts, staff hours) pulled from the dashboard's datalog API.
+
+## The business day is 6pm–6pm Mountain
+
+The log for date **D** covers **6:00pm on D-1 through 6:00pm on D**. After-hours
+online orders, support emails, and texts are handled at next opening, so they
+belong on the *next* day's log — a ticket that arrives 8pm July 20 shows up in
+the July 21 log. Downtown has no after-hours in-store sales by definition.
+
+The **audio** transcript still covers store hours of calendar day D (the mic
+window, 08:00–20:00). The one place the two windows meet is order-weaving, which
+uses only calendar-day-D register orders so the audio timeline stays coherent.
 
 ## How it works
 
 ```
-Local whisper transcribes each camera's audio  →  /share/<camera>_transcript.log   (transient, on the HA box)
-        │  once a day at 7pm MT
+HA fires the AI-box trigger at 7pm MT (one hour after the business day closes)
+        │
+        ▼  on the AI box (captains_pipeline.py)
+UniFi Protect audio → faster-whisper large-v3 (GPU) → day transcript
+dashboard datalog API → sales / shipping / support / calls / texts / timeclock
+Slack API → staff channel messages (real names)
+        │
         ▼
-Opus reads EVERY camera's transcript at once, writes ONE combined summary  →  captains_log/YYYY-MM-DD.md   (durable, in git)
-        │  only after the summary is committed + pushed
+POS orders woven into the transcript by timestamp
+  "[14:14] ⟦POS $43.50 (sample given) — Earl Grey, Honey Sticks ×3⟧"
+        │
+        ▼  local Qwen3-8B (GPU)
+summary draft → CORRELATION pass → REDACTION pass
+        │
+        ▼  deterministic (no LLM)
++ Business day / Support / Comms / Staff sections rendered straight from JSON
+        │
         ▼
-ALL raw transcripts are deleted.
+committed to captains_log/YYYY-MM-DD.md on the captains-log branch,
+raw transcript deleted
 ```
 
-Cameras are **auto-discovered**: the job globs `/share/*_transcript.log`, so
-pointing a new transcribe add-on at another camera is all it takes — the next
-nightly run includes it with zero code changes.
+- **Weaving** gives the summarizer ground truth: a sample offered on audio and
+  the matching sale minutes later become one connected observation, and garbled
+  product names get corrected against what the register actually rang up.
+- **Correlation pass**: the summarizer reads chronologically, so an end-of-day
+  conversation about an order discrepancy can't cite the morning order it
+  concerns. A second pass re-reads the finished draft against a one-line-per-
+  record digest of the whole day (orders, tickets, calls) and appends references
+  like *"(likely order #58212, $43.50 at 2:14pm)"* — only ever using ids that
+  exist in the records, marking inferred links "likely".
+- **Deterministic sections**: dollar figures, counts, names, and hours never
+  pass through the LLM — they're rendered directly from the datalog JSON after
+  redaction, so they can't be mangled or hallucinated.
+- Every business fetch is **fail-soft**: an unreachable endpoint becomes a
+  "_data unavailable_" line, never a failed run. A day with no captured speech
+  still gets a log with the business sections.
 
-**The split is deliberate:** the *local model* only transcribes (mechanical). The
-*judgment* — what's worth keeping and what must never be written down — is done by
-Opus at summary time. The raw, word-for-word transcript is never kept; only the
-scrubbed daily log survives.
+## Privacy policy (the summarizer MUST follow this)
 
-## Multi-camera: combining is the summary step
+**Strict de-identification applies to captured voice only.** Structured
+business records keep real names — that's their value.
 
-There is **no separate "combine" stage**. Every camera's transcript is just more
-input to the one summary pass — Opus reads them all together (each under a
-`===== CAMERA: <name> =====` header, with timestamps) and, while writing the
-single day's log, naturally:
+| Source | Names | Treatment |
+| --- | --- | --- |
+| Camera-mic audio | **never** | de-identify, drop personal-life content, garble-filter |
+| POS orders | n/a (no customer data fetched) | exact amounts/items, never garble-filtered |
+| Slack staff chat | real names OK | business record |
+| Support tickets | real customer names OK | emails/phones scrubbed from subjects |
+| Calls / texts | caller names & numbers OK | metadata only (no call audio) |
+| Timeclock | real staff names OK | hours, breaks, locations |
 
-- **De-duplicates** — two cameras that overhear the *same* counter conversation
-  (both catch the "instant chai" chat in the same minute) become **one** event in
-  the log, not two.
-- **Cross-reconstructs** — each camera catches slightly different fragments; using
-  them together yields a more complete, higher-confidence read than any one alone
-  (the transcription is lossy, so this genuinely helps).
-- **Locates** — which cameras heard it says roughly *where in the store* it was.
+Audio rules (unchanged in spirit from day one):
 
-That's it — no clustering pipeline, no per-camera code. Adjacent cameras (e.g.
-Tea One + Emporium Hall) overlap the most and help each other the most.
-
-## Sanitization policy (the summarizer MUST follow this)
-
-The goal is an operational log for running the shop — **not** a record of who said
-what.
-
-**Include (de-identified, aggregate):**
-- Store rhythm — active hours, busy vs. quiet stretches, overall traffic feel.
-- Product / topic interest — which teas, categories, and questions came up (as
-  themes/counts, never tied to a person).
-- Operational events worth remembering — possible order/payment issues (e.g. a
-  chargeback), stock/supply mentions, equipment problems, notable large/wholesale
-  or curbside orders (amounts fine, names not).
-- Staff-surfaced business observations (e.g. "staff noted Sundays outperform
-  Mondays").
-- Anything actionable for running the shop.
-
-**Never write:**
-- Names of customers or staff, or anything that identifies a specific person.
-- Contact info (phone, email, address).
-- Health/medical details tied to an individual. (You may note *"a wellness-tea
-  consultation occurred"* in the aggregate — never the person or their specifics.)
-- Personal-life specifics (relationships, travel, family, religion, …).
-- Verbatim quotes that could identify someone.
-- Gossip or staff interpersonal conflict — include only if operationally relevant,
-  and then neutral + de-identified.
-
-**Rules of thumb:**
-- When in doubt, leave it out. A shorter, safer log beats an oversharing one.
-- Transcription is lossy (small model) — flag uncertain items as *"possible"* and
-  never assert shaky specifics as fact.
+- No names or anything identifying a person overheard on the floor.
+- No contact info; no health/medical details tied to an individual.
+- No personal-life content (school, side-jobs, hobbies, travel, family,
+  relationships, religion, politics, feelings, small talk) — drop it entirely.
+- No verbatim quotes that could identify someone; no gossip.
+- When in doubt, leave it out. If audio and this policy ever conflict with a
+  business record, the record's facts are safe; the overheard context is not.
+- If call *audio* is ever added, it gets the same strict treatment as mic audio.
 
 ## Format
 
+The narrative half (`Hours active` / `Traffic` / `Product & topics` /
+`Notable / follow-ups` / `Staff & ops notes`) is written by the summarizer.
+Then the deterministic half is appended:
+
 ```markdown
-# Captain's Log — <Weekday> <YYYY-MM-DD>
+## Business day (6pm–6pm MT)
+**Online:** $512.40 retail (9 orders)
+**In-store:** $1,041.77 retail (33 orders) + $210.00 wholesale (1) · 2 pickup orders ($45.50)
+**Shipped:** 21 orders · 24 labels (1 voided) · postage $187.33 — USPS 18, UPS 3
 
-**Hours active:** …
-**Traffic:** …
+## Support
+3 new · 7 inbound messages · 2 closed · 5 open now
+- New #91 08:11 — Jane Miller: "Missing tin from order" (Orders)
 
-## Product & topics
-- …
+## Comms
+**6 calls (25 min) · texts 4 in / 6 out · 1 text awaiting reply**
 
-## Notable / follow-ups
-- …
-
-## Staff & ops notes
-- …
-
-_Source: Tea One mic → local whisper (tiny.en) → summarized by Opus. Raw transcript discarded after this log was written._
+## Staff
+**15.9 labor hours**
+- Dawn S: 8:58am–5:02pm (7.54h, 32m break) — Downtown
 ```
+
+## Data sources & credentials
+
+All on the AI box in `/etc/nmteaco/captains.env` (mode 600, never committed):
+
+| Key | Purpose |
+| --- | --- |
+| `GITHUB_TOKEN` | push the finished log to the `captains-log` branch |
+| `DATALOG_API_TOKEN` | bearer token for `https://www.nmteaco.com/dashboard/tools/datalog/*.php` (same value lives in the dashboard's `/home/nmteaco/.env`) |
+| `DASHBOARD_BASE_URL` | optional override, default `https://www.nmteaco.com` |
+| `SLACK_BOT_TOKEN` | optional; scopes `channels:history` (+`groups:history` for private channels), `users:read` — bot must be invited to the channels |
+| `SLACK_CHANNELS` | optional; comma-separated channel IDs to read |
 
 ## Retention
 
-The raw transcripts are **ephemeral** — every camera's log is deleted each night
-once the day's combined summary is safely in git. These dated summaries are the
-only durable record.
+The raw transcript is **ephemeral** — deleted each night once the day's log is
+safely in git. These dated summaries are the only durable record.
