@@ -593,19 +593,22 @@ def _build_image_prompt_from_message(message: str) -> str:
 
 
 PROMPT_ASSIST_SYSTEM = (
-    "You turn a short image idea into ONE detailed Stable Diffusion XL prompt. "
-    "Keep the user's subject exactly (if they name a fictional character, add "
-    "the actor's real name - diffusion models know actors, not characters), "
-    "then add concrete artistic direction: shot type, composition, lighting, "
-    "color palette, mood, lens/film or art style. Comma-separated fragments, "
-    "not sentences. HARD LIMIT ~55 words (CLIP truncates past that - front-load "
-    "what matters). Output ONLY the prompt, nothing else."
+    "You ADD artistic direction to a Stable Diffusion XL prompt. You will see "
+    "the user's image idea. Output ONLY comma-separated additions to append "
+    "after it - NEVER restate or rewrite their idea. Add: shot type, "
+    "composition, lighting, color palette, mood, lens/film or art style. If "
+    "their idea names a fictional character, ALSO add the actor's real name "
+    "as one addition (diffusion models know actors, not characters). Max ~35 "
+    "words of additions (CLIP truncates long prompts). No sentences, no "
+    "preamble - just the comma-separated fragments."
 )
 
 
 def _expand_image_prompt(user_prompt: str) -> str:
-    """Optional 'prompt assist': the local chat LLM (CPU) adds artistic
-    direction. Falls back to the raw prompt on any failure."""
+    """Optional 'prompt assist': the local chat LLM (CPU) generates artistic-
+    direction fragments which are APPENDED to the user's untouched prompt -
+    subject preservation is structural, not an instruction the model can
+    drift from. Falls back to the raw prompt on any failure."""
     try:
         with _llm_lock:
             completion = llm.create_chat_completion(
@@ -613,10 +616,12 @@ def _expand_image_prompt(user_prompt: str) -> str:
                     {"role": "system", "content": PROMPT_ASSIST_SYSTEM},
                     {"role": "user", "content": user_prompt},
                 ],
-                max_tokens=140, temperature=0.7, top_p=0.9, repeat_penalty=1.15,
+                max_tokens=110, temperature=0.5, top_p=0.9, repeat_penalty=1.15,
             )
-        expanded = completion["choices"][0]["message"]["content"].strip().strip('"')
-        return expanded if expanded else user_prompt
+        additions = completion["choices"][0]["message"]["content"].strip().strip('"').strip(",. ")
+        if not additions:
+            return user_prompt
+        return f"{user_prompt}, {additions}"[:400]
     except Exception as e:
         print(f"prompt assist failed, using raw prompt: {e}", flush=True)
         return user_prompt
