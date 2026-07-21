@@ -112,8 +112,16 @@ MAX_HISTORY = 40  # messages kept per conversation, oldest dropped past this
 MAX_GALLERY = 30  # images kept per conversation-with-images session
 MIN_PASSWORD_LEN = 8  # enforced client-side; the server never sees the password
 
-IMG_STEPS = 24  # DPM++ 2M Karras converges well here (was 32 w/ default scheduler)
-IMG_GUIDANCE = 6.0
+# Quality presets: steps + guidance on the same model/scheduler. Resolution
+# stays 1024 (SDXL's native training size - lower degrades composition more
+# than it saves time) and the TAESD tiny VAE stays for all presets (the full
+# VAE's decode spike is what used to OOM the 6GB card).
+IMG_PRESETS = {
+    "quick":    {"steps": 14, "guidance": 5.5},
+    "balanced": {"steps": 24, "guidance": 6.0},  # DPM++ 2M Karras converges well here
+    "best":     {"steps": 40, "guidance": 6.5},
+}
+IMG_DEFAULT_PRESET = "balanced"
 IMG_SIZE = 1024
 LLM_MAX_TOKENS = 512
 LLM_CONTEXT = 8192
@@ -577,10 +585,11 @@ def _build_image_prompt_from_message(message: str) -> str:
     return f"{appearance}. {scene}"[:240]
 
 
-def _run_image(prompt: str) -> str:
+def _run_image(prompt: str, quality: str = IMG_DEFAULT_PRESET) -> str:
+    p = IMG_PRESETS.get(quality, IMG_PRESETS[IMG_DEFAULT_PRESET])
     with _gpu_lock:
         image = image_pipe(
-            prompt=prompt, num_inference_steps=IMG_STEPS, guidance_scale=IMG_GUIDANCE,
+            prompt=prompt, num_inference_steps=p["steps"], guidance_scale=p["guidance"],
             height=IMG_SIZE, width=IMG_SIZE,
         ).images[0]
         # 6GB is a tight budget for SDXL's VAE-decode memory spike specifically -
@@ -695,9 +704,13 @@ async def image_only(request: Request):
     prompt = (body.get("prompt") or "").strip()[:2000]
     if not prompt:
         return JSONResponse({"error": "empty prompt"}, status_code=400)
+    quality = body.get("quality")
+    if quality not in IMG_PRESETS:
+        quality = IMG_DEFAULT_PRESET
 
     try:
-        image_b64 = await asyncio.get_event_loop().run_in_executor(_gpu_executor, _run_image, prompt)
+        image_b64 = await asyncio.get_event_loop().run_in_executor(
+            _gpu_executor, _run_image, prompt, quality)
     except RuntimeError:
         # Almost always CUDA OOM - the nightly Captain's Log transcription
         # holds ~4GB of the 6GB card while it runs.

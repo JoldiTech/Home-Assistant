@@ -325,6 +325,12 @@ function renderImageOnly() {
     <h2>generate an image</h2>
     <form id="image-form">
       <textarea id="image-prompt" rows="3" placeholder="describe the image..." autofocus required></textarea>
+      <label for="image-quality">quality</label>
+      <select id="image-quality">
+        <option value="quick">quick (~15s)</option>
+        <option value="balanced" selected>balanced (~30s)</option>
+        <option value="best">best (~55s)</option>
+      </select>
       <button type="submit">generate</button>
     </form>
     <div id="image-status"></div>
@@ -345,9 +351,11 @@ async function onImageSubmit(e) {
   if (!prompt) return;
   const btn = e.target.querySelector("button");
   btn.disabled = true;
-  $("image-status").textContent = "generating... (~30s)";
+  const quality = $("image-quality").value;
+  const eta = { quick: "~15s", balanced: "~30s", best: "~55s" }[quality] || "";
+  $("image-status").textContent = `generating (${quality})... ${eta}`;
   try {
-    const { image } = await apiCall("/api/image", { prompt });
+    const { image } = await apiCall("/api/image", { prompt, quality });
     appendGalleryImage(image);
     $("image-status").textContent = "";
   } catch (err) {
