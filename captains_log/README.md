@@ -103,7 +103,8 @@ Then the deterministic half is appended:
 
 ## Support
 3 new · 7 inbound messages · 2 closed · 5 open now
-- New #91 08:11 — Jane Miller: "Missing tin from order" (Orders)
+(counts only — ticket details live in the support system; issues worth acting
+on surface in the narrative/Unresolved instead)
 
 ## Comms
 **6 calls (25 min) · texts 4 in / 6 out · 1 text awaiting reply**

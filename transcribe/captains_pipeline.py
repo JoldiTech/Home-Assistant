@@ -86,12 +86,6 @@ REPO_CLONE = Path.home() / "ha-captains-repo"
 DEFAULT_DASHBOARD = "https://dashboard.nmteaco.com"
 DATALOG_ENDPOINTS = ("sales", "shipping", "support", "calls", "texts", "timeclock")
 
-SOURCE_LINE = (
-    "_Source: Tea One mic → faster-whisper large-v3 → de-identified by a local "
-    "model on the AI box · business data from the dashboard datalog API and "
-    "Slack. Raw transcript never leaves the box._"
-)
-
 # --- policy (the summarizer MUST follow this) ---------------------------------
 # Mirrors captains_log/README.md. Privacy = no linkage between a named person
 # and sensitive content; names on operational facts are welcome. This is the
@@ -311,10 +305,6 @@ Fix garbled product names from the lossy mic: if a "product" is not a
 plausible real tea/herb/ingredient/flavor, drop just that mention - register
 (POS/order-reference) product names are never garble.
 
-KEEP every "[likely ...]" annotation exactly as written - those are catalog
-cross-references added in code, and a name carrying one is a real product
-reference, never garble.
-
 Do not add commentary. Output ONLY the cleaned markdown log. /no_think"""
 
 NOTES_SYSTEM = SYSTEM_PROMPT + (
@@ -506,18 +496,19 @@ def _match_catalog(markdown: str, products: list[dict]):
 
 def _annotate_catalog(draft: str, review) -> tuple[str, int]:
     """Deterministic follow-through for the review tier: the 8B model ignored
-    'replace X with Y' instructions across repeated runs, so instead of asking
-    it to edit, append the best candidate inline - '"Munch's Blend [likely
-    Monk's Blend | Organic]"'. Nothing is destroyed, the reader sees the real
-    product, and no LLM roll can drop the correction."""
+    'replace X with Y' instructions across repeated runs, so code swaps the
+    misheard name for the real catalog name directly - the log just reads
+    "Monk's Blend", no correction markup. Done in code, no LLM roll can drop
+    it."""
     n = 0
     for q, cands in review:
         # len >= 5 keeps quoted ordinary words ("trap") from being treated as
         # product names; 0.65 is calibrated so "Munch's Blend"->Monk's (0.66)
-        # annotates but supplier-name coincidences like "Star West"->Star
+        # corrects but supplier-name coincidences like "Star West"->Star
         # Anise (0.63) don't.
-        if len(q) >= 5 and cands and cands[0][1] >= 0.65 and f"{q} [likely" not in draft:
-            draft = draft.replace(q, f"{q} [likely {cands[0][0]}]", 1)
+        if len(q) >= 5 and cands and cands[0][1] >= 0.65:
+            _warn(f"catalog correction: \"{q}\" -> \"{cands[0][0]}\"")
+            draft = draft.replace(q, cands[0][0])
             n += 1
     return draft, n
 
@@ -906,14 +897,12 @@ def _business_sections(biz: dict) -> str:
 
     sup = biz.get("support")
     if sup:
-        line = (f"**Support:** {sup.get('tickets_created', 0)} new · "
-                f"{sup.get('inbound_messages', 0)} inbound · "
-                f"{sup.get('tickets_closed', 0)} closed · {sup.get('open_now', 0)} open")
-        parts.append(line)
-        for kind, lst in (("new", sup.get("created")), ("closed", sup.get("closed"))):
-            for tkt in lst or []:
-                parts.append(f"- {kind} #{tkt.get('id')} — {_scrub(tkt.get('customer', ''))}: "
-                             f"\"{_scrub(tkt.get('subject', ''))}\"")
+        # Counts only - the support system itself is where ticket details live.
+        # Ticket content still reaches the summarizer (via the context block) so
+        # genuine issues surface in the narrative/Unresolved instead of a list.
+        parts.append(f"**Support:** {sup.get('tickets_created', 0)} new · "
+                     f"{sup.get('inbound_messages', 0)} inbound · "
+                     f"{sup.get('tickets_closed', 0)} closed · {sup.get('open_now', 0)} open")
     else:
         parts.append("**Support:** _unavailable_")
 
@@ -1260,8 +1249,7 @@ def main():
     markdown = _validate_annotations(markdown, biz)
     markdown = _cap_bullet_lists(markdown)
     markdown = _flag_stock_contradictions(markdown, products)
-    markdown = (markdown.rstrip() + "\n\n" + _business_sections(biz)
-                + "\n\n" + SOURCE_LINE)
+    markdown = markdown.rstrip() + "\n\n" + _business_sections(biz)
     _commit_and_push(date_str, markdown, env)
 
     # Transcripts stay on this box (never in git) so test reruns skip the
