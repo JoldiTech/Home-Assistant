@@ -83,6 +83,36 @@ authorized on both machines) — only the Access layer differs per box.
 Connect with `ssh aibox` (set up by the same SessionStart hook / Setup script as
 `ssh homeassistant`).
 
+**Networking & power (hard-won facts — verify, don't assume):**
+
+- **LAN addresses:** AI box = `192.168.22.6` (DHCP reservation + the same address
+  configured statically in `/etc/netplan/55-lan-static-fallback.yaml`, so its LAN
+  identity survives a dead UniFi DHCP). **HA Green = `192.168.22.254`** (NOT .4;
+  its MAC OUI `20:f8:3b` is easily mis-read as Arris). UniFi console/gateway/
+  Protect = `192.168.22.1`.
+- **Dual WAN:** primary = UniFi LAN → T-Mobile (egress `172.59.x`). Backup = USB
+  AX88179 dongle `enx00051ba3cee1` → AT&T ISP box LAN (`192.168.1.x`, gateway
+  `.254`, egress `99.x`), netplan `60-usb-wan-backup.yaml`: metric 700, IPv6
+  deliberately disabled (its RA would siphon dual-stack traffic during normal
+  operation). `wan-failover.service` health-checks the primary and swaps in a
+  metric-50 override only while the primary is genuinely dead; `usb-wan-guard`
+  (nftables) drops unsolicited inbound on the dongle. All remote access is
+  outbound Cloudflare tunnels, so failover re-homes SSH/Chloe automatically —
+  proven live. **LAN routes never depend on the default route**: even failed
+  over, the box still reaches HA/console/cameras via the connected route.
+- **UPS:** CyberPower CP1500PFCLCDa on USB, NUT (`upsc cyberpower`), shuts the
+  box down at 50% charge / 10 min runtime (on battery only) to leave the rest
+  of the battery for cameras + network gear. HA integration "NUT" shows it
+  (`sensor.cyberpower_*`); `script.wake_ai_box` sends WoL (MAC
+  `a8:5e:45:e6:62:1f`) to restart the box after an outage shutdown, since the
+  UPS never lets the PSU see AC drop. WoL persisted via `wol-enable.service`.
+- **Minimal-image gotcha:** this box shipped WITHOUT `ping`, `iptables`,
+  `traceroute` (now installed: iputils-ping/arping, traceroute, mtr, tcpdump,
+  nftables). A missing tool exits 127, which reads as "host down" in sloppy
+  scripts/checks — the wan-failover watchdog explicitly refuses to act on
+  exec-failure exit codes for exactly this reason. Never diagnose "network
+  down" without confirming the diagnostic tool itself ran.
+
 **Python ML stack** lives in a venv at `~/transcribe-env` on the box (activate with
 `source ~/transcribe-env/bin/activate`): `torch` (CUDA build, confirmed working on
 the RTX 2060), `faster-whisper`, `demucs`, `nemo_toolkit[asr]` (Parakeet). This is
