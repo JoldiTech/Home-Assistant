@@ -135,7 +135,15 @@ environment — they live only on the box itself:
   `88f7af54-98f8-306a-a1c7-c9349722b1f6`, "Default"): device list (UDM Pro Max,
   US-16-PoE-150W, AC Pro, U7 Pro Max), client list, stats, and ACTIONS
   (device restart, per-port PoE power-cycle) — remote network remediation
-  without touching the rack.
+  without touching the rack. **It ALSO works on the legacy admin API**
+  (`/proxy/network/api/s/default/...` — stat/health, stat/device), which is
+  where WAN detail lives that the integration API omits.
+- **Store dual-WAN (UDM Pro Max):** WAN1 eth8 = AT&T Internet Air (via the
+  same AT&T box the AI-box dongle uses, `192.168.1.x`); WAN2 eth7 = T-Mobile
+  (`192.168.12.x`, egress `172.59.x`). Both monitored by the UDM; failover is
+  automatic. After a full rack power-cycle the UDM may sit on WAN2 without
+  failing back unless failback is enabled. UniFi Talk is installed but has NO
+  integration API - its endpoints reject API keys (admin session only).
 - Any future systemd service on this box should read secrets via
   `EnvironmentFile=/etc/nmteaco/protect.env`, never hardcode them.
 
