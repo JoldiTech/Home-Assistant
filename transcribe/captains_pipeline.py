@@ -195,7 +195,9 @@ count poisons a permanent record; an honest gap does not.
 
 PRIVACY - the rule is about LINKAGE, not names:
 - Names are fine, and often the point: a promise, hold, special order, or
-  callback NEEDS the name to be actionable ("send samples to Nancy Brown").
+  callback NEEDS the name to be actionable (name the customer on the promise).
+  Only use names ACTUALLY present in the day's material - never invent one, and
+  never copy an example name from these instructions into the log.
 - What must NEVER appear is a named person tied to sensitive or personal
   content: health/medical details, personal-life circumstances, complaints
   about other people, or "so-and-so said/felt X". Keep the operational fact,
@@ -281,8 +283,10 @@ log. You are given a draft Captain's Log. Return it UNCHANGED except for the \
 removals below, then output the cleaned log in the same format.
 
 THE PRIVACY RULE IS ABOUT LINKAGE, NOT NAMES. Names attached to operational
-facts stay - "send samples to Nancy Brown", "hold two tins for the Duran
-account" are the point of the log. What must never survive is a NAMED person
+facts stay - naming the customer on a promise, hold, or special order is the
+point of the log (use ONLY names that actually appear in the day's material;
+never carry an example name from these instructions into the output). What
+must never survive is a NAMED person
 tied to sensitive content: health/medical details, personal-life
 circumstances, or "so-and-so said/felt X". Fix by breaking the link - keep
 the event, drop the name from THAT sentence ("a customer asked about teas
