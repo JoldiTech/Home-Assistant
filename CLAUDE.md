@@ -106,6 +106,16 @@ Connect with `ssh aibox` (set up by the same SessionStart hook / Setup script as
   (`sensor.cyberpower_*`); `script.wake_ai_box` sends WoL (MAC
   `a8:5e:45:e6:62:1f`) to restart the box after an outage shutdown, since the
   UPS never lets the PSU see AC drop. WoL persisted via `wol-enable.service`.
+- **Bulk downloads ride the backup line:** `via-att <command>` on the box runs
+  anything with egress pinned to the AT&T dongle (dedicated `dl` user +
+  uidrange ip rule -> table 107, asserted by `dl-route.service` at boot and a
+  networkd-dispatcher hook after any netplan/link event — netplan apply
+  flushes table 107 and would otherwise silently fall back to the store WAN).
+  ~95 Mbps measured to HuggingFace. Use it for every model download so the
+  store's T-Mobile line never feels it: `via-att curl -LO <url>`. /srv/dl is
+  the dl user's group-writable staging dir. Dongle MTU is pinned to **1430**
+  (probed: 1500/1452 drop with DF on AT&T Internet Air — a PMTUD blackhole
+  that strangles bulk TCP against hosts that filter ICMP).
 - **Minimal-image gotcha:** this box shipped WITHOUT `ping`, `iptables`,
   `traceroute` (now installed: iputils-ping/arping, traceroute, mtr, tcpdump,
   nftables). A missing tool exits 127, which reads as "host down" in sloppy
