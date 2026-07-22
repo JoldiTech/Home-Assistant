@@ -173,10 +173,14 @@ FORMAT:
    0-5 bullets, each a concrete object + action someone can pick up
    tomorrow ("reconcile the $NN register shortfall", "reorder [the
    out-of-stock product]") - fill the brackets from TODAY'S input only;
-   these are format examples, never content. BANNED: vague care-taking
-   ("confirm the customer was satisfied"), resolved items, garble-based
-   items, and any item whose amount or product you cannot point to in the
-   input. Empty beats padded.
+   these are format examples, never content. A product on a ⟦POS⟧ line
+   SOLD - a sale is proof of stock, the opposite of unmet demand. "Reorder
+   X" is valid ONLY when speech says X was asked for and unavailable, ran
+   out, or must be restocked - never because X appears in a sale. BANNED:
+   vague care-taking ("confirm the customer was satisfied"), resolved
+   items, garble-based items, and any item whose amount or product you
+   cannot point to in the input. NEVER more than 5 bullets - if you have
+   more candidates, keep only the 5 most consequential. Empty beats padded.
 3. "## Worth remembering" - 0-5 durable signals a future reader would want:
    unmet demand (named, with counts), specific feedback, first signs of
    something (equipment aging, a recurring confusion), promises already in
@@ -311,13 +315,16 @@ Do not add commentary. Output ONLY the cleaned markdown log. /no_think"""
 NOTES_SYSTEM = SYSTEM_PROMPT + (
     "\n\nFor THIS step you are taking rough notes on one slice of the day. Output a "
     "short bullet list capturing ONLY the unique record: unmet demand (exact product "
-    "names customers asked for and didn't get), specific feedback, promises staff "
+    "names customers asked for and didn't get - this comes from SPEECH only; a "
+    "product on a ⟦POS⟧ line SOLD, which is the opposite of unmet demand, so never "
+    "note sold items or their product lists), specific feedback, promises staff "
     "made, causes/explanations, problems and discrepancies (with amounts), equipment "
     "or stock issues, staff observations, plus one bullet on traffic feel. Routine "
-    "retail chit-chat (brewing questions, browsing, tastings) produces NO bullets. "
-    "Keep POS amounts exact. Names are fine when they carry an operational fact "
+    "retail chit-chat (brewing questions, browsing, tastings) and ordinary completed "
+    "sales produce NO bullets. Keep POS amounts exact when a discrepancy or promise "
+    "references them. Names are fine when they carry an operational fact "
     "(a promise, hold, or order); never pair a name with personal or health "
-    "content. No format headers - just bullets."
+    "content. No format headers - just bullets. At most 8 bullets per slice."
 )
 
 
@@ -535,6 +542,27 @@ def _context_block(biz: dict) -> str:
 
 
 _ANNOT_RE = re.compile(r"\s*\((?:likely\s+)?(order|ticket)\s*#([A-Za-z0-9\-]+)[^)]*\)")
+
+
+def _cap_bullet_lists(markdown: str, cap: int = 6) -> str:
+    """Deterministic guard behind the summarizer's 0-5 rule: on POS-heavy days
+    the 8B model has produced degenerate drafts listing every SOLD product as a
+    'Reorder' bullet (50+ lines), which then truncates the output mid-word.
+    Prompts lower the odds; this makes the failure bounded - keep the first
+    `cap` bullets of each list section and drop the rest."""
+    out, in_list, kept = [], False, 0
+    for line in markdown.splitlines():
+        if line.startswith("## "):
+            in_list = line.strip() in ("## Unresolved", "## Worth remembering")
+            kept = 0
+        elif in_list and line.lstrip().startswith("- "):
+            kept += 1
+            if kept > cap:
+                if kept == cap + 1:
+                    _warn(f"capping runaway bullet list at {cap} items")
+                continue
+        out.append(line)
+    return "\n".join(out)
 
 
 def _validate_annotations(markdown: str, biz: dict) -> str:
@@ -966,6 +994,7 @@ def main():
     # and record references must point at real, amount-consistent records.
     markdown = markdown.replace("⟦", "").replace("⟧", "")
     markdown = _validate_annotations(markdown, biz)
+    markdown = _cap_bullet_lists(markdown)
     markdown = (markdown.rstrip() + "\n\n" + _business_sections(biz)
                 + "\n\n" + SOURCE_LINE)
     _commit_and_push(date_str, markdown, env)
