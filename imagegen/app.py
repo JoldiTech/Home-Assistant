@@ -173,8 +173,13 @@ IMG_DEFAULT_NEGATIVE = (
 IP_ADAPTER_DIR = os.environ.get(
     "IP_ADAPTER_DIR", os.path.expanduser("~/imagegen/models/ip_adapter")
 )
-IMG_REF_MAX = 2          # 1 ref = subject likeness; 2 refs = left/right masked
-IMG_REF_DEFAULT_STRENGTH = 0.6
+# IP-Adapter FaceID (SDXL): identity from an InsightFace embedding (computed on
+# CPU) rather than a heavy CLIP image encoder in VRAM, so a face reference fits
+# the 6GB card. The adapter ships as a weights file + a companion LoRA.
+FACEID_WEIGHTS = "ip-adapter-faceid_sdxl.bin"
+FACEID_LORA = "ip-adapter-faceid_sdxl_lora.safetensors"
+IMG_REF_MAX = 1          # v1: one face reference. Multi-person masking is a follow-up.
+IMG_REF_DEFAULT_STRENGTH = 0.7
 LLM_MAX_TOKENS = 512
 LLM_CONTEXT = 8192
 
@@ -275,6 +280,8 @@ _gpu_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 _llm_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 image_pipe = None
+ref_pipe = None                # lazy FaceID (sequential-offload) pipe; built on first reference-photo use
+_face_app = None               # lazy InsightFace buffalo_l (CPU) for face embeddings
 llm = None
 _chat_worker = None            # Popen for GPU-chat mode; None otherwise
 _chat_worker_layers = 0        # gpu layers the worker actually loaded (fallback-aware)
@@ -302,7 +309,10 @@ def _init_payload() -> dict:
     # including 'error'. Otherwise a transient load failure strips the picker
     # to fallbacks AND leaves no way forward.
     payload["mode"] = _chat_selection["mode"]
-    payload["images"] = (image_pipe is not None)  # get-image is only usable when True
+    # Images are on whenever an SDXL pipe COULD be resident (either the fast base
+    # pipe or the FaceID ref pipe - only one lives at a time). Both are None only
+    # in gpu_chat mode, where SDXL never loads.
+    payload["images"] = (image_pipe is not None or ref_pipe is not None)
     if status not in ("loading", "ready"):
         payload["models"] = _list_chat_models()
         payload["modes"] = list(CHAT_MODES)
@@ -707,9 +717,114 @@ def _decode_ref(b64: str):
 
 
 class ReferenceUnavailable(Exception):
-    """Reference-photo generation was requested but the feature isn't loaded.
-    Deliberately NOT a RuntimeError so it doesn't get swallowed by the CUDA-OOM
-    handler and mis-reported as 'GPU is busy'."""
+    """Reference-photo generation was requested but the feature isn't loaded
+    (adapter/face model missing). Deliberately NOT a RuntimeError so it doesn't
+    get swallowed by the CUDA-OOM handler and mis-reported as 'GPU is busy'."""
+
+
+class NoFaceInReference(Exception):
+    """The reference image had no detectable face - user-fixable, not an error."""
+
+
+def _get_face_app():
+    """Lazily load InsightFace buffalo_l on the CPU (onnxruntime). Kept off the
+    GPU on purpose so it never competes with SDXL for the 6GB card."""
+    global _face_app
+    if _face_app is not None:
+        return _face_app
+    try:
+        from insightface.app import FaceAnalysis
+    except Exception:
+        raise ReferenceUnavailable("the face model isn't installed on this server")
+    fa = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+    fa.prepare(ctx_id=-1, det_size=(640, 640))
+    _face_app = fa
+    return _face_app
+
+
+def _build_base_pipe():
+    """The fast, normal-gen SDXL pipe: model_cpu_offload keeps the whole UNet
+    resident on the GPU across denoising steps (~5.2GB, ~20s/image) and has NO
+    adapter, so ordinary images are pristine. DPM++ Karras + TAESD for speed and
+    to kill the VAE-decode VRAM spike. Caller holds _gpu_lock."""
+    print("loading SDXL checkpoint (GPU, fast path)...", flush=True)
+    p = StableDiffusionXLPipeline.from_single_file(
+        IMAGE_MODEL_PATH, torch_dtype=torch.float16, use_safetensors=True)
+    p.scheduler = DPMSolverMultistepScheduler.from_config(
+        p.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++")
+    p.vae = AutoencoderTiny.from_pretrained("madebyollin/taesdxl", torch_dtype=torch.float16)
+    p.enable_model_cpu_offload()
+    print("image model ready", flush=True)
+    return p
+
+
+def _build_ref_pipe():
+    """The reference-photo (FaceID) SDXL pipe. FaceID's extra UNet weights don't
+    fit the 6GB card under model_cpu_offload, so this pipe streams weights via
+    sequential offload (~650MB VRAM, ~50s/image). The companion LoRA is fused in
+    permanently - this pipe only ever does reference gen. Caller holds _gpu_lock."""
+    for fn in (FACEID_WEIGHTS, FACEID_LORA):
+        if not os.path.exists(os.path.join(IP_ADAPTER_DIR, fn)):
+            raise ReferenceUnavailable("the reference-photo model isn't installed on this server")
+    print("building FaceID reference pipeline...", flush=True)
+    p = StableDiffusionXLPipeline.from_single_file(
+        IMAGE_MODEL_PATH, torch_dtype=torch.float16, use_safetensors=True)
+    p.scheduler = DPMSolverMultistepScheduler.from_config(
+        p.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++")
+    p.vae = AutoencoderTiny.from_pretrained("madebyollin/taesdxl", torch_dtype=torch.float16)
+    p.load_ip_adapter(IP_ADAPTER_DIR, subfolder=None,
+                      weight_name=FACEID_WEIGHTS, image_encoder_folder=None)
+    p.load_lora_weights(IP_ADAPTER_DIR, weight_name=FACEID_LORA)
+    p.fuse_lora()
+    p.unload_lora_weights()
+    p.enable_sequential_cpu_offload()
+    print("FaceID reference pipeline ready", flush=True)
+    return p
+
+
+def _activate_base():
+    """Ensure the fast normal-gen pipe is the one resident. Only ONE SDXL pipe
+    lives at a time (base ~10GB RAM OR ref ~10GB RAM, never both) so that with
+    the 12B chat model also loaded we stay well under the cgroup memory cap. The
+    two pipes need incompatible offload strategies, so switching means swapping
+    the object - an occasional ~15s rebuild, paid only when a session actually
+    alternates between normal and reference gen."""
+    global image_pipe, ref_pipe
+    if image_pipe is not None:
+        return
+    if ref_pipe is not None:
+        ref_pipe = None
+        gc.collect()
+        try: torch.cuda.empty_cache()
+        except Exception: pass
+    image_pipe = _build_base_pipe()
+
+
+def _activate_ref():
+    """Ensure the FaceID pipe is the one resident (dropping the base pipe)."""
+    global image_pipe, ref_pipe
+    if ref_pipe is not None:
+        return
+    if image_pipe is not None:
+        image_pipe = None
+        gc.collect()
+        try: torch.cuda.empty_cache()
+        except Exception: pass
+    ref_pipe = _build_ref_pipe()
+
+
+def _face_id_embeds(refs: list):
+    """Largest face in the first reference image -> CFG-ready FaceID embedding
+    ([neg, pos] stacked). Raises NoFaceInReference if the detector finds none."""
+    import numpy as np
+    fa = _get_face_app()
+    faces = fa.get(np.array(refs[0].convert("RGB"))[:, :, ::-1])  # PIL RGB -> BGR ndarray
+    if not faces:
+        raise NoFaceInReference()
+    faces.sort(key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]), reverse=True)
+    emb = torch.from_numpy(faces[0].normed_embedding).unsqueeze(0)   # [1, 512]
+    ref = torch.stack([emb], dim=0)                                  # [1, 1, 512]
+    return torch.cat([torch.zeros_like(ref), ref]).to(dtype=torch.float16, device="cuda")
 
 
 def _run_image(prompt: str, quality: str = IMG_DEFAULT_PRESET,
@@ -718,16 +833,28 @@ def _run_image(prompt: str, quality: str = IMG_DEFAULT_PRESET,
     p = IMG_PRESETS.get(quality, IMG_PRESETS[IMG_DEFAULT_PRESET])
     neg = IMG_DEFAULT_NEGATIVE if negative is None else negative
     refs = refs or []
-    if refs:
-        raise ReferenceUnavailable(
-            "reference photos aren't enabled yet - this is not a GPU-busy error"
-        )
     with _gpu_lock:
-        image = image_pipe(
-            prompt=prompt, negative_prompt=neg or None,
-            num_inference_steps=p["steps"], guidance_scale=p["guidance"],
-            height=IMG_SIZE, width=IMG_SIZE,
-        ).images[0]
+        if refs:
+            # Fail fast on a faceless reference BEFORE paying to build the pipe.
+            id_embeds = _face_id_embeds(refs)
+            _activate_ref()
+            ref_pipe.set_ip_adapter_scale(float(ref_strength))
+            # Sequential offload is slow; cap steps so even the "best" preset plus
+            # a possible ~15s pipe rebuild stays under Cloudflare's ~100s timeout.
+            steps = min(p["steps"], 34)
+            image = ref_pipe(
+                prompt=prompt, negative_prompt=neg or None,
+                ip_adapter_image_embeds=[id_embeds],
+                num_inference_steps=steps, guidance_scale=p["guidance"],
+                height=IMG_SIZE, width=IMG_SIZE,
+            ).images[0]
+        else:
+            _activate_base()
+            image = image_pipe(
+                prompt=prompt, negative_prompt=neg or None,
+                num_inference_steps=p["steps"], guidance_scale=p["guidance"],
+                height=IMG_SIZE, width=IMG_SIZE,
+            ).images[0]
         # 6GB is a tight budget for SDXL's VAE-decode memory spike specifically -
         # release cached (but unused) allocator blocks between calls rather than
         # letting them accumulate/fragment across requests.
@@ -926,7 +1053,7 @@ async def chat_image(request: Request):
         return result
     if _model_status != "ready":
         return JSONResponse({"error": "not initialized"}, status_code=503)
-    if image_pipe is None:
+    if image_pipe is None and ref_pipe is None:
         return JSONResponse(
             {"error": "images are off in GPU-chat mode - shut down models and re-initialize in 'CPU chat + images' to generate"},
             status_code=409)
@@ -1036,6 +1163,10 @@ async def image_only(request: Request):
     try:
         image_b64 = await asyncio.get_event_loop().run_in_executor(
             _gpu_executor, _run_image, final_prompt, quality, negative, refs, ref_strength)
+    except NoFaceInReference:
+        return JSONResponse(
+            {"error": "couldn't find a face in that photo - use a clear, front-facing headshot"},
+            status_code=400)
     except ReferenceUnavailable as e:
         return JSONResponse({"error": str(e)}, status_code=501)
     except RuntimeError:
@@ -1110,22 +1241,7 @@ def _load_models():
         if mode == "gpu_chat":
             _spawn_chat_worker(chat_path)  # GPU; SDXL stays unloaded
         else:
-            print("loading SDXL checkpoint (GPU)...", flush=True)
-            image_pipe = StableDiffusionXLPipeline.from_single_file(
-                IMAGE_MODEL_PATH, torch_dtype=torch.float16, use_safetensors=True
-            )
-            # Speed, no model change: DPM++ 2M Karras converges in fewer steps
-            # than the default scheduler, and TAESD (a tiny distilled VAE)
-            # decodes far faster than the full SDXL VAE and removes the
-            # VAE-decode VRAM spike that used to flirt with OOM on the 6GB
-            # card. Set the VAE BEFORE enable_model_cpu_offload so the offload
-            # hooks attach to it.
-            image_pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-                image_pipe.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++"
-            )
-            image_pipe.vae = AutoencoderTiny.from_pretrained("madebyollin/taesdxl", torch_dtype=torch.float16)
-            image_pipe.enable_model_cpu_offload()
-            print("image model ready", flush=True)
+            image_pipe = _build_base_pipe()
 
             print(f"loading chat model {_chat_selection['model']} (CPU)...", flush=True)
             llm = Llama(model_path=chat_path, n_ctx=LLM_CONTEXT, n_threads=8,
@@ -1157,10 +1273,12 @@ def _unload_models():
     the model objects, so everything picks up where it left off after the next
     Initialize. Runs on _gpu_executor so teardown happens on the same thread
     (and CUDA context) that loaded the models."""
-    global image_pipe, llm, _model_status
+    global image_pipe, ref_pipe, _face_app, llm, _model_status
     _kill_worker()  # GPU-chat subprocess, if any
     with _gpu_lock:
         image_pipe = None
+        ref_pipe = None      # lazy FaceID pipe, if it was built this session
+        _face_app = None     # InsightFace (CPU) - frees its RAM
         llm = None
         gc.collect()
         try:

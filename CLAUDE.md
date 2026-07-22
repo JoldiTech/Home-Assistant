@@ -381,6 +381,23 @@ the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
 - **Lazy load:** nothing loads at startup (~700 MB cold). The **Initialize**
   button (`/api/initialize`) loads both models; steady state ~17 GB RAM. The
   unit caps memory (`MemoryHigh=22G`, `MemoryMax=26G`) as a safety net.
+- **Reference photos (IP-Adapter FaceID):** the image-only view accepts one
+  headshot and puts that person's likeness into the generated image. Identity
+  comes from an **InsightFace `buffalo_l` embedding computed on the CPU**
+  (onnxruntime), NOT a CLIP image encoder in VRAM — that's what makes it fit the
+  6 GB card. Extra deps in `imagegen-env`: `insightface`, `onnxruntime`, `peft`;
+  weights `ip-adapter-faceid_sdxl.bin` + `..._lora.safetensors` in
+  `~/imagegen/models/ip_adapter/` (from `h94/IP-Adapter-FaceID`, not in git);
+  `buffalo_l` auto-downloads to `~/.insightface/`. **Why two SDXL pipes, one
+  resident at a time:** normal gen keeps `model_cpu_offload` (whole UNet on GPU,
+  ~20 s, fast) but FaceID's extra UNet weights don't fit that way — the ref pipe
+  uses `enable_sequential_cpu_offload` (streams weights, ~650 MB VRAM, ~50 s).
+  Both pipes resident *plus* the 12B chat peaked ~31 GB RSS (OOM). So the base
+  pipe and ref pipe **swap** (build one, drop the other; ~15 s rebuild only when
+  a session alternates normal↔reference) — one SDXL + chat stays ~17–18 GB.
+  Multi-person (two distinct faces) is a deliberate follow-up: basic FaceID
+  blends two embeddings into one face; distinct placement needs regional
+  attention masking.
 
 **Two hard guarantees (do not "optimize" away):**
 

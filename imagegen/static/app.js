@@ -365,13 +365,13 @@ function renderImageOnly() {
       <textarea id="image-negative" rows="2" placeholder="avoid in the image (optional - a sensible default is applied if empty)"></textarea>
       <label><input type="checkbox" id="image-assist"> prompt assist - the local LLM adds artistic
         direction (composition, lighting, style) to your idea first (+~15s)</label>
-      <label for="image-refs">reference photo(s) - optional, up to 2. One photo steers the
-        subject's look; with two, the FIRST person appears on the LEFT, the second on the
-        RIGHT. Headshots work best. Never stored.</label>
-      <input type="file" id="image-refs" accept="image/*" multiple>
-      <label for="image-ref-strength">reference strength: <span id="ref-strength-val">0.6</span>
+      <label for="image-refs">reference face - optional. A clear, front-facing headshot puts
+        that person's likeness into the image. Runs slower (~1 min, streams weights to fit
+        the card) and needs a detectable face. Never stored.</label>
+      <input type="file" id="image-refs" accept="image/*">
+      <label for="image-ref-strength">reference strength: <span id="ref-strength-val">0.7</span>
         (higher = closer likeness, but the prompt steers less)</label>
-      <input type="range" id="image-ref-strength" min="0.1" max="1.0" step="0.05" value="0.6">
+      <input type="range" id="image-ref-strength" min="0.1" max="1.0" step="0.05" value="0.7">
       <label for="image-quality">quality</label>
       <select id="image-quality">
         <option value="quick">quick (~15s)</option>
@@ -420,7 +420,7 @@ async function onImageSubmit(e) {
   try {
     const payload = { prompt, quality, assist };
     if (negRaw) payload.negative = negRaw;
-    const refFiles = Array.from($("image-refs").files || []).slice(0, 2);
+    const refFiles = Array.from($("image-refs").files || []).slice(0, 1);
     if (refFiles.length) {
       payload.refs = await Promise.all(refFiles.map(fileToB64));
       payload.ref_strength = parseFloat($("image-ref-strength").value);
