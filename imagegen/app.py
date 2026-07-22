@@ -1128,7 +1128,7 @@ async def image_only(request: Request):
         return result
     if _model_status != "ready":
         return JSONResponse({"error": "not initialized"}, status_code=503)
-    if image_pipe is None:
+    if image_pipe is None and ref_pipe is None:
         return JSONResponse(
             {"error": "images are off in GPU-chat mode - re-initialize in 'CPU chat + images'"},
             status_code=409)
