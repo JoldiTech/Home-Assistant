@@ -427,13 +427,24 @@ def _norm_name(s: str) -> str:
 
 def _extract_quoted(markdown: str) -> list[str]:
     """Product-ish quoted strings from the narrative half of the log (the
-    deterministic sections aren't part of the input here)."""
+    deterministic sections aren't part of the input here). Transcript garble
+    often lands as ONE quoted comma-list ("Munch's Blend, 4M, L'Oreal
+    Troubles") - the real product hiding inside never matches unless the list
+    is split, so components are extracted alongside the full string."""
     seen, out = set(), []
+
+    def _add(s: str):
+        s = s.strip().strip(",. ")
+        if len(s) >= 3 and not s.replace(".", "").replace("$", "").isdigit() \
+                and s.lower() not in seen:
+            seen.add(s.lower())
+            out.append(s)
+
     for q in re.findall(r'[""“"]([^""”"]{3,80})[""”"]', markdown):
-        q = q.strip().strip(",. ")
-        if q and not q.replace(".", "").replace("$", "").isdigit() and q.lower() not in seen:
-            seen.add(q.lower())
-            out.append(q)
+        _add(q)
+        if q.count(",") >= 1:
+            for part in q.split(","):
+                _add(part)
     return out
 
 
@@ -1093,7 +1104,14 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
     # sensitive-content links and strip personal-life/garble that slipped
     # through. Cheap on GPU (~seconds).
     _warn("redaction pass...")
-    return _gen(REDACT_TEMPLATE, f"Draft to clean:{catalog_notes}\n\n{draft}", 1800, temperature=0.1)
+    draft = _gen(REDACT_TEMPLATE, f"Draft to clean:{catalog_notes}\n\n{draft}", 1800, temperature=0.1)
+    # Second roll of the same pass: redaction is "return unchanged except
+    # removals", so re-running is near-idempotent and cheap (~seconds), and
+    # the 8B model's misses are roll-to-roll independent enough that a second
+    # look catches linkage it left in the first time (observed repeatedly:
+    # named person + health interest surviving a single pass).
+    _warn("redaction pass (second look)...")
+    return _gen(REDACT_TEMPLATE, f"Draft to clean:\n\n{draft}", 1800, temperature=0.1)
 
 
 # --- git ----------------------------------------------------------------------
