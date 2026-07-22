@@ -302,12 +302,16 @@ function renderInitState(st) {
     area.innerHTML = `
       <label for="chat-model-sel">chat model</label>
       <select id="chat-model-sel"></select>
+      <label for="image-model-sel">image model (used in CPU chat + images)</label>
+      <select id="image-model-sel"></select>
       <label for="chat-mode-sel">mode</label>
       <select id="chat-mode-sel"></select>
       <button id="init-btn">initialize system</button>
       ${errLine}
       <p id="chat-status">models aren't loaded yet - nothing uses memory until you start this</p>`;
     fillSelect($("chat-model-sel"), st.models || [st.chat_model], st.chat_model, (m) => m);
+    fillSelect($("image-model-sel"), st.image_models || [st.image_model], st.image_model,
+               (m) => m.replace(/\.safetensors$/, ""));
     fillSelect($("chat-mode-sel"), st.modes || ["cpu_images"], st.mode || "cpu_images",
                (m) => CHAT_MODE_LABELS[m] || m);
     $("init-btn").addEventListener("click", startInit);
@@ -333,6 +337,7 @@ async function checkInit() {
 async function startInit() {
   const st = await apiCall("/api/initialize", {
     chat_model: $("chat-model-sel") ? $("chat-model-sel").value : undefined,
+    image_model: $("image-model-sel") ? $("image-model-sel").value : undefined,
     chat_mode: $("chat-mode-sel") ? $("chat-mode-sel").value : undefined,
   });
   renderInitState(st);

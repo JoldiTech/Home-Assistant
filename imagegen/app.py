@@ -121,6 +121,10 @@ LLM_MODEL_PATH = os.environ.get(
 # CMAKE_ARGS="-DGGML_CUDA=off" --no-binary llama-cpp-python; the prebuilt CPU
 # wheels are musl-linked and won't load on glibc.)
 GGUF_DIR = Path(LLM_MODEL_PATH).parent
+# Image-model picker: any .safetensors in the models dir is a selectable SDXL
+# checkpoint at Initialize (parallel to the chat .gguf picker). All SDXL bases
+# run through the same cpu_offload path, so any of them fits the 6GB card.
+IMAGE_MODEL_DIR = Path(IMAGE_MODEL_PATH).parent
 CHAT_GPU_LAYERS = 0  # CPU-only in-process build ignores this; kept explicit
 
 # Two init modes, chosen at Initialize:
@@ -290,6 +294,7 @@ _model_status_lock = threading.Lock()
 _model_status = "cold"  # cold -> loading -> ready; error -> back to a cold-like retry
 _model_error = ""       # last load failure, surfaced to the picker so the user can retry
 _chat_selection = {"model": Path(LLM_MODEL_PATH).name, "mode": "cpu_images"}
+_image_selection = {"model": Path(IMAGE_MODEL_PATH).name}
 
 
 def _list_chat_models() -> list[str]:
@@ -299,11 +304,46 @@ def _list_chat_models() -> list[str]:
         return [Path(LLM_MODEL_PATH).name]
 
 
+def _list_image_models() -> list[str]:
+    """Selectable SDXL checkpoints: single-file *.safetensors in the models dir,
+    PLUS diffusers-format model folders (a subdir holding a model_index.json).
+    Most community SDXL models on HF ship as folders, so supporting both is what
+    makes the picker actually useful."""
+    try:
+        files = [f.name for f in IMAGE_MODEL_DIR.glob("*.safetensors")]
+        dirs = [d.name for d in IMAGE_MODEL_DIR.iterdir()
+                if d.is_dir() and (d / "model_index.json").exists()]
+        return sorted(files + dirs) or [Path(IMAGE_MODEL_PATH).name]
+    except OSError:
+        return [Path(IMAGE_MODEL_PATH).name]
+
+
+def _image_model_path() -> str:
+    return str(IMAGE_MODEL_DIR / _image_selection["model"])
+
+
+def _load_sdxl():
+    """Load the selected SDXL checkpoint, transparently handling both a single-
+    file checkpoint and a diffusers-format folder. Scheduler/VAE are swapped by
+    the callers, same for every base."""
+    sel = _image_model_path()
+    if os.path.isdir(sel):
+        try:
+            return StableDiffusionXLPipeline.from_pretrained(
+                sel, torch_dtype=torch.float16, use_safetensors=True, variant="fp16")
+        except Exception:
+            return StableDiffusionXLPipeline.from_pretrained(
+                sel, torch_dtype=torch.float16, use_safetensors=True)
+    return StableDiffusionXLPipeline.from_single_file(
+        sel, torch_dtype=torch.float16, use_safetensors=True)
+
+
 def _init_payload() -> dict:
     with _model_status_lock:
         status = _model_status
         err = _model_error
-    payload = {"status": status, "chat_model": _chat_selection["model"]}
+    payload = {"status": status, "chat_model": _chat_selection["model"],
+               "image_model": _image_selection["model"]}
     # Any state that isn't actively loading or ready is a state the user must
     # be able to (re)start from - so always ship the picker options there,
     # including 'error'. Otherwise a transient load failure strips the picker
@@ -315,6 +355,7 @@ def _init_payload() -> dict:
     payload["images"] = (image_pipe is not None or ref_pipe is not None)
     if status not in ("loading", "ready"):
         payload["models"] = _list_chat_models()
+        payload["image_models"] = _list_image_models()
         payload["modes"] = list(CHAT_MODES)
     if status == "error":
         payload["error"] = err
@@ -749,7 +790,7 @@ def _build_base_pipe():
     to kill the VAE-decode VRAM spike. Caller holds _gpu_lock."""
     print("loading SDXL checkpoint (GPU, fast path)...", flush=True)
     p = StableDiffusionXLPipeline.from_single_file(
-        IMAGE_MODEL_PATH, torch_dtype=torch.float16, use_safetensors=True)
+        _image_model_path(), torch_dtype=torch.float16, use_safetensors=True)
     p.scheduler = DPMSolverMultistepScheduler.from_config(
         p.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++")
     p.vae = AutoencoderTiny.from_pretrained("madebyollin/taesdxl", torch_dtype=torch.float16)
@@ -768,7 +809,7 @@ def _build_ref_pipe():
             raise ReferenceUnavailable("the reference-photo model isn't installed on this server")
     print("building FaceID reference pipeline...", flush=True)
     p = StableDiffusionXLPipeline.from_single_file(
-        IMAGE_MODEL_PATH, torch_dtype=torch.float16, use_safetensors=True)
+        _image_model_path(), torch_dtype=torch.float16, use_safetensors=True)
     p.scheduler = DPMSolverMultistepScheduler.from_config(
         p.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++")
     p.vae = AutoencoderTiny.from_pretrained("madebyollin/taesdxl", torch_dtype=torch.float16)
@@ -1337,6 +1378,9 @@ async def initialize(request: Request):
             model = body.get("chat_model")
             if model in _list_chat_models():
                 _chat_selection["model"] = model
+            img_model = body.get("image_model")
+            if img_model in _list_image_models():
+                _image_selection["model"] = img_model
             mode = body.get("chat_mode")
             if mode in CHAT_MODES:
                 _chat_selection["mode"] = mode
