@@ -49,6 +49,20 @@ raw transcript deleted
   record digest of the whole day (orders, tickets, calls) and appends references
   like *"(likely order #58212, $43.50 at 2:14pm)"* — only ever using ids that
   exist in the records, marking inferred links "likely".
+- **Catalog pass**: quoted product names are cross-checked against the real
+  catalog (the datalog `products` endpoint — 3dcart, the canonical list, with
+  live stock). A deterministic fuzzy matcher finds names that don't exist and
+  their closest real candidates; the LLM then adjudicates each as *misheard*
+  (corrected to the catalog spelling — "Munch's Blend" → "Monk's Blend"),
+  *real but not carried* (kept and tagged — premium unmet-demand signal), or
+  *garble* (dropped). This reaches exactly the names POS weaving can't:
+  out-of-stock requests never ring up, so they have no order line to correct
+  against. Whisper also gets a tea-vocabulary `hotwords` list so "pu-erh"
+  stops arriving as "poire" in the first place.
+- **Stock cross-check (deterministic)**: when a bullet claims something was
+  out of stock but the website shows stock, the contradiction itself is
+  flagged in code — `⚠ website shows in stock: …` — either the site is
+  overselling or the floor missed inventory, and both are worth knowing.
 - **Deterministic sections**: dollar figures, counts, names, and hours never
   pass through the LLM — they're rendered directly from the datalog JSON after
   redaction, so they can't be mangled or hallucinated.

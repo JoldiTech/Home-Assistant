@@ -282,6 +282,29 @@ names. Rules:
 - Change NOTHING else: no rewording, no adding or removing bullets.
 Output ONLY the annotated markdown log. /no_think"""
 
+CATALOG_FIX_SYSTEM = """You correct product names in a tea shop's draft \
+Captain's Log against the shop's REAL catalog (the website's product list). \
+The audio transcription mishears names, so the draft may quote products that \
+don't exist. You get a CANDIDATES table - each quoted name from the draft \
+that doesn't exactly match the catalog, with its closest real catalog names - \
+and the DRAFT.
+
+For each entry, exactly one of:
+- MISHEARD: the quoted name is clearly a garbled version of a candidate
+  ("Munch's Blend" -> "Monk's Blend") - replace it with the exact catalog
+  name everywhere it appears. If two candidates are plausible variants of
+  the same base product, use the shorter base name.
+- REAL BUT NOT CARRIED: no candidate is the same product, but the name is a
+  plausible real tea/product someone could ask for ("Lady Londonderry") -
+  keep it exactly as quoted and append " (not in our catalog)" at its first
+  mention. This is valuable unmet demand - never delete it.
+- GARBLE: not a plausible product at all ("4M, L'Oreal Troubles") - remove
+  just that item from its list/sentence; remove the whole bullet only if
+  nothing meaningful remains.
+
+Change NOTHING else: every other word, number, name, and line stays exactly.
+Output ONLY the corrected markdown log. /no_think"""
+
 REDACT_TEMPLATE = """You are a privacy redactor for a tea shop's operational \
 log. You are given a draft Captain's Log. Return it UNCHANGED except for the \
 removals below, then output the cleaned log in the same format.
@@ -381,6 +404,77 @@ def _fetch_business(env: dict, date_str: str) -> dict:
             params["detail"] = "1"
         biz[ep] = _datalog_get(env, ep, params)
     return biz
+
+
+PRODUCTS_CACHE = Path.home() / "captains_transcripts" / "products_cache.json"
+
+
+def _fetch_products(env: dict) -> list[dict]:
+    """The 3dcart catalog (canonical product list) - names + live stock. Fresh
+    fetch each run, falling back to the last good copy on disk so a dashboard
+    outage degrades to slightly-stale stock numbers, not a lost feature."""
+    data = _datalog_get(env, "products", {}) if env.get("DATALOG_API_TOKEN") else None
+    if data and data.get("products"):
+        try:
+            PRODUCTS_CACHE.parent.mkdir(exist_ok=True)
+            PRODUCTS_CACHE.write_text(json.dumps(data["products"]))
+        except OSError:
+            pass
+        return data["products"]
+    try:
+        cached = json.loads(PRODUCTS_CACHE.read_text())
+        _warn(f"products endpoint unavailable - using cached catalog ({len(cached)} items)")
+        return cached
+    except Exception:
+        _warn("no product catalog available - name cross-check skipped")
+        return []
+
+
+def _norm_name(s: str) -> str:
+    s = s.lower().replace("’", "'").replace("‘", "'")
+    s = re.sub(r"\s*\|\s*(bulk|organic)\s*$", "", s)
+    s = re.sub(r"\s*-\s*organic\s*$", "", s)
+    s = re.sub(r"[^a-z0-9 ]", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _extract_quoted(markdown: str) -> list[str]:
+    """Product-ish quoted strings from the narrative half of the log (the
+    deterministic sections aren't part of the input here)."""
+    seen, out = set(), []
+    for q in re.findall(r'[""“"]([^""”"]{3,80})[""”"]', markdown):
+        q = q.strip().strip(",. ")
+        if q and not q.replace(".", "").replace("$", "").isdigit() and q.lower() not in seen:
+            seen.add(q.lower())
+            out.append(q)
+    return out
+
+
+def _match_catalog(markdown: str, products: list[dict]) -> list[tuple[str, list[tuple[str, float]]]]:
+    """(quoted name, top catalog candidates with scores) for every quoted name
+    that is not an exact/near-exact catalog match. difflib on normalized names -
+    deterministic, and 20 quotes x 2.3k products is negligible."""
+    import difflib
+    norm_to_name: dict[str, str] = {}
+    for p in products:
+        n = _norm_name(p.get("name") or "")
+        # Variants normalize together ("X | Bulk", "X - Organic") - show the
+        # shortest original as the canonical spelling.
+        if n and (n not in norm_to_name or len(p["name"]) < len(norm_to_name[n])):
+            norm_to_name[n] = p["name"]
+    norms = list(norm_to_name)
+    mismatches = []
+    for q in _extract_quoted(markdown):
+        qn = _norm_name(q)
+        if not qn or qn in norm_to_name:
+            continue
+        scored = sorted(((difflib.SequenceMatcher(None, qn, n).ratio(), n) for n in norms),
+                        reverse=True)[:3]
+        if scored and scored[0][0] >= 0.96:
+            continue  # spelling-variant of a real product; not worth a pass
+        cands = [(norm_to_name[n], round(r, 2)) for r, n in scored if r >= 0.55]
+        mismatches.append((q, cands))
+    return mismatches
 
 
 # --- Slack staff chat ---------------------------------------------------------
@@ -542,6 +636,39 @@ def _context_block(biz: dict) -> str:
 
 
 _ANNOT_RE = re.compile(r"\s*\((?:likely\s+)?(order|ticket)\s*#([A-Za-z0-9\-]+)[^)]*\)")
+
+
+_UNAVAILABLE_RE = re.compile(
+    r"reorder|out of stock|sold out|unavailable|not available|wasn't available|"
+    r"didn't have|don't carry|not carried|ran out|restock", re.IGNORECASE)
+
+
+def _flag_stock_contradictions(markdown: str, products: list[dict]) -> str:
+    """Deterministic cross-check the user asked for: when the floor says a
+    product was out of stock but the website (3dcart, the canonical catalog)
+    shows stock, that mismatch is itself the finding - either the site is
+    overselling or the floor missed inventory. Appends the flag in code so the
+    stock number never passes through the LLM."""
+    if not products:
+        return markdown
+    stock: dict[str, float] = {}
+    for p in products:
+        n = _norm_name(p.get("name") or "")
+        if n:
+            stock[n] = max(stock.get(n, 0.0), float(p.get("stock") or 0))
+    out = []
+    for line in markdown.splitlines():
+        if line.lstrip().startswith("- ") and _UNAVAILABLE_RE.search(line) \
+                and "website shows" not in line:
+            flagged = []
+            for q in re.findall(r'[""“"]([^""”"]{3,80})[""”"]', line):
+                qn = _norm_name(q)
+                if stock.get(qn, 0) > 0:
+                    flagged.append(q)
+            if flagged:
+                line = line.rstrip() + " ⚠ website shows in stock: " + ", ".join(flagged)
+        out.append(line)
+    return "\n".join(out)
 
 
 def _cap_bullet_lists(markdown: str, cap: int = 6) -> str:
@@ -843,7 +970,7 @@ def _strip_think(text: str) -> str:
 
 
 def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
-               context_text: str = "") -> str:
+               context_text: str = "", products: list[dict] | None = None) -> str:
     _warn("loading summarizer...")
     # Prefer a clear card (fast GPU path); the layer-fallback below still
     # covers the case where the VRAM never frees up.
@@ -908,6 +1035,22 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
         _warn("correlation pass...")
         draft = _gen(CORRELATE_SYSTEM, f"RECORDS:\n{records}\n\nDRAFT:\n{draft}", 1800)
 
+    # Catalog pass: quoted product names that don't match the real (3dcart)
+    # catalog are either misheard audio, real-but-not-carried requests, or
+    # garble - the LLM adjudicates each against deterministic candidates. This
+    # is what fixes names the POS weave can't reach: out-of-stock requests
+    # never ring up, so they have no order line to correct against.
+    if products:
+        mismatches = _match_catalog(draft, products)
+        if mismatches:
+            table = "\n".join(
+                f'- "{q}" -> ' + ("; ".join(f"{name} ({score})" for name, score in cands)
+                                  if cands else "NO CLOSE MATCH")
+                for q, cands in mismatches
+            )
+            _warn(f"catalog pass: {len(mismatches)} unmatched product names...")
+            draft = _gen(CATALOG_FIX_SYSTEM, f"CANDIDATES:\n{table}\n\nDRAFT:\n{draft}", 1800)
+
     # Independent redaction pass: re-read the draft ONLY to break name-to-
     # sensitive-content links and strip personal-life/garble that slipped
     # through. Cheap on GPU (~seconds).
@@ -969,6 +1112,7 @@ def main():
     window_start = window_end - timedelta(days=1)
 
     biz = _fetch_business(env, date_str)
+    products = _fetch_products(env)
     slack_text, slack_names = _fetch_slack(env, window_start, window_end)
 
     transcript, log_path = _transcribe(date_str)
@@ -982,7 +1126,7 @@ def main():
     if have_speech:
         transcript = _weave_orders(transcript, biz.get("sales"), date_str)
         markdown = _summarize(transcript, day, slack_text, _records_index(biz),
-                              _context_block(biz))
+                              _context_block(biz), products)
     else:
         _warn(f"{date_str}: no speech captured - business sections only")
         markdown = (
@@ -995,6 +1139,7 @@ def main():
     markdown = markdown.replace("⟦", "").replace("⟧", "")
     markdown = _validate_annotations(markdown, biz)
     markdown = _cap_bullet_lists(markdown)
+    markdown = _flag_stock_contradictions(markdown, products)
     markdown = (markdown.rstrip() + "\n\n" + _business_sections(biz)
                 + "\n\n" + SOURCE_LINE)
     _commit_and_push(date_str, markdown, env)

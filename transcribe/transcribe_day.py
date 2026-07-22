@@ -44,6 +44,18 @@ END_HOUR = int(os.environ.get("TRANSCRIBE_END_HOUR", "20"))
 
 MAX_REPEAT = 2  # collapse a line repeated more than this many times in a row
 VAD_PARAMS = dict(threshold=0.6, min_silence_duration_ms=500)
+# Domain vocabulary injected into every decode window (hotwords work with
+# condition_on_previous_text=False; initial_prompt would only reach the first
+# window). Whisper mishears tea terms it doesn't know - "pu-erh" became "poire",
+# "Monk's" became "Munch's". Kept deliberately small: overstuffed hotwords
+# degrade decoding.
+HOTWORDS = (
+    "pu-erh, rooibos, honeybush, oolong, genmaicha, sencha, gyokuro, matcha, "
+    "hojicha, tulsi, yerba mate, guayusa, Nilgiri, Darjeeling, Assam, Keemun, "
+    "Ceylon, lapsang souchong, Earl Grey, Monk's Blend, silver needle, "
+    "white peony, Tieguanyin, masala chai, hibiscus, chamomile, elderberry, "
+    "lemongrass, tisane, Wenshan, tulsi Krishna, Rama, Vana"
+)
 _NOISE = {"[blank_audio]", "(blank_audio)", "[silence]", "[music]", "(music)", "you", "."}
 
 OUT_DIR = Path.home() / "captains_transcripts"
@@ -125,7 +137,7 @@ async def main():
         )
         segs, _ = model.transcribe(
             str(wav), language="en", vad_filter=True, vad_parameters=VAD_PARAMS,
-            condition_on_previous_text=False,
+            condition_on_previous_text=False, hotwords=HOTWORDS,
         )
         lines = []
         prev, run = None, 0
