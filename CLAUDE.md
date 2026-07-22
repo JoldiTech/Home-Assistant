@@ -350,10 +350,21 @@ deployed to `~/transcribe/` on the AI box and run as the
   `/config/captains_gh.token`) and emits `{"count", "content"}`. The **"Captain's
   Log"** view on the **DowntownControls** dashboard (`dashboard-downtowncontrols`)
   renders `content` (one collapsible `<details>` per day).
+- **Control panel (on-demand runs):** the trigger service exposes `POST /run`
+  (full log, reuses an existing transcript), `POST /transcribe` (audio-only —
+  stage the slow ~30 min step, build the log later in seconds), and `GET /status`
+  (LAN, unauthed: `{running, job, date, transcripts[]}` — which days have a raw
+  transcript on disk + what the one worker is doing; only one job runs at a time,
+  a second returns 409). HA surfaces this as `sensor.captains_status`
+  (`/share/captains_status.py` merges `/status` with the GitHub log listing into
+  a per-day Transcript/Log table), an `input_datetime.captains_target_date` day
+  picker, and two scripts (`captains_create_transcript`, `captains_create_log`)
+  wired to buttons on the Captain's Log dashboard view. rest_commands
+  `captains_log_run` / `captains_transcribe` POST to the box with the picked date.
 - **Manage:** on the AI box `sudo systemctl {status,restart} captains-transcribe.service`,
   `sudo journalctl -u captains-transcribe.service -f`; trigger a run by hand with
   `curl -X POST -H "X-Trigger-Token: <tok>" -d '{"date":"YYYY-MM-DD"}'
-  http://127.0.0.1:8190/run`. Fire the whole HA→box path with
+  http://127.0.0.1:8190/run` (or `/transcribe`). Fire the whole HA→box path with
   `POST /api/services/rest_command/captains_log_run`.
 - **Secrets:** AI box `/etc/nmteaco/captains.env` (trigger token, GitHub write
   PAT, `DATALOG_API_TOKEN`, optional `DASHBOARD_BASE_URL` / `SLACK_BOT_TOKEN` /
