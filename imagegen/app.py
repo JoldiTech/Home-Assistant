@@ -1084,6 +1084,58 @@ async def chat(request: Request):
                              headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"})
 
 
+def _history_index(body) -> int | None:
+    try:
+        return int(body.get("index"))
+    except (TypeError, ValueError):
+        return None
+
+
+@app.post("/api/chat-edit")
+async def chat_edit(request: Request):
+    """Edit one message in the conversation history by index. The edited text
+    becomes canonical - the model conditions on it on the next turn, not on what
+    it originally said. Editing an assistant reply is the way out of a merge
+    model's stuck 'conservative' register: trim the cautious sentence (or rewrite
+    the reply) and generation continues from your version. Role is preserved."""
+    result = _require_session(request)
+    if isinstance(result, JSONResponse):
+        return result
+    _token, state = result
+    body = _decrypt(await request.json())
+    idx = _history_index(body)
+    content = (body.get("content") or "").strip()[:8000]
+    if not content:
+        return JSONResponse({"error": "empty edit - use delete instead"}, status_code=400)
+    with _state_lock:
+        history = state["chat"]["history"]
+        if idx is None or not (0 <= idx < len(history)):
+            return JSONResponse({"error": "no such message"}, status_code=400)
+        history[idx]["content"] = content
+        hist = [dict(m) for m in history]
+    return JSONResponse(_encrypt({"history": hist}))
+
+
+@app.post("/api/chat-delete")
+async def chat_delete(request: Request):
+    """Delete one message from the conversation history by index. Use it to drop
+    the message where a merge model first flipped into refusal - removing it from
+    the context breaks the self-reinforcing loop that kept it stuck."""
+    result = _require_session(request)
+    if isinstance(result, JSONResponse):
+        return result
+    _token, state = result
+    body = _decrypt(await request.json())
+    idx = _history_index(body)
+    with _state_lock:
+        history = state["chat"]["history"]
+        if idx is None or not (0 <= idx < len(history)):
+            return JSONResponse({"error": "no such message"}, status_code=400)
+        del history[idx]
+        hist = [dict(m) for m in history]
+    return JSONResponse(_encrypt({"history": hist}))
+
+
 @app.post("/api/chat-image")
 async def chat_image(request: Request):
     """'Get image' in conversation mode: distill the scene from the last few

@@ -528,10 +528,104 @@ function appendGalleryImage(b64png) {
   img.scrollIntoView({ block: "end" });
 }
 
+// A finished message, with edit/delete controls. index = position in the
+// server-side history, so edits/deletes target the exact message the model
+// conditions on. Editing an assistant reply rewrites what the model "said" for
+// every future turn - the way out of a stuck merge-model register.
+function makeBubble(index, role, content) {
+  const div = document.createElement("div");
+  div.className = "msg " + role;
+  div.dataset.index = String(index);
+  const label = document.createElement("b");
+  label.textContent = role === "user" ? "you: " : "assistant: ";
+  div.appendChild(label);
+  const span = document.createElement("span");
+  span.className = "msg-text";
+  span.textContent = content;
+  div.appendChild(span);
+  const actions = document.createElement("span");
+  actions.className = "msg-actions";
+  actions.style.marginLeft = "0.6em";
+  actions.style.fontSize = "0.8em";
+  actions.style.opacity = "0.6";
+  const edit = document.createElement("a");
+  edit.href = "#"; edit.textContent = "edit";
+  edit.addEventListener("click", (e) => { e.preventDefault(); beginEdit(div, index); });
+  const del = document.createElement("a");
+  del.href = "#"; del.textContent = "delete";
+  del.addEventListener("click", (e) => { e.preventDefault(); onDeleteMessage(index); });
+  actions.append(edit, document.createTextNode(" · "), del);
+  div.appendChild(actions);
+  return div;
+}
+
+function renderTranscript(history) {
+  const t = $("transcript");
+  t.innerHTML = "";
+  (history || []).forEach((m, i) => t.appendChild(makeBubble(i, m.role, m.content)));
+  if (t.lastElementChild) t.lastElementChild.scrollIntoView({ block: "end" });
+}
+
+function beginEdit(div, index) {
+  if (div.querySelector(".msg-editor")) return;      // already editing
+  const span = div.querySelector(".msg-text");
+  const actions = div.querySelector(".msg-actions");
+  const ta = document.createElement("textarea");
+  ta.className = "msg-editor";
+  ta.value = span.textContent;
+  ta.rows = Math.min(12, Math.max(2, span.textContent.split("\n").length + 1));
+  ta.style.width = "100%";
+  span.style.display = "none";
+  if (actions) actions.style.display = "none";
+  const bar = document.createElement("div");
+  const save = document.createElement("button"); save.type = "button"; save.textContent = "save";
+  const cancel = document.createElement("button"); cancel.type = "button"; cancel.textContent = "cancel";
+  cancel.style.marginLeft = "0.4em";
+  bar.append(save, cancel);
+  div.append(ta, bar);
+  ta.focus();
+  const close = () => { ta.remove(); bar.remove(); span.style.display = ""; if (actions) actions.style.display = ""; };
+  cancel.addEventListener("click", close);
+  save.addEventListener("click", async () => {
+    const content = ta.value.trim();
+    if (!content) { $("chat-status").textContent = "empty - use delete instead"; return; }
+    save.disabled = true;
+    try {
+      const { history } = await apiCall("/api/chat-edit", { index, content });
+      renderTranscript(history);
+      $("chat-status").textContent = "";
+    } catch (err) {
+      save.disabled = false;
+      $("chat-status").textContent = err.message || "edit failed";
+    }
+  });
+}
+
+async function onDeleteMessage(index) {
+  try {
+    const { history } = await apiCall("/api/chat-delete", { index });
+    renderTranscript(history);
+    $("chat-status").textContent = "";
+  } catch (err) {
+    $("chat-status").textContent = err.message || "delete failed";
+  }
+}
+
+// Re-pull authoritative history and re-render, so freshly-streamed messages
+// pick up their real index + edit/delete controls.
+async function refreshTranscript() {
+  try {
+    const { history } = await apiCall("/api/state", { mode: currentMode });
+    renderTranscript(history || []);
+  } catch (err) {
+    // leave the live-streamed bubbles as-is
+  }
+}
+
 async function loadState(mode) {
   try {
     const { history, gallery } = await apiCall("/api/state", { mode });
-    for (const m of history) appendMessage(m.role, m.content);
+    renderTranscript(history || []);
     if (gallery) for (const img of gallery) appendGalleryImage(img);
   } catch (err) {
     // fresh conversation, nothing to load
@@ -595,6 +689,7 @@ async function onChatSubmit(e) {
   } finally {
     btn.disabled = false;
     if ($("stop-btn")) $("stop-btn").style.display = "none";
+    await refreshTranscript();   // replace live bubbles with indexed, editable ones
   }
 }
 
