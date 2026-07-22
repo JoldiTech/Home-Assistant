@@ -130,6 +130,12 @@ environment — they live only on the box itself:
   pipeline doesn't depend on that DNS mechanism at boot).
 - Verified: `curl -k -H "X-API-KEY: $PROTECT_API_KEY" https://$PROTECT_HOST/proxy/protect/integration/v1/meta/info`
   → `200 {"applicationVersion":"7.1.87"}`.
+- **The same key is console-level** — it also authorizes the **UniFi Network
+  Integration API** (`/proxy/network/integration/v1/...`, site id
+  `88f7af54-98f8-306a-a1c7-c9349722b1f6`, "Default"): device list (UDM Pro Max,
+  US-16-PoE-150W, AC Pro, U7 Pro Max), client list, stats, and ACTIONS
+  (device restart, per-port PoE power-cycle) — remote network remediation
+  without touching the rack.
 - Any future systemd service on this box should read secrets via
   `EnvironmentFile=/etc/nmteaco/protect.env`, never hardcode them.
 
