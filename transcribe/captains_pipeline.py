@@ -512,7 +512,11 @@ def _annotate_catalog(draft: str, review) -> tuple[str, int]:
     product, and no LLM roll can drop the correction."""
     n = 0
     for q, cands in review:
-        if cands and cands[0][1] >= 0.60 and f"{q} [likely" not in draft:
+        # len >= 5 keeps quoted ordinary words ("trap") from being treated as
+        # product names; 0.65 is calibrated so "Munch's Blend"->Monk's (0.66)
+        # annotates but supplier-name coincidences like "Star West"->Star
+        # Anise (0.63) don't.
+        if len(q) >= 5 and cands and cands[0][1] >= 0.65 and f"{q} [likely" not in draft:
             draft = draft.replace(q, f"{q} [likely {cands[0][0]}]", 1)
             n += 1
     return draft, n
