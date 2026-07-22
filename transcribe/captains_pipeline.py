@@ -311,14 +311,9 @@ Fix garbled product names from the lossy mic: if a "product" is not a
 plausible real tea/herb/ingredient/flavor, drop just that mention - register
 (POS/order-reference) product names are never garble.
 
-If a CATALOG NOTES section precedes the draft, each listed quoted name was
-checked against the shop's real product catalog and does not exist. For each:
-if it is clearly a misheard version of one of its "closest real products",
-replace it with that exact catalog name everywhere; if it is a plausible real
-tea/product we simply don't carry, keep it and append " (not in our catalog)"
-at its first mention - that is valuable unmet demand, never delete it; if it
-is not a plausible product at all, remove just that mention. Never copy the
-CATALOG NOTES section itself into the output.
+KEEP every "[likely ...]" annotation exactly as written - those are catalog
+cross-references added in code, and a name carrying one is a real product
+reference, never garble.
 
 Do not add commentary. Output ONLY the cleaned markdown log. /no_think"""
 
@@ -505,8 +500,22 @@ def _match_catalog(markdown: str, products: list[dict]):
         if top >= 0.72 and top - second >= 0.10:
             auto_fixes.append((q, norm_to_name[scored[0][1]]))
         else:
-            review.append((q, [norm_to_name[n] for s, n in scored if s >= 0.55]))
+            review.append((q, [(norm_to_name[n], round(s, 2)) for s, n in scored if s >= 0.55]))
     return auto_fixes, review
+
+
+def _annotate_catalog(draft: str, review) -> tuple[str, int]:
+    """Deterministic follow-through for the review tier: the 8B model ignored
+    'replace X with Y' instructions across repeated runs, so instead of asking
+    it to edit, append the best candidate inline - '"Munch's Blend [likely
+    Monk's Blend | Organic]"'. Nothing is destroyed, the reader sees the real
+    product, and no LLM roll can drop the correction."""
+    n = 0
+    for q, cands in review:
+        if cands and cands[0][1] >= 0.60 and f"{q} [likely" not in draft:
+            draft = draft.replace(q, f"{q} [likely {cands[0][0]}]", 1)
+            n += 1
+    return draft, n
 
 
 # --- Slack staff chat ---------------------------------------------------------
@@ -716,6 +725,56 @@ def _flag_stock_contradictions(markdown: str, products: list[dict]) -> str:
                 line = line.rstrip() + " ⚠ website shows in stock: " + ", ".join(flagged)
         out.append(line)
     return "\n".join(out)
+
+
+LINKAGE_SCAN_SYSTEM = """You check a tea shop's daily log for privacy LINKAGE \
+violations: a personal name tied IN THE SAME SENTENCE to health/medical topics \
+(pregnancy, allergies, cleansing, detox interests, conditions), personal-life \
+circumstances, or attributed feelings/opinions. A name on a purely operational \
+fact (a promise, hold, special order, sample request, staff hours) is FINE and \
+must NOT be listed.
+
+Output one line per violation, formatted exactly:
+NAME | the sentence fragment that pairs the name with sensitive content
+If there are none, output exactly: NONE
+Output nothing else - no commentary, no markdown. /no_think"""
+
+
+def _strip_linkage_names(markdown: str, findings: list[str]) -> str:
+    """Deterministic surgery for scanned linkage violations: drop the NAME from
+    the sentences that pair it with sensitive content, keeping the fact. The
+    LLM only detects (which it does reliably); code does the editing (which the
+    LLM repeatedly failed to apply itself)."""
+    for raw in findings:
+        if "|" not in raw:
+            continue
+        name, fragment = (s.strip().strip('"') for s in raw.split("|", 1))
+        if not name or len(name) > 40 or not name[0].isupper():
+            continue
+        pat_poss = re.compile(r"\b" + re.escape(name) + r"(?:'s|’s)\b")
+        pat = re.compile(r"\b" + re.escape(name) + r"\b")
+        # Scope the strip to the flagged sentence: an operational mention of
+        # the same name elsewhere ("asked for a hold on two tins") keeps its
+        # name per policy. Loose fragment match (first words, normalized);
+        # if the fragment can't be located, strip everywhere - privacy wins
+        # over precision when in doubt.
+        frag_key = _norm_name(" ".join(fragment.split()[:5]))
+        lines = markdown.splitlines()
+        hits = [i for i, l in enumerate(lines)
+                if pat.search(l) and frag_key and frag_key in _norm_name(l)]
+        targets = set(hits) if hits else {i for i, l in enumerate(lines) if pat.search(l)}
+        for i in targets:
+            line = lines[i]
+            if line.startswith(("#", "**")):
+                continue
+            new = pat_poss.sub("a customer's", line)
+            new = pat.sub("a customer", new)
+            new = re.sub(r"(^|[.!?]\s+|^- )a customer", lambda m: m.group(1) + "A customer", new)
+            if new != line:
+                _warn(f"linkage break: removed name '{name}' from a sentence")
+            lines[i] = new
+        markdown = "\n".join(lines)
+    return markdown
 
 
 def _cap_bullet_lists(markdown: str, cap: int = 6) -> str:
@@ -1088,30 +1147,31 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
     # This reaches the names the POS weave can't: out-of-stock requests never
     # ring up, so they have no order line to correct against. Ambiguous names
     # ride into the redaction pass below as CATALOG NOTES.
-    catalog_notes = ""
     if products:
         auto_fixes, review = _match_catalog(draft, products)
         for q, name in auto_fixes:
             _warn(f"catalog fix: \"{q}\" -> \"{name}\"")
             draft = draft.replace(q, name)
-        if review:
-            catalog_notes = "\n\nCATALOG NOTES (quoted names not in our catalog):\n" + "\n".join(
-                f'- "{q}"' + (f" - closest real products: {', '.join(c)}" if c else " - nothing similar")
-                for q, c in review
-            )
+        draft, n_annotated = _annotate_catalog(draft, review)
+        if n_annotated:
+            _warn(f"catalog: annotated {n_annotated} likely-match names")
 
     # Independent redaction pass: re-read the draft ONLY to break name-to-
     # sensitive-content links and strip personal-life/garble that slipped
     # through. Cheap on GPU (~seconds).
     _warn("redaction pass...")
-    draft = _gen(REDACT_TEMPLATE, f"Draft to clean:{catalog_notes}\n\n{draft}", 1800, temperature=0.1)
-    # Second roll of the same pass: redaction is "return unchanged except
-    # removals", so re-running is near-idempotent and cheap (~seconds), and
-    # the 8B model's misses are roll-to-roll independent enough that a second
-    # look catches linkage it left in the first time (observed repeatedly:
-    # named person + health interest surviving a single pass).
-    _warn("redaction pass (second look)...")
-    return _gen(REDACT_TEMPLATE, f"Draft to clean:\n\n{draft}", 1800, temperature=0.1)
+    draft = _gen(REDACT_TEMPLATE, f"Draft to clean:\n\n{draft}", 1800, temperature=0.1)
+
+    # Linkage guard, detect-then-surgery: whole-document editing is exactly
+    # what this 8B keeps failing at (a named person's health interest survived
+    # repeated redaction rolls), but LISTING violations is a small structured
+    # task it handles. The model detects; code strips the name.
+    _warn("linkage scan...")
+    scan = _gen(LINKAGE_SCAN_SYSTEM, f"Log to check:\n\n{draft}", 400, temperature=0.1)
+    findings = [l for l in scan.splitlines() if "|" in l]
+    if findings:
+        draft = _strip_linkage_names(draft, findings)
+    return draft
 
 
 # --- git ----------------------------------------------------------------------
