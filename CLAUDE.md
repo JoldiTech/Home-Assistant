@@ -371,9 +371,15 @@ only** (SDXL). Source of truth is `imagegen/` in this repo (`app.py`,
 `static/{index.html,app.js}`, `imagegen.service`); deployed to `~/imagegen/` on
 the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
 
-- **Models (not in git):** image = JuggernautXL Ragnarok (SDXL) at
-  `~/imagegen/models/juggernautXL_ragnarok.safetensors` (6.6 GB, re-download
-  from Civitai); chat = `Gemma-4-12B-OBLITERATED.Q4_K_M.gguf` (~7.4 GB, from
+- **Models (not in git):** image models live in `~/imagegen/models/` and are
+  **selectable at Initialize** (image-model picker, parallel to the chat picker).
+  `_list_image_models()` enumerates both single-file `*.safetensors` checkpoints
+  AND diffusers-format model folders (a subdir with `model_index.json`), and
+  `_load_sdxl()` branches `from_single_file` vs `from_pretrained` — so adding a
+  model is just dropping the file/folder in. Currently: JuggernautXL Ragnarok
+  (`juggernautXL_ragnarok.safetensors`, 6.6 GB, from Civitai) and RealVisXL V5.0
+  (`RealVisXL_V5.0.safetensors`, ~6.9 GB, from `SG161222/RealVisXL_V5.0` on HF).
+  chat = `Gemma-4-12B-OBLITERATED.Q4_K_M.gguf` (~7.4 GB, from
   `mradermacher/Gemma-4-12B-OBLITERATED-GGUF`) via `llama-cpp-python`, **CPU-only**
   (`n_gpu_layers=0`) so it never contends with SDXL for the 6 GB VRAM. Install
   llama-cpp-python with `--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu`
