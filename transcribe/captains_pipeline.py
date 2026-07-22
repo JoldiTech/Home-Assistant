@@ -282,28 +282,6 @@ names. Rules:
 - Change NOTHING else: no rewording, no adding or removing bullets.
 Output ONLY the annotated markdown log. /no_think"""
 
-CATALOG_FIX_SYSTEM = """You correct product names in a tea shop's draft \
-Captain's Log against the shop's REAL catalog (the website's product list). \
-The audio transcription mishears names, so the draft may quote products that \
-don't exist. You get a CANDIDATES table - each quoted name from the draft \
-that doesn't exactly match the catalog, with its closest real catalog names - \
-and the DRAFT.
-
-For each entry, exactly one of:
-- MISHEARD: the quoted name is clearly a garbled version of a candidate
-  ("Munch's Blend" -> "Monk's Blend") - replace it with the exact catalog
-  name everywhere it appears. If two candidates are plausible variants of
-  the same base product, use the shorter base name.
-- REAL BUT NOT CARRIED: no candidate is the same product, but the name is a
-  plausible real tea/product someone could ask for ("Lady Londonderry") -
-  keep it exactly as quoted and append " (not in our catalog)" at its first
-  mention. This is valuable unmet demand - never delete it.
-- GARBLE: not a plausible product at all ("4M, L'Oreal Troubles") - remove
-  just that item from its list/sentence; remove the whole bullet only if
-  nothing meaningful remains.
-
-Change NOTHING else: every other word, number, name, and line stays exactly.
-Output ONLY the corrected markdown log. /no_think"""
 
 REDACT_TEMPLATE = """You are a privacy redactor for a tea shop's operational \
 log. You are given a draft Captain's Log. Return it UNCHANGED except for the \
@@ -332,6 +310,15 @@ KEEP every id / dollar amount / time in parenthetical record references like
 Fix garbled product names from the lossy mic: if a "product" is not a
 plausible real tea/herb/ingredient/flavor, drop just that mention - register
 (POS/order-reference) product names are never garble.
+
+If a CATALOG NOTES section precedes the draft, each listed quoted name was
+checked against the shop's real product catalog and does not exist. For each:
+if it is clearly a misheard version of one of its "closest real products",
+replace it with that exact catalog name everywhere; if it is a plausible real
+tea/product we simply don't carry, keep it and append " (not in our catalog)"
+at its first mention - that is valuable unmet demand, never delete it; if it
+is not a plausible product at all, remove just that mention. Never copy the
+CATALOG NOTES section itself into the output.
 
 Do not add commentary. Output ONLY the cleaned markdown log. /no_think"""
 
@@ -450,11 +437,7 @@ def _extract_quoted(markdown: str) -> list[str]:
     return out
 
 
-def _match_catalog(markdown: str, products: list[dict]) -> list[tuple[str, list[tuple[str, float]]]]:
-    """(quoted name, top catalog candidates with scores) for every quoted name
-    that is not an exact/near-exact catalog match. difflib on normalized names -
-    deterministic, and 20 quotes x 2.3k products is negligible."""
-    import difflib
+def _catalog_index(products: list[dict]) -> dict[str, str]:
     norm_to_name: dict[str, str] = {}
     for p in products:
         n = _norm_name(p.get("name") or "")
@@ -462,19 +445,57 @@ def _match_catalog(markdown: str, products: list[dict]) -> list[tuple[str, list[
         # shortest original as the canonical spelling.
         if n and (n not in norm_to_name or len(p["name"]) < len(norm_to_name[n])):
             norm_to_name[n] = p["name"]
+    return norm_to_name
+
+
+def _match_catalog(markdown: str, products: list[dict]):
+    """Split the draft's unknown quoted product names into deterministic
+    auto-fixes and cases needing judgment.
+
+    Scoring is the mean of full-string similarity and distinct-head similarity
+    (shared trailing tokens stripped): "Munch's Blend" vs "Monk's Blend" is
+    close on BOTH, while "French Blend" only looks close because of the shared
+    " Blend" tail - the head comparison kills that false positive. A clear
+    winner becomes an auto-fix applied in code (the 8B model applying its own
+    replacements proved unreliable); everything else goes to the redaction
+    pass with candidates attached.
+
+    Returns (auto_fixes: [(quoted, catalog_name)], review: [(quoted, [names])]).
+    """
+    import difflib
+
+    def ratio(a: str, b: str) -> float:
+        return difflib.SequenceMatcher(None, a, b).ratio()
+
+    def head_score(qa: str, qb: str) -> float:
+        ta, tb = qa.split(), qb.split()
+        while ta and tb and ta[-1] == tb[-1]:
+            ta.pop(); tb.pop()
+        if not ta and not tb:
+            return 1.0
+        return ratio(" ".join(ta), " ".join(tb))
+
+    norm_to_name = _catalog_index(products)
     norms = list(norm_to_name)
-    mismatches = []
+    auto_fixes, review = [], []
     for q in _extract_quoted(markdown):
         qn = _norm_name(q)
         if not qn or qn in norm_to_name:
             continue
-        scored = sorted(((difflib.SequenceMatcher(None, qn, n).ratio(), n) for n in norms),
-                        reverse=True)[:3]
-        if scored and scored[0][0] >= 0.96:
-            continue  # spelling-variant of a real product; not worth a pass
-        cands = [(norm_to_name[n], round(r, 2)) for r, n in scored if r >= 0.55]
-        mismatches.append((q, cands))
-    return mismatches
+        scored = sorted(
+            (((ratio(qn, n) + head_score(qn, n)) / 2, n) for n in norms),
+            reverse=True,
+        )[:3]
+        if scored and scored[0][0] >= 0.93:
+            auto_fixes.append((q, norm_to_name[scored[0][1]]))
+            continue
+        top = scored[0][0] if scored else 0.0
+        second = scored[1][0] if len(scored) > 1 else 0.0
+        if top >= 0.72 and top - second >= 0.10:
+            auto_fixes.append((q, norm_to_name[scored[0][1]]))
+        else:
+            review.append((q, [norm_to_name[n] for s, n in scored if s >= 0.55]))
+    return auto_fixes, review
 
 
 # --- Slack staff chat ---------------------------------------------------------
@@ -652,19 +673,34 @@ def _flag_stock_contradictions(markdown: str, products: list[dict]) -> str:
     if not products:
         return markdown
     stock: dict[str, float] = {}
+    display: dict[str, str] = {}
     for p in products:
         n = _norm_name(p.get("name") or "")
         if n:
             stock[n] = max(stock.get(n, 0.0), float(p.get("stock") or 0))
+            if n not in display or len(p["name"]) < len(display[n]):
+                display[n] = p["name"]
+    # The model doesn't reliably quote product names in bullets, so match
+    # catalog names by word boundary in the normalized line too. Longest-first
+    # so "monks grenadine blend" claims its words before "monks blend" can.
+    boundary_names = sorted((n for n in stock if len(n) >= 8), key=len, reverse=True)
     out = []
     for line in markdown.splitlines():
         if line.lstrip().startswith("- ") and _UNAVAILABLE_RE.search(line) \
                 and "website shows" not in line:
-            flagged = []
+            flagged, seen_norms = [], set()
             for q in re.findall(r'[""“"]([^""”"]{3,80})[""”"]', line):
                 qn = _norm_name(q)
-                if stock.get(qn, 0) > 0:
+                if stock.get(qn, 0) > 0 and qn not in seen_norms:
+                    seen_norms.add(qn)
                     flagged.append(q)
+            nline = _norm_name(line)
+            for n in boundary_names:
+                if n in seen_norms or any(n in s for s in seen_norms):
+                    continue
+                if re.search(r"\b" + re.escape(n) + r"\b", nline) and stock[n] > 0:
+                    seen_norms.add(n)
+                    flagged.append(display[n])
             if flagged:
                 line = line.rstrip() + " ⚠ website shows in stock: " + ", ".join(flagged)
         out.append(line)
@@ -1000,10 +1036,10 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
         slack_block += f"\n\n{context_text}"
     INPUT_BUDGET = SUMMARIZER_CTX - 2600 - _tok(slack_block)  # room for system + template + output
 
-    def _gen(system, user, max_tokens):
+    def _gen(system, user, max_tokens, temperature=0.3):
         out = llm.create_chat_completion(
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            max_tokens=max_tokens, temperature=0.3, top_p=0.9, repeat_penalty=1.1,
+            max_tokens=max_tokens, temperature=temperature, top_p=0.9, repeat_penalty=1.1,
         )
         return _strip_think(out["choices"][0]["message"]["content"])
 
@@ -1033,29 +1069,31 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
         while _tok(records) > SUMMARIZER_CTX - 3000 and "\n" in records:
             records = records.rsplit("\n", max(1, records.count("\n") // 4))[0]
         _warn("correlation pass...")
-        draft = _gen(CORRELATE_SYSTEM, f"RECORDS:\n{records}\n\nDRAFT:\n{draft}", 1800)
+        draft = _gen(CORRELATE_SYSTEM, f"RECORDS:\n{records}\n\nDRAFT:\n{draft}", 1800, temperature=0.1)
 
-    # Catalog pass: quoted product names that don't match the real (3dcart)
-    # catalog are either misheard audio, real-but-not-carried requests, or
-    # garble - the LLM adjudicates each against deterministic candidates. This
-    # is what fixes names the POS weave can't reach: out-of-stock requests
-    # never ring up, so they have no order line to correct against.
+    # Catalog check: quoted product names that don't exist in the real (3dcart)
+    # catalog. Clear mishears are corrected HERE, in code - string replacement
+    # is exact and the 8B model applying its own replacements proved unreliable.
+    # This reaches the names the POS weave can't: out-of-stock requests never
+    # ring up, so they have no order line to correct against. Ambiguous names
+    # ride into the redaction pass below as CATALOG NOTES.
+    catalog_notes = ""
     if products:
-        mismatches = _match_catalog(draft, products)
-        if mismatches:
-            table = "\n".join(
-                f'- "{q}" -> ' + ("; ".join(f"{name} ({score})" for name, score in cands)
-                                  if cands else "NO CLOSE MATCH")
-                for q, cands in mismatches
+        auto_fixes, review = _match_catalog(draft, products)
+        for q, name in auto_fixes:
+            _warn(f"catalog fix: \"{q}\" -> \"{name}\"")
+            draft = draft.replace(q, name)
+        if review:
+            catalog_notes = "\n\nCATALOG NOTES (quoted names not in our catalog):\n" + "\n".join(
+                f'- "{q}"' + (f" - closest real products: {', '.join(c)}" if c else " - nothing similar")
+                for q, c in review
             )
-            _warn(f"catalog pass: {len(mismatches)} unmatched product names...")
-            draft = _gen(CATALOG_FIX_SYSTEM, f"CANDIDATES:\n{table}\n\nDRAFT:\n{draft}", 1800)
 
     # Independent redaction pass: re-read the draft ONLY to break name-to-
     # sensitive-content links and strip personal-life/garble that slipped
     # through. Cheap on GPU (~seconds).
     _warn("redaction pass...")
-    return _gen(REDACT_TEMPLATE, f"Draft to clean:\n\n{draft}", 1800)
+    return _gen(REDACT_TEMPLATE, f"Draft to clean:{catalog_notes}\n\n{draft}", 1800, temperature=0.1)
 
 
 # --- git ----------------------------------------------------------------------
