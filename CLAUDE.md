@@ -83,6 +83,46 @@ authorized on both machines) — only the Access layer differs per box.
 Connect with `ssh aibox` (set up by the same SessionStart hook / Setup script as
 `ssh homeassistant`).
 
+**Networking & power (hard-won facts — verify, don't assume):**
+
+- **LAN addresses:** AI box = `192.168.22.6` (DHCP reservation + the same address
+  configured statically in `/etc/netplan/55-lan-static-fallback.yaml`, so its LAN
+  identity survives a dead UniFi DHCP). **HA Green = `192.168.22.254`** (NOT .4;
+  its MAC OUI `20:f8:3b` is easily mis-read as Arris). UniFi console/gateway/
+  Protect = `192.168.22.1`.
+- **Dual WAN:** primary = UniFi LAN → T-Mobile (egress `172.59.x`). Backup = USB
+  AX88179 dongle `enx00051ba3cee1` → AT&T ISP box LAN (`192.168.1.x`, gateway
+  `.254`, egress `99.x`), netplan `60-usb-wan-backup.yaml`: metric 700, IPv6
+  deliberately disabled (its RA would siphon dual-stack traffic during normal
+  operation). `wan-failover.service` health-checks the primary and swaps in a
+  metric-50 override only while the primary is genuinely dead; `usb-wan-guard`
+  (nftables) drops unsolicited inbound on the dongle. All remote access is
+  outbound Cloudflare tunnels, so failover re-homes SSH/Chloe automatically —
+  proven live. **LAN routes never depend on the default route**: even failed
+  over, the box still reaches HA/console/cameras via the connected route.
+- **UPS:** CyberPower CP1500PFCLCDa on USB, NUT (`upsc cyberpower`), shuts the
+  box down at 50% charge / 10 min runtime (on battery only) to leave the rest
+  of the battery for cameras + network gear. HA integration "NUT" shows it
+  (`sensor.cyberpower_*`); `script.wake_ai_box` sends WoL (MAC
+  `a8:5e:45:e6:62:1f`) to restart the box after an outage shutdown, since the
+  UPS never lets the PSU see AC drop. WoL persisted via `wol-enable.service`.
+- **Bulk downloads ride the backup line:** `via-att <command>` on the box runs
+  anything with egress pinned to the AT&T dongle (dedicated `dl` user +
+  uidrange ip rule -> table 107, asserted by `dl-route.service` at boot and a
+  networkd-dispatcher hook after any netplan/link event — netplan apply
+  flushes table 107 and would otherwise silently fall back to the store WAN).
+  ~95 Mbps measured to HuggingFace. Use it for every model download so the
+  store's T-Mobile line never feels it: `via-att curl -LO <url>`. /srv/dl is
+  the dl user's group-writable staging dir. Dongle MTU is pinned to **1430**
+  (probed: 1500/1452 drop with DF on AT&T Internet Air — a PMTUD blackhole
+  that strangles bulk TCP against hosts that filter ICMP).
+- **Minimal-image gotcha:** this box shipped WITHOUT `ping`, `iptables`,
+  `traceroute` (now installed: iputils-ping/arping, traceroute, mtr, tcpdump,
+  nftables). A missing tool exits 127, which reads as "host down" in sloppy
+  scripts/checks — the wan-failover watchdog explicitly refuses to act on
+  exec-failure exit codes for exactly this reason. Never diagnose "network
+  down" without confirming the diagnostic tool itself ran.
+
 **Python ML stack** lives in a venv at `~/transcribe-env` on the box (activate with
 `source ~/transcribe-env/bin/activate`): `torch` (CUDA build, confirmed working on
 the RTX 2060), `faster-whisper`, `demucs`, `nemo_toolkit[asr]` (Parakeet). This is
@@ -100,6 +140,20 @@ environment — they live only on the box itself:
   pipeline doesn't depend on that DNS mechanism at boot).
 - Verified: `curl -k -H "X-API-KEY: $PROTECT_API_KEY" https://$PROTECT_HOST/proxy/protect/integration/v1/meta/info`
   → `200 {"applicationVersion":"7.1.87"}`.
+- **The same key is console-level** — it also authorizes the **UniFi Network
+  Integration API** (`/proxy/network/integration/v1/...`, site id
+  `88f7af54-98f8-306a-a1c7-c9349722b1f6`, "Default"): device list (UDM Pro Max,
+  US-16-PoE-150W, AC Pro, U7 Pro Max), client list, stats, and ACTIONS
+  (device restart, per-port PoE power-cycle) — remote network remediation
+  without touching the rack. **It ALSO works on the legacy admin API**
+  (`/proxy/network/api/s/default/...` — stat/health, stat/device), which is
+  where WAN detail lives that the integration API omits.
+- **Store dual-WAN (UDM Pro Max):** WAN1 eth8 = AT&T Internet Air (via the
+  same AT&T box the AI-box dongle uses, `192.168.1.x`); WAN2 eth7 = T-Mobile
+  (`192.168.12.x`, egress `172.59.x`). Both monitored by the UDM; failover is
+  automatic. After a full rack power-cycle the UDM may sit on WAN2 without
+  failing back unless failback is enabled. UniFi Talk is installed but has NO
+  integration API - its endpoints reject API keys (admin session only).
 - Any future systemd service on this box should read secrets via
   `EnvironmentFile=/etc/nmteaco/protect.env`, never hardcode them.
 
@@ -324,11 +378,22 @@ deployed to `~/transcribe/` on the AI box and run as the
   Integrations API, creds from `/etc/nmteaco/protect.env`) — no HA in the audio
   path. `condition_on_previous_text=False` + strict VAD to avoid hallucination
   loops.
+- **Business data:** the pipeline also pulls the **6pm–6pm MT business day**
+  (log for date D = 6pm D-1 → 6pm D) from the dashboard's **datalog API**
+  (`/dashboard/tools/datalog/{sales,shipping,support,calls,texts,timeclock}.php`,
+  bearer `DATALOG_API_TOKEN`) plus Slack staff chat. In-store POS orders are
+  woven into the transcript by timestamp (`[14:14] ⟦POS $43.50 — Earl Grey ×1⟧`)
+  so the summarizer can tie conversations to actual sales; dollar/count sections
+  are appended deterministically (never through the LLM). All fetches fail soft.
+  Full design: `captains_log/README.md`.
 - **Summarizer:** `Qwen3-8B-Q4_K_M.gguf` (`~/transcribe/models/`, not in git) via
   llama-cpp-python (CUDA), ~30 GPU layers with a `[30, 20, 0]` fallback chain so
   the job still finishes (slower) if Chloe is holding VRAM. Timestamps are
   compacted to hourly markers + hierarchical chunk→notes→merge so a full day fits
-  the context, then a redaction pass strips names/personal-life/garbled products.
+  the context. A **correlation pass** then links draft bullets to specific
+  order/ticket/call ids from the day's records, and a redaction pass strips
+  names/personal-life/garble — **audio-derived content only**; names from
+  structured sources (Slack, tickets, timeclock, POS references) stay.
 - **Output:** one Markdown day-file `captains_log/YYYY-MM-DD.md` pushed to the
   **`captains-log` branch** of this repo (persistent clone `~/ha-captains-repo`,
   auth via a fine-grained PAT in `/etc/nmteaco/captains.env`). The transcription
@@ -339,14 +404,27 @@ deployed to `~/transcribe/` on the AI box and run as the
   `/config/captains_gh.token`) and emits `{"count", "content"}`. The **"Captain's
   Log"** view on the **DowntownControls** dashboard (`dashboard-downtowncontrols`)
   renders `content` (one collapsible `<details>` per day).
+- **Control panel (on-demand runs):** the trigger service exposes `POST /run`
+  (full log, reuses an existing transcript), `POST /transcribe` (audio-only —
+  stage the slow ~30 min step, build the log later in seconds), and `GET /status`
+  (LAN, unauthed: `{running, job, date, transcripts[]}` — which days have a raw
+  transcript on disk + what the one worker is doing; only one job runs at a time,
+  a second returns 409). HA surfaces this as `sensor.captains_status`
+  (`/share/captains_status.py` merges `/status` with the GitHub log listing into
+  a per-day Transcript/Log table), an `input_datetime.captains_target_date` day
+  picker, and two scripts (`captains_create_transcript`, `captains_create_log`)
+  wired to buttons on the Captain's Log dashboard view. rest_commands
+  `captains_log_run` / `captains_transcribe` POST to the box with the picked date.
 - **Manage:** on the AI box `sudo systemctl {status,restart} captains-transcribe.service`,
   `sudo journalctl -u captains-transcribe.service -f`; trigger a run by hand with
   `curl -X POST -H "X-Trigger-Token: <tok>" -d '{"date":"YYYY-MM-DD"}'
-  http://127.0.0.1:8190/run`. Fire the whole HA→box path with
+  http://127.0.0.1:8190/run` (or `/transcribe`). Fire the whole HA→box path with
   `POST /api/services/rest_command/captains_log_run`.
-- **Secrets:** AI box `/etc/nmteaco/captains.env` (trigger token + GitHub write
-  PAT); HA `secrets.yaml` `aibox_trigger_token` + `/config/captains_gh.token`
-  (GitHub read PAT). None are committed.
+- **Secrets:** AI box `/etc/nmteaco/captains.env` (trigger token, GitHub write
+  PAT, `DATALOG_API_TOKEN`, optional `DASHBOARD_BASE_URL` / `SLACK_BOT_TOKEN` /
+  `SLACK_CHANNELS`); HA `secrets.yaml` `aibox_trigger_token` +
+  `/config/captains_gh.token` (GitHub read PAT). The datalog token's other half
+  lives in the dashboard's `/home/nmteaco/.env`. None are committed.
 
 ### Chloe / ephemeral generation tool (AI box)
 
@@ -358,9 +436,15 @@ only** (SDXL). Source of truth is `imagegen/` in this repo (`app.py`,
 `static/{index.html,app.js}`, `imagegen.service`); deployed to `~/imagegen/` on
 the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
 
-- **Models (not in git):** image = JuggernautXL Ragnarok (SDXL) at
-  `~/imagegen/models/juggernautXL_ragnarok.safetensors` (6.6 GB, re-download
-  from Civitai); chat = `Gemma-4-12B-OBLITERATED.Q4_K_M.gguf` (~7.4 GB, from
+- **Models (not in git):** image models live in `~/imagegen/models/` and are
+  **selectable at Initialize** (image-model picker, parallel to the chat picker).
+  `_list_image_models()` enumerates both single-file `*.safetensors` checkpoints
+  AND diffusers-format model folders (a subdir with `model_index.json`), and
+  `_load_sdxl()` branches `from_single_file` vs `from_pretrained` — so adding a
+  model is just dropping the file/folder in. Currently: JuggernautXL Ragnarok
+  (`juggernautXL_ragnarok.safetensors`, 6.6 GB, from Civitai) and RealVisXL V5.0
+  (`RealVisXL_V5.0.safetensors`, ~6.9 GB, from `SG161222/RealVisXL_V5.0` on HF).
+  chat = `Gemma-4-12B-OBLITERATED.Q4_K_M.gguf` (~7.4 GB, from
   `mradermacher/Gemma-4-12B-OBLITERATED-GGUF`) via `llama-cpp-python`, **CPU-only**
   (`n_gpu_layers=0`) so it never contends with SDXL for the 6 GB VRAM. Install
   llama-cpp-python with `--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu`
@@ -368,6 +452,23 @@ the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
 - **Lazy load:** nothing loads at startup (~700 MB cold). The **Initialize**
   button (`/api/initialize`) loads both models; steady state ~17 GB RAM. The
   unit caps memory (`MemoryHigh=22G`, `MemoryMax=26G`) as a safety net.
+- **Reference photos (IP-Adapter FaceID):** the image-only view accepts one
+  headshot and puts that person's likeness into the generated image. Identity
+  comes from an **InsightFace `buffalo_l` embedding computed on the CPU**
+  (onnxruntime), NOT a CLIP image encoder in VRAM — that's what makes it fit the
+  6 GB card. Extra deps in `imagegen-env`: `insightface`, `onnxruntime`, `peft`;
+  weights `ip-adapter-faceid_sdxl.bin` + `..._lora.safetensors` in
+  `~/imagegen/models/ip_adapter/` (from `h94/IP-Adapter-FaceID`, not in git);
+  `buffalo_l` auto-downloads to `~/.insightface/`. **Why two SDXL pipes, one
+  resident at a time:** normal gen keeps `model_cpu_offload` (whole UNet on GPU,
+  ~20 s, fast) but FaceID's extra UNet weights don't fit that way — the ref pipe
+  uses `enable_sequential_cpu_offload` (streams weights, ~650 MB VRAM, ~50 s).
+  Both pipes resident *plus* the 12B chat peaked ~31 GB RSS (OOM). So the base
+  pipe and ref pipe **swap** (build one, drop the other; ~15 s rebuild only when
+  a session alternates normal↔reference) — one SDXL + chat stays ~17–18 GB.
+  Multi-person (two distinct faces) is a deliberate follow-up: basic FaceID
+  blends two embeddings into one face; distinct placement needs regional
+  attention masking.
 
 **Two hard guarantees (do not "optimize" away):**
 

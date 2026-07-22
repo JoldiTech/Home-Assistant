@@ -8,12 +8,19 @@ Design constraints (deliberate, do not "fix"):
   - Nothing is ever written to disk. All state - login sessions, chat
     history, generated images - lives only in this process's memory and
     is gone on restart, idle-timeout, or explicit reset.
-  - The password is never transmitted, not even at login: both browser and
-    server independently derive the same AES/HMAC key material from it
-    (PBKDF2), so a login is a challenge/response proof, not a password
-    submission. Every request/response body after that is an AES-GCM
-    envelope encrypted with that key - Cloudflare's edge (or anything else
-    on the path) only ever relays ciphertext it has no key for.
+  - The password is never transmitted OR stored, not even server-side. The
+    browser derives two independent PBKDF2 halves from it: an auth key and
+    an encryption key. The server persists ONLY the auth half - a login
+    verifier that can check a challenge/response proof but cannot decrypt
+    anything. Each login also runs an ephemeral ECDH exchange; the session
+    key is HMAC(auth_key, nonce || DH-shared), so every envelope after login
+    is bound to BOTH the password and a one-time secret that dies with the
+    session - recorded traffic stays undecryptable forever, even by someone
+    who later learns the password (forward secrecy). The prompt-store key
+    arrives wrapped under the session key and lives in server RAM only: a
+    fresh process is locked out of the prompt store until someone who knows
+    the password logs in. Cloudflare's edge (or anything else on the path,
+    or anything reading this box's disk) only ever has ciphertext.
   - The browser never persists the derived key anywhere (no localStorage/
     sessionStorage) - only an in-memory JS variable - so a page reload
     requires the password again by construction, not by policy.
@@ -25,6 +32,8 @@ Design constraints (deliberate, do not "fix"):
 import asyncio
 import base64
 import concurrent.futures
+import contextvars
+import re
 import gc
 import hashlib
 import hmac
@@ -32,6 +41,7 @@ import io
 import json
 import os
 import secrets
+import subprocess
 import threading
 import time
 from collections import defaultdict, deque
@@ -40,11 +50,20 @@ from pathlib import Path
 import logging
 import warnings
 
+# SDXL's UNet fills most of the 6GB card during generation; expandable
+# segments cut allocator fragmentation so the peak fits with margin instead
+# of OOMing on the last few MB. Must be set before torch initializes CUDA.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from diffusers import AutoencoderTiny, DPMSolverMultistepScheduler, StableDiffusionXLPipeline
+from diffusers.image_processor import IPAdapterMaskProcessor
+from PIL import Image as PILImage
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from llama_cpp import Llama
 
@@ -74,12 +93,16 @@ except Exception:
 STATIC_DIR = Path(__file__).parent / "static"
 
 # Writable config dir (systemd punches a ReadWritePaths hole here despite
-# ProtectSystem=strict). Holds the two persisted things: the current
-# password (plaintext, mode 600 - same trust model as the old env file) and
-# the prompts, ENCRYPTED under the password-derived key. Conversations and
-# images are never persisted anywhere - see the module docstring.
+# ProtectSystem=strict). Holds the two persisted things: the AUTH half of
+# the PBKDF2 output (a login verifier - PBKDF2's output halves are
+# computationally independent, so it cannot yield the encryption key) and
+# the prompts, ENCRYPTED under the enc half, which is NEVER stored - the
+# browser delivers it at login, wrapped, and it lives in RAM only. Nothing
+# on this disk can decrypt anything. Conversations and images are never
+# persisted anywhere - see the module docstring.
 CONFIG_DIR = Path(os.environ.get("IMAGEGEN_CONFIG_DIR", "/var/lib/imagegen"))
-PASSWORD_FILE = CONFIG_DIR / "password"
+KAUTH_FILE = CONFIG_DIR / "k_auth"
+LEGACY_PASSWORD_FILE = CONFIG_DIR / "password"
 PROMPTS_FILE = CONFIG_DIR / "prompts.enc"
 
 IMAGE_MODEL_PATH = os.environ.get(
@@ -87,6 +110,41 @@ IMAGE_MODEL_PATH = os.environ.get(
 )
 LLM_MODEL_PATH = os.environ.get(
     "LLM_MODEL_PATH", os.path.expanduser("~/imagegen/models/Gemma-4-12B-OBLITERATED.Q4_K_M.gguf")
+)
+# Chat-model picker: any .gguf in the models dir is selectable at Initialize.
+# Chat is ALWAYS CPU-inference. This is not a limitation to "fix": imagegen-env
+# uses the CPU-ONLY build of llama-cpp-python ON PURPOSE. The CUDA build
+# reserves ~1GB of VRAM even at n_gpu_layers=0, and on the 6GB card that 1GB
+# is exactly enough to push SDXL's ~4.6GB generation peak into OOM - image
+# generation and GPU-offloaded chat cannot coexist here. CPU chat uses zero
+# VRAM, so SDXL owns the card and both work. (Rebuild note: install with
+# CMAKE_ARGS="-DGGML_CUDA=off" --no-binary llama-cpp-python; the prebuilt CPU
+# wheels are musl-linked and won't load on glibc.)
+GGUF_DIR = Path(LLM_MODEL_PATH).parent
+# Image-model picker: any .safetensors in the models dir is a selectable SDXL
+# checkpoint at Initialize (parallel to the chat .gguf picker). All SDXL bases
+# run through the same cpu_offload path, so any of them fits the 6GB card.
+IMAGE_MODEL_DIR = Path(IMAGE_MODEL_PATH).parent
+CHAT_GPU_LAYERS = 0  # CPU-only in-process build ignores this; kept explicit
+
+# Two init modes, chosen at Initialize:
+#   cpu_images - SDXL on the GPU + chat on CPU (in-process CPU-only llama).
+#                Image generation works; chat is CPU-speed. The default.
+#   gpu_chat   - chat model offloaded to the GPU (fast) via a SUBPROCESS that
+#                runs under transcribe-env (CUDA llama build); SDXL is NOT
+#                loaded, so "get image" is disabled. On a 6GB card these are
+#                mutually exclusive - a GPU chat model and SDXL can't coexist.
+CHAT_MODES = ("cpu_images", "gpu_chat")
+GPU_CHAT_PY = os.environ.get("GPU_CHAT_PY", os.path.expanduser("~/transcribe-env/bin/python"))
+CHAT_WORKER_PATH = str(Path(__file__).resolve().parent / "chat_worker.py")
+GPU_CHAT_LAYERS = int(os.environ.get("GPU_CHAT_LAYERS", "28"))
+GPU_CHAT_CTX = int(os.environ.get("GPU_CHAT_CTX", "4096"))
+# The GPU chat worker runs under transcribe-env, whose CUDA llama build needs
+# the torch-bundled CUDA runtime on LD_LIBRARY_PATH (same trick the captains-
+# log runner uses to load the summarizer on the GPU).
+import glob as _glob
+_GPU_CHAT_NVIDIA_LIBS = ":".join(
+    _glob.glob(os.path.expanduser("~/transcribe-env/lib/python*/site-packages/nvidia/*/lib"))
 )
 PORT = int(os.environ.get("PORT", "8189"))
 
@@ -96,11 +154,36 @@ LOGIN_MAX_ATTEMPTS = 5
 LOGIN_WINDOW_SECONDS = 15 * 60
 MAX_HISTORY = 40  # messages kept per conversation, oldest dropped past this
 MAX_GALLERY = 30  # images kept per conversation-with-images session
-MIN_PASSWORD_LEN = 8
+MIN_PASSWORD_LEN = 8  # enforced client-side; the server never sees the password
 
-IMG_STEPS = 24  # DPM++ 2M Karras converges well here (was 32 w/ default scheduler)
-IMG_GUIDANCE = 6.0
+# Quality presets: steps + guidance on the same model/scheduler. Resolution
+# stays 1024 (SDXL's native training size - lower degrades composition more
+# than it saves time) and the TAESD tiny VAE stays for all presets (the full
+# VAE's decode spike is what used to OOM the 6GB card).
+IMG_PRESETS = {
+    "quick":    {"steps": 14, "guidance": 5.5},
+    "balanced": {"steps": 24, "guidance": 6.0},  # DPM++ 2M Karras converges well here
+    "best":     {"steps": 40, "guidance": 6.5},
+}
+IMG_DEFAULT_PRESET = "balanced"
 IMG_SIZE = 1024
+# Baseline negative prompt - the single biggest artistic-quality lever SDXL
+# has. Callers can override per-request; empty string disables entirely.
+IMG_DEFAULT_NEGATIVE = (
+    "blurry, lowres, bad anatomy, deformed, disfigured, extra fingers, extra "
+    "limbs, mutated hands, watermark, signature, text, jpeg artifacts, "
+    "worst quality, cartoon, 3d render"
+)
+IP_ADAPTER_DIR = os.environ.get(
+    "IP_ADAPTER_DIR", os.path.expanduser("~/imagegen/models/ip_adapter")
+)
+# IP-Adapter FaceID (SDXL): identity from an InsightFace embedding (computed on
+# CPU) rather than a heavy CLIP image encoder in VRAM, so a face reference fits
+# the 6GB card. The adapter ships as a weights file + a companion LoRA.
+FACEID_WEIGHTS = "ip-adapter-faceid_sdxl.bin"
+FACEID_LORA = "ip-adapter-faceid_sdxl_lora.safetensors"
+IMG_REF_MAX = 1          # v1: one face reference. Multi-person masking is a follow-up.
+IMG_REF_DEFAULT_STRENGTH = 0.7
 LLM_MAX_TOKENS = 512
 LLM_CONTEXT = 8192
 
@@ -118,16 +201,18 @@ PBKDF2_SALT = b"imagegen-e2e-v1"
 PBKDF2_ITERATIONS = 210000
 
 # --- mutable key material + prompt config, guarded by _config_lock ------------
-# The password-derived AES/HMAC keys can change at runtime (change-password),
-# so they are globals swapped under the lock, not import-time constants. The
-# browser derives the same keys from the password the user types; neither the
-# password nor the key ever crosses the network (login is challenge/response,
-# every body is an AES-GCM envelope). Cloudflare only ever relays ciphertext.
+# K_AUTH (stored on disk) can only verify login proofs. K_ENC exists ONLY in
+# this process's memory, and only after a successful login has delivered it:
+# the browser derives both halves from the password, proves knowledge of
+# K_AUTH against the challenge, and sends K_ENC wrapped under
+# HMAC(K_AUTH, "wrap-enc-key" || nonce) - Cloudflare relays ciphertext it
+# can never unwrap, and a fresh process cannot decrypt the prompts until
+# someone who knows the password logs in.
 _config_lock = threading.Lock()
 K_AUTH = b""
 K_ENC = b""
 _aesgcm = None
-_prompts = {}  # {"system_prompt": str, "image_prompt_prefix": str}
+_prompts = None  # {"system_prompt": str, "image_prompt_prefix": str} once unlocked
 
 
 def _derive_keys(password: str):
@@ -148,29 +233,32 @@ def _write_prompts_locked():
 
 
 def _load_config():
+    """Load (or create) the login verifier. The encryption key is deliberately
+    NOT recoverable here: a fresh process starts locked, and stays locked until
+    a browser that knows the password logs in and delivers the enc key."""
     global K_AUTH, K_ENC, _aesgcm, _prompts
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    if PASSWORD_FILE.exists():
-        password = PASSWORD_FILE.read_text().strip()
+    if KAUTH_FILE.exists():
+        K_AUTH = base64.b64decode(KAUTH_FILE.read_text().strip())
     else:
-        # First ever start: seed the persisted password from the env var
-        # (delivered via the systemd EnvironmentFile), then never read env again.
-        password = os.environ.get("IMAGEGEN_PASSWORD", "").strip()
+        # First start on this scheme. Derive the verifier from the legacy
+        # plaintext password file (upgrade path) or IMAGEGEN_PASSWORD (fresh
+        # install), store ONLY the auth half, and destroy the plaintext - the
+        # enc half is discarded; prompts.enc stays valid because the same
+        # password re-derives the same enc key at login.
+        if LEGACY_PASSWORD_FILE.exists():
+            password = LEGACY_PASSWORD_FILE.read_text().strip()
+        else:
+            password = os.environ.get("IMAGEGEN_PASSWORD", "").strip()
         if not password:
-            raise RuntimeError("no password file and IMAGEGEN_PASSWORD unset")
-        PASSWORD_FILE.write_text(password)
-        os.chmod(PASSWORD_FILE, 0o600)
-    K_AUTH, K_ENC = _derive_keys(password)
-    _aesgcm = AESGCM(K_ENC)
-    if PROMPTS_FILE.exists():
-        raw = PROMPTS_FILE.read_bytes()
-        _prompts = json.loads(_aesgcm.decrypt(raw[:12], raw[12:], None))
-    else:
-        _prompts = {
-            "system_prompt": DEFAULT_SYSTEM_PROMPT,
-            "image_prompt_prefix": DEFAULT_APPEARANCE,
-        }
-        _write_prompts_locked()
+            raise RuntimeError("no k_auth file, no legacy password file, IMAGEGEN_PASSWORD unset")
+        K_AUTH, _discard = _derive_keys(password)
+        KAUTH_FILE.write_text(base64.b64encode(K_AUTH).decode())
+        os.chmod(KAUTH_FILE, 0o600)
+        LEGACY_PASSWORD_FILE.unlink(missing_ok=True)
+    K_ENC = b""
+    _aesgcm = None
+    _prompts = None
 
 
 _load_config()
@@ -196,9 +284,82 @@ _gpu_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 _llm_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 image_pipe = None
+ref_pipe = None                # lazy FaceID (sequential-offload) pipe; built on first reference-photo use
+_face_app = None               # lazy InsightFace buffalo_l (CPU) for face embeddings
 llm = None
+_chat_worker = None            # Popen for GPU-chat mode; None otherwise
+_chat_worker_layers = 0        # gpu layers the worker actually loaded (fallback-aware)
+_worker_lock = threading.Lock()  # serializes one chat turn at a time over the worker pipe
 _model_status_lock = threading.Lock()
-_model_status = "cold"  # cold -> loading -> ready -> error
+_model_status = "cold"  # cold -> loading -> ready; error -> back to a cold-like retry
+_model_error = ""       # last load failure, surfaced to the picker so the user can retry
+_chat_selection = {"model": Path(LLM_MODEL_PATH).name, "mode": "cpu_images"}
+_image_selection = {"model": Path(IMAGE_MODEL_PATH).name}
+
+
+def _list_chat_models() -> list[str]:
+    try:
+        return sorted(f.name for f in GGUF_DIR.glob("*.gguf"))
+    except OSError:
+        return [Path(LLM_MODEL_PATH).name]
+
+
+def _list_image_models() -> list[str]:
+    """Selectable SDXL checkpoints: single-file *.safetensors in the models dir,
+    PLUS diffusers-format model folders (a subdir holding a model_index.json).
+    Most community SDXL models on HF ship as folders, so supporting both is what
+    makes the picker actually useful."""
+    try:
+        files = [f.name for f in IMAGE_MODEL_DIR.glob("*.safetensors")]
+        dirs = [d.name for d in IMAGE_MODEL_DIR.iterdir()
+                if d.is_dir() and (d / "model_index.json").exists()]
+        return sorted(files + dirs) or [Path(IMAGE_MODEL_PATH).name]
+    except OSError:
+        return [Path(IMAGE_MODEL_PATH).name]
+
+
+def _image_model_path() -> str:
+    return str(IMAGE_MODEL_DIR / _image_selection["model"])
+
+
+def _load_sdxl():
+    """Load the selected SDXL checkpoint, transparently handling both a single-
+    file checkpoint and a diffusers-format folder. Scheduler/VAE are swapped by
+    the callers, same for every base."""
+    sel = _image_model_path()
+    if os.path.isdir(sel):
+        try:
+            return StableDiffusionXLPipeline.from_pretrained(
+                sel, torch_dtype=torch.float16, use_safetensors=True, variant="fp16")
+        except Exception:
+            return StableDiffusionXLPipeline.from_pretrained(
+                sel, torch_dtype=torch.float16, use_safetensors=True)
+    return StableDiffusionXLPipeline.from_single_file(
+        sel, torch_dtype=torch.float16, use_safetensors=True)
+
+
+def _init_payload() -> dict:
+    with _model_status_lock:
+        status = _model_status
+        err = _model_error
+    payload = {"status": status, "chat_model": _chat_selection["model"],
+               "image_model": _image_selection["model"]}
+    # Any state that isn't actively loading or ready is a state the user must
+    # be able to (re)start from - so always ship the picker options there,
+    # including 'error'. Otherwise a transient load failure strips the picker
+    # to fallbacks AND leaves no way forward.
+    payload["mode"] = _chat_selection["mode"]
+    # Images are on whenever an SDXL pipe COULD be resident (either the fast base
+    # pipe or the FaceID ref pipe - only one lives at a time). Both are None only
+    # in gpu_chat mode, where SDXL never loads.
+    payload["images"] = (image_pipe is not None or ref_pipe is not None)
+    if status not in ("loading", "ready"):
+        payload["models"] = _list_chat_models()
+        payload["image_models"] = _list_image_models()
+        payload["modes"] = list(CHAT_MODES)
+    if status == "error":
+        payload["error"] = err
+    return payload
 
 
 def _client_ip(request: Request) -> str:
@@ -221,8 +382,7 @@ def _record_failure(ip: str) -> None:
 
 def _new_conversation_state() -> dict:
     return {
-        "chat": {"history": []},
-        "chat_images": {"history": [], "gallery": [], "jobs": {}},
+        "chat": {"history": [], "gallery": [], "jobs": {}},
         "image": {"gallery": []},
     }
 
@@ -241,15 +401,22 @@ def _touch_session(token: str) -> dict | None:
         return s
 
 
+# Envelopes are encrypted under the PER-SESSION key (password + ephemeral
+# ECDH), set into this contextvar by _require_session for the current request
+# task. Forward secrecy: the session key dies with the session on both ends,
+# so recorded traffic is permanently undecryptable - even with the password.
+_current_aesgcm: contextvars.ContextVar = contextvars.ContextVar("session_aesgcm", default=None)
+
+
 def _encrypt(obj, aesgcm=None) -> dict:
-    aesgcm = aesgcm or _aesgcm
+    aesgcm = aesgcm or _current_aesgcm.get() or _aesgcm
     nonce = os.urandom(12)
     ciphertext = aesgcm.encrypt(nonce, json.dumps(obj).encode(), None)
     return {"nonce": base64.b64encode(nonce).decode(), "ciphertext": base64.b64encode(ciphertext).decode()}
 
 
 def _decrypt(envelope: dict, aesgcm=None):
-    aesgcm = aesgcm or _aesgcm
+    aesgcm = aesgcm or _current_aesgcm.get() or _aesgcm
     nonce = base64.b64decode(envelope["nonce"])
     ciphertext = base64.b64decode(envelope["ciphertext"])
     return json.loads(aesgcm.decrypt(nonce, ciphertext, None))
@@ -306,6 +473,11 @@ async def index():
 async def challenge():
     nonce = os.urandom(16)
     nonce_b64 = base64.b64encode(nonce).decode()
+    # Fresh ephemeral ECDH pair per challenge - the private half lives only in
+    # this dict entry and dies with the challenge/login. Mixed into the session
+    # key, it gives every session forward secrecy.
+    eph_priv = ec.generate_private_key(ec.SECP256R1())
+    server_pub = eph_priv.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
     now = time.time()
     with _state_lock:
         # opportunistic sweep of expired challenges and idle sessions - a
@@ -313,12 +485,12 @@ async def challenge():
         # without this, sessions nobody ever revisits (e.g. every page
         # reload starts a fresh login here, by design - see app.js) would
         # sit in memory, galleries and all, until the process restarts.
-        for k in [k for k, exp in _challenges.items() if exp < now]:
+        for k in [k for k, ch in _challenges.items() if ch["exp"] < now]:
             del _challenges[k]
         for tok in [tok for tok, s in _sessions.items() if now - s["last_seen"] > SESSION_IDLE_TIMEOUT]:
             del _sessions[tok]
-        _challenges[nonce_b64] = now + CHALLENGE_TTL
-    return {"nonce": nonce_b64}
+        _challenges[nonce_b64] = {"exp": now + CHALLENGE_TTL, "priv": eph_priv}
+    return {"nonce": nonce_b64, "server_pub": base64.b64encode(server_pub).decode()}
 
 
 @app.post("/api/login")
@@ -332,8 +504,8 @@ async def login(request: Request):
     proof_b64 = body.get("proof", "")
 
     with _state_lock:
-        expiry = _challenges.pop(nonce_b64, None)
-    if expiry is None or expiry < time.time():
+        ch = _challenges.pop(nonce_b64, None)
+    if ch is None or ch["exp"] < time.time():
         _record_failure(ip)
         return JSONResponse({"error": "expired or invalid challenge"}, status_code=401)
 
@@ -344,9 +516,55 @@ async def login(request: Request):
         _record_failure(ip)
         return JSONResponse({"error": "incorrect password"}, status_code=401)
 
+    # Session key = HMAC(K_AUTH, nonce || ECDH-shared). The DH share gives
+    # forward secrecy (both ephemeral privates die with the session; recorded
+    # traffic is undecryptable forever, password or not); mixing K_AUTH
+    # authenticates the DH so a man-in-the-middle relay without the password
+    # can't sit between the two ends. The browser's enc key arrives wrapped
+    # under this session key, and login is only complete if that key actually
+    # test-decrypts the prompt store - a stolen verifier can't fake that.
+    global K_ENC, _aesgcm, _prompts
+    try:
+        client_pub = ec.EllipticCurvePublicKey.from_encoded_point(
+            ec.SECP256R1(), base64.b64decode(body.get("client_pub", ""))
+        )
+        shared = ch["priv"].exchange(ec.ECDH(), client_pub)
+        k_sess = hmac.new(K_AUTH, b"session-v1" + nonce + shared, hashlib.sha256).digest()
+        sess_aesgcm = AESGCM(k_sess)
+        ek = sess_aesgcm.decrypt(
+            base64.b64decode(body.get("ek_iv", "")),
+            base64.b64decode(body.get("ek_ct", "")),
+            None,
+        )
+        if len(ek) != 32:
+            raise ValueError("bad key length")
+    except Exception:
+        _record_failure(ip)
+        return JSONResponse({"error": "incorrect password"}, status_code=401)
+
+    candidate = AESGCM(ek)
+    with _config_lock:
+        if PROMPTS_FILE.exists():
+            try:
+                raw = PROMPTS_FILE.read_bytes()
+                prompts = json.loads(candidate.decrypt(raw[:12], raw[12:], None))
+            except Exception:
+                _record_failure(ip)
+                return JSONResponse({"error": "incorrect password"}, status_code=401)
+            K_ENC, _aesgcm, _prompts = ek, candidate, prompts
+        else:
+            # Very first login ever: seed the prompt store under this key.
+            K_ENC, _aesgcm = ek, candidate
+            _prompts = {
+                "system_prompt": DEFAULT_SYSTEM_PROMPT,
+                "image_prompt_prefix": DEFAULT_APPEARANCE,
+            }
+            _write_prompts_locked()
+
     token = base64.urlsafe_b64encode(os.urandom(32)).decode()
     with _state_lock:
-        _sessions[token] = {"last_seen": time.time(), **_new_conversation_state()}
+        _sessions[token] = {"last_seen": time.time(), "aesgcm": sess_aesgcm,
+                            **_new_conversation_state()}
 
     resp = JSONResponse({"ok": True})
     # Session cookie only - no Max-Age, so the browser drops it when it closes.
@@ -363,6 +581,8 @@ def _require_session(request: Request) -> tuple[str, dict] | JSONResponse:
     state = _touch_session(token)
     if state is None:
         return JSONResponse({"error": "session expired"}, status_code=401)
+    # Route this request's envelopes through the session's own key.
+    _current_aesgcm.set(state.get("aesgcm"))
     return token, state
 
 
@@ -386,7 +606,7 @@ async def reset(request: Request):
     body = _decrypt(await request.json())
     mode = body.get("mode")
     with _state_lock:
-        if mode in ("chat", "chat_images", "image"):
+        if mode in ("chat", "image"):
             state[mode] = _new_conversation_state()[mode]
     return JSONResponse(_encrypt({"ok": True}))
 
@@ -424,20 +644,24 @@ async def change_password(request: Request):
     if isinstance(result, JSONResponse):
         return result
     global K_AUTH, K_ENC, _aesgcm
-    # The request is encrypted under the CURRENT (old) key; capture it so the
-    # ack can be encrypted under it too - the browser is still holding the old
-    # key and won't re-derive until it re-logs-in.
-    old_aesgcm = _aesgcm
+    # Request and ack ride THIS session's envelope key (which survives until
+    # the session-clear below). The password itself never arrives: the browser
+    # derives the new key pair and sends the halves (length policy is enforced
+    # client-side; the server can't see length).
+    old_aesgcm = _current_aesgcm.get() or _aesgcm
     body = _decrypt(await request.json(), aesgcm=old_aesgcm)
-    new_password = (body.get("new_password") or "").strip()
-    if len(new_password) < MIN_PASSWORD_LEN:
-        return JSONResponse(
-            _encrypt({"error": f"password must be at least {MIN_PASSWORD_LEN} characters"}, old_aesgcm)
-        )
+    try:
+        new_k_auth = base64.b64decode(body.get("new_k_auth", ""))
+        new_k_enc = base64.b64decode(body.get("new_k_enc", ""))
+        if len(new_k_auth) != 32 or len(new_k_enc) != 32:
+            raise ValueError("bad key length")
+    except Exception:
+        return JSONResponse(_encrypt({"error": "malformed key material"}, old_aesgcm))
     with _config_lock:
-        PASSWORD_FILE.write_text(new_password)
-        os.chmod(PASSWORD_FILE, 0o600)
-        K_AUTH, K_ENC = _derive_keys(new_password)
+        K_AUTH = new_k_auth
+        KAUTH_FILE.write_text(base64.b64encode(K_AUTH).decode())
+        os.chmod(KAUTH_FILE, 0o600)
+        K_ENC = new_k_enc
         _aesgcm = AESGCM(K_ENC)
         _write_prompts_locked()  # re-encrypt prompts under the NEW key
     # Force everyone (including this browser) to re-login with the new password.
@@ -480,26 +704,198 @@ def _run_llm(history: list[dict]) -> str:
             top_p=0.9,
             repeat_penalty=1.18,
         )
-    return completion["choices"][0]["message"]["content"].strip()
+    return _clean_llm_text(completion["choices"][0]["message"]["content"])
 
 
-def _build_image_prompt_from_message(message: str) -> str:
-    """Image prompt from what the USER just said (no LLM call), so image
-    generation can start immediately and run on the GPU in parallel with the
-    reply on the CPU. No LLM here on purpose - an LLM call would contend with
-    the reply on the single LLM thread and re-serialize the two. Lead with the
-    configured look, then the user's line as the scene; cap under CLIP's limit."""
-    appearance = _prompts["image_prompt_prefix"]
-    scene = message.strip().replace("\n", " ")[:180]
-    return f"{appearance}. {scene}"[:240]
+# This checkpoint emits internal channel markers (<|channel>thought <channel|>...)
+# that llama.cpp's chat handler usually strips but demonstrably not always.
+# Defense: split on any channel-marker variant, keep the last substantial
+# segment (the reply follows the final marker), drop leading channel labels.
+_CHANNEL_RE = re.compile(r"<[|/]?channel[|]?>", re.IGNORECASE)
 
 
-def _run_image(prompt: str) -> str:
+def _clean_llm_text(text: str) -> str:
+    parts = [p for p in _CHANNEL_RE.split(text) if p.strip()]
+    if len(parts) > 1:
+        text = parts[-1]
+    elif parts:
+        text = parts[0]
+    text = re.sub(r"^\s*(thought|thinking|analysis|final|assistant)\b[:.\s]*", "",
+                  text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+
+def _expand_image_prompt(user_prompt: str) -> str:
+    """Optional 'prompt assist': the local chat LLM (CPU) generates artistic-
+    direction fragments which are APPENDED to the user's untouched prompt -
+    subject preservation is structural, not an instruction the model can
+    drift from. Falls back to the raw prompt on any failure."""
+    try:
+        with _llm_lock:
+            completion = llm.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": PROMPT_ASSIST_SYSTEM},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=110, temperature=0.5, top_p=0.9, repeat_penalty=1.15,
+            )
+        additions = _clean_llm_text(completion["choices"][0]["message"]["content"]).strip('"').strip(",. ")
+        if not additions:
+            return user_prompt
+        return f"{user_prompt}, {additions}"[:400]
+    except Exception as e:
+        print(f"prompt assist failed, using raw prompt: {e}", flush=True)
+        return user_prompt
+
+
+def _decode_ref(b64: str):
+    """Reference photo from the request: decode, orient, downscale. Lives only
+    in this request - never written anywhere."""
+    img = PILImage.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+    img.thumbnail((768, 768))
+    return img
+
+
+class ReferenceUnavailable(Exception):
+    """Reference-photo generation was requested but the feature isn't loaded
+    (adapter/face model missing). Deliberately NOT a RuntimeError so it doesn't
+    get swallowed by the CUDA-OOM handler and mis-reported as 'GPU is busy'."""
+
+
+class NoFaceInReference(Exception):
+    """The reference image had no detectable face - user-fixable, not an error."""
+
+
+def _get_face_app():
+    """Lazily load InsightFace buffalo_l on the CPU (onnxruntime). Kept off the
+    GPU on purpose so it never competes with SDXL for the 6GB card."""
+    global _face_app
+    if _face_app is not None:
+        return _face_app
+    try:
+        from insightface.app import FaceAnalysis
+    except Exception:
+        raise ReferenceUnavailable("the face model isn't installed on this server")
+    fa = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+    fa.prepare(ctx_id=-1, det_size=(640, 640))
+    _face_app = fa
+    return _face_app
+
+
+def _build_base_pipe():
+    """The fast, normal-gen SDXL pipe: model_cpu_offload keeps the whole UNet
+    resident on the GPU across denoising steps (~5.2GB, ~20s/image) and has NO
+    adapter, so ordinary images are pristine. DPM++ Karras + TAESD for speed and
+    to kill the VAE-decode VRAM spike. Caller holds _gpu_lock."""
+    print("loading SDXL checkpoint (GPU, fast path)...", flush=True)
+    p = StableDiffusionXLPipeline.from_single_file(
+        _image_model_path(), torch_dtype=torch.float16, use_safetensors=True)
+    p.scheduler = DPMSolverMultistepScheduler.from_config(
+        p.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++")
+    p.vae = AutoencoderTiny.from_pretrained("madebyollin/taesdxl", torch_dtype=torch.float16)
+    p.enable_model_cpu_offload()
+    print("image model ready", flush=True)
+    return p
+
+
+def _build_ref_pipe():
+    """The reference-photo (FaceID) SDXL pipe. FaceID's extra UNet weights don't
+    fit the 6GB card under model_cpu_offload, so this pipe streams weights via
+    sequential offload (~650MB VRAM, ~50s/image). The companion LoRA is fused in
+    permanently - this pipe only ever does reference gen. Caller holds _gpu_lock."""
+    for fn in (FACEID_WEIGHTS, FACEID_LORA):
+        if not os.path.exists(os.path.join(IP_ADAPTER_DIR, fn)):
+            raise ReferenceUnavailable("the reference-photo model isn't installed on this server")
+    print("building FaceID reference pipeline...", flush=True)
+    p = StableDiffusionXLPipeline.from_single_file(
+        _image_model_path(), torch_dtype=torch.float16, use_safetensors=True)
+    p.scheduler = DPMSolverMultistepScheduler.from_config(
+        p.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++")
+    p.vae = AutoencoderTiny.from_pretrained("madebyollin/taesdxl", torch_dtype=torch.float16)
+    p.load_ip_adapter(IP_ADAPTER_DIR, subfolder=None,
+                      weight_name=FACEID_WEIGHTS, image_encoder_folder=None)
+    p.load_lora_weights(IP_ADAPTER_DIR, weight_name=FACEID_LORA)
+    p.fuse_lora()
+    p.unload_lora_weights()
+    p.enable_sequential_cpu_offload()
+    print("FaceID reference pipeline ready", flush=True)
+    return p
+
+
+def _activate_base():
+    """Ensure the fast normal-gen pipe is the one resident. Only ONE SDXL pipe
+    lives at a time (base ~10GB RAM OR ref ~10GB RAM, never both) so that with
+    the 12B chat model also loaded we stay well under the cgroup memory cap. The
+    two pipes need incompatible offload strategies, so switching means swapping
+    the object - an occasional ~15s rebuild, paid only when a session actually
+    alternates between normal and reference gen."""
+    global image_pipe, ref_pipe
+    if image_pipe is not None:
+        return
+    if ref_pipe is not None:
+        ref_pipe = None
+        gc.collect()
+        try: torch.cuda.empty_cache()
+        except Exception: pass
+    image_pipe = _build_base_pipe()
+
+
+def _activate_ref():
+    """Ensure the FaceID pipe is the one resident (dropping the base pipe)."""
+    global image_pipe, ref_pipe
+    if ref_pipe is not None:
+        return
+    if image_pipe is not None:
+        image_pipe = None
+        gc.collect()
+        try: torch.cuda.empty_cache()
+        except Exception: pass
+    ref_pipe = _build_ref_pipe()
+
+
+def _face_id_embeds(refs: list):
+    """Largest face in the first reference image -> CFG-ready FaceID embedding
+    ([neg, pos] stacked). Raises NoFaceInReference if the detector finds none."""
+    import numpy as np
+    fa = _get_face_app()
+    faces = fa.get(np.array(refs[0].convert("RGB"))[:, :, ::-1])  # PIL RGB -> BGR ndarray
+    if not faces:
+        raise NoFaceInReference()
+    faces.sort(key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]), reverse=True)
+    emb = torch.from_numpy(faces[0].normed_embedding).unsqueeze(0)   # [1, 512]
+    ref = torch.stack([emb], dim=0)                                  # [1, 1, 512]
+    return torch.cat([torch.zeros_like(ref), ref]).to(dtype=torch.float16, device="cuda")
+
+
+def _run_image(prompt: str, quality: str = IMG_DEFAULT_PRESET,
+               negative: str | None = None, refs: list | None = None,
+               ref_strength: float = IMG_REF_DEFAULT_STRENGTH) -> str:
+    p = IMG_PRESETS.get(quality, IMG_PRESETS[IMG_DEFAULT_PRESET])
+    neg = IMG_DEFAULT_NEGATIVE if negative is None else negative
+    refs = refs or []
     with _gpu_lock:
-        image = image_pipe(
-            prompt=prompt, num_inference_steps=IMG_STEPS, guidance_scale=IMG_GUIDANCE,
-            height=IMG_SIZE, width=IMG_SIZE,
-        ).images[0]
+        if refs:
+            # Fail fast on a faceless reference BEFORE paying to build the pipe.
+            id_embeds = _face_id_embeds(refs)
+            _activate_ref()
+            ref_pipe.set_ip_adapter_scale(float(ref_strength))
+            # Sequential offload is slow; cap steps so even the "best" preset plus
+            # a possible ~15s pipe rebuild stays under Cloudflare's ~100s timeout.
+            steps = min(p["steps"], 34)
+            image = ref_pipe(
+                prompt=prompt, negative_prompt=neg or None,
+                ip_adapter_image_embeds=[id_embeds],
+                num_inference_steps=steps, guidance_scale=p["guidance"],
+                height=IMG_SIZE, width=IMG_SIZE,
+            ).images[0]
+        else:
+            _activate_base()
+            image = image_pipe(
+                prompt=prompt, negative_prompt=neg or None,
+                num_inference_steps=p["steps"], guidance_scale=p["guidance"],
+                height=IMG_SIZE, width=IMG_SIZE,
+            ).images[0]
         # 6GB is a tight budget for SDXL's VAE-decode memory spike specifically -
         # release cached (but unused) allocator blocks between calls rather than
         # letting them accumulate/fragment across requests.
@@ -523,19 +919,105 @@ def _run_image_job(job_id: str, prompt: str, mode_state: dict):
             gallery = mode_state["gallery"]
             gallery.append(image_b64)
             del gallery[:-MAX_GALLERY]
-    except Exception:
+    except Exception as e:
+        # Surface WHY - a silently vanishing image is the worst UX. The usual
+        # cause on the 6GB card is VRAM exhaustion when the chat model is on
+        # the GPU (a GPU placement) or the nightly captain's-log run holds it.
+        msg = ("out of GPU memory - the chat model is using the GPU. Shut down "
+               "models and re-initialize with CPU placement to free it for images."
+               if _is_oom(e) else "image generation failed")
+        print(f"image job failed: {e}", flush=True)
         with _state_lock:
-            jobs[job_id] = {"status": "error", "image": None}
+            jobs[job_id] = {"status": "error", "image": None, "error": msg}
+
+
+def _is_oom(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return "out of memory" in s or "oom" in s or "cuda error" in s or "alloc" in s
+
+
+def _cpu_token_stream(messages, cancel):
+    """Yield raw delta strings from the in-process CPU chat model. Breaking the
+    loop (on cancel) stops llama.cpp - the generator is lazy, so not pulling
+    the next token stops evaluation."""
+    with _llm_lock:
+        if llm is None:
+            raise RuntimeError("models were shut down - re-initialize")
+        for chunk in llm.create_chat_completion(
+                messages=messages, max_tokens=LLM_MAX_TOKENS, stream=True,
+                temperature=0.75, top_p=0.9, repeat_penalty=1.18):
+            if cancel.is_set():
+                break
+            delta = (chunk["choices"][0].get("delta") or {}).get("content")
+            if delta:
+                yield delta
+
+
+def _gpu_token_stream(messages, cancel):
+    """Yield raw delta strings from the GPU worker subprocess. A cancel is
+    forwarded to the worker over stdin; the worker stops within one token and
+    the turn ends cleanly (worker stays healthy for the next turn)."""
+    import select
+    with _worker_lock:
+        p = _chat_worker
+        if p is None or p.poll() is not None:
+            raise RuntimeError("chat worker is not running - re-initialize")
+        p.stdin.write(json.dumps({"messages": messages, "max_tokens": LLM_MAX_TOKENS}) + "\n")
+        p.stdin.flush()
+        sent_cancel = False
+        while True:
+            r, _, _ = select.select([p.stdout], [], [], 0.1)
+            if cancel.is_set() and not sent_cancel:
+                try:
+                    p.stdin.write(json.dumps({"cancel": True}) + "\n")
+                    p.stdin.flush()
+                except Exception:
+                    pass
+                sent_cancel = True
+            if not r:
+                continue
+            line = p.stdout.readline()
+            if not line:
+                raise RuntimeError("chat worker died mid-stream")
+            msg = json.loads(line)
+            if msg.get("done"):
+                break
+            if msg.get("error"):
+                raise RuntimeError(msg["error"])
+            delta = msg.get("delta")
+            if delta and not cancel.is_set():
+                yield delta
+
+
+@app.post("/api/chat-stop")
+async def chat_stop(request: Request):
+    """Stop the in-flight reply for this session. Idempotent - a no-op if
+    nothing is generating."""
+    result = _require_session(request)
+    if isinstance(result, JSONResponse):
+        return result
+    _token, state = result
+    ev = state["chat"].get("cancel")
+    if ev is not None:
+        ev.set()
+    return JSONResponse(_encrypt({"ok": True}))
 
 
 @app.post("/api/chat")
 async def chat(request: Request):
+    """Streaming chat. The reply arrives as newline-delimited AES-GCM
+    envelopes under the session key - E2E holds per-chunk, Cloudflare only
+    relays ciphertext. Each decrypted chunk is {"delta": text} to append,
+    {"replace": text} when the live channel-token filter has to retract
+    already-shown text (a marker completed mid-stream), {"error": msg}, or
+    {"done": true}."""
     result = _require_session(request)
     if isinstance(result, JSONResponse):
         return result
     if _model_status != "ready":
         return JSONResponse({"error": "not initialized"}, status_code=503)
     token, state = result
+    aes = _current_aesgcm.get()
     body = _decrypt(await request.json())
     message = (body.get("message") or "").strip()[:4000]
     if not message:
@@ -543,47 +1025,179 @@ async def chat(request: Request):
 
     history = state["chat"]["history"]
     history.append({"role": "user", "content": message})
-    reply = await asyncio.get_event_loop().run_in_executor(_llm_executor, _run_llm, history[-MAX_HISTORY:])
-    history.append({"role": "assistant", "content": reply})
-    del history[:-MAX_HISTORY]
-    return JSONResponse(_encrypt({"reply": reply}))
+    with _config_lock:
+        system_prompt = _prompts["system_prompt"]
+    messages = [{"role": "system", "content": system_prompt},
+                *history[-MAX_HISTORY:]]
+    # A fresh cancel event per turn; /api/chat-stop sets it.
+    cancel = threading.Event()
+    state["chat"]["cancel"] = cancel
+    gpu_mode = _chat_selection["mode"] == "gpu_chat"
+
+    q: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+
+    def produce():
+        raw, emitted = "", ""
+        try:
+            source = _gpu_token_stream(messages, cancel) if gpu_mode else _cpu_token_stream(messages, cancel)
+            for delta in source:
+                raw += delta
+                cleaned = _clean_llm_text(raw)
+                # Hold back a trailing partial marker ("<|chan...") so it never
+                # flashes on screen before the regex can catch it.
+                tail = cleaned[-14:]
+                if "<" in tail:
+                    cleaned = cleaned[:len(cleaned) - (len(tail) - tail.index("<"))]
+                if cleaned.startswith(emitted):
+                    d = cleaned[len(emitted):]
+                    if d:
+                        emitted = cleaned
+                        loop.call_soon_threadsafe(q.put_nowait, {"delta": d})
+                else:
+                    # A late marker re-segmented the text: retract.
+                    emitted = cleaned
+                    loop.call_soon_threadsafe(q.put_nowait, {"replace": cleaned})
+            final = _clean_llm_text(raw)
+            # Keep the partial reply on stop, so context continues coherently.
+            if final:
+                with _state_lock:
+                    history.append({"role": "assistant", "content": final})
+                    del history[:-MAX_HISTORY]
+            if final != emitted:
+                loop.call_soon_threadsafe(q.put_nowait, {"replace": final})
+        except Exception as e:
+            print(f"chat stream failed: {e}", flush=True)
+            loop.call_soon_threadsafe(q.put_nowait, {"error": str(e)[:160] if "re-initialize" in str(e) else "generation failed"})
+        loop.call_soon_threadsafe(q.put_nowait, {"done": True})
+
+    loop.run_in_executor(_llm_executor, produce)
+
+    async def event_stream():
+        while True:
+            item = await q.get()
+            yield json.dumps(_encrypt(item, aes)) + "\n"
+            if item.get("done") or item.get("error"):
+                break
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson",
+                             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"})
 
 
-@app.post("/api/chat-images")
-async def chat_images(request: Request):
+def _history_index(body) -> int | None:
+    try:
+        return int(body.get("index"))
+    except (TypeError, ValueError):
+        return None
+
+
+@app.post("/api/chat-edit")
+async def chat_edit(request: Request):
+    """Edit one message in the conversation history by index. The edited text
+    becomes canonical - the model conditions on it on the next turn, not on what
+    it originally said. Editing an assistant reply is the way out of a merge
+    model's stuck 'conservative' register: trim the cautious sentence (or rewrite
+    the reply) and generation continues from your version. Role is preserved."""
+    result = _require_session(request)
+    if isinstance(result, JSONResponse):
+        return result
+    _token, state = result
+    body = _decrypt(await request.json())
+    idx = _history_index(body)
+    content = (body.get("content") or "").strip()[:8000]
+    if not content:
+        return JSONResponse({"error": "empty edit - use delete instead"}, status_code=400)
+    with _state_lock:
+        history = state["chat"]["history"]
+        if idx is None or not (0 <= idx < len(history)):
+            return JSONResponse({"error": "no such message"}, status_code=400)
+        history[idx]["content"] = content
+        hist = [dict(m) for m in history]
+    return JSONResponse(_encrypt({"history": hist}))
+
+
+@app.post("/api/chat-delete")
+async def chat_delete(request: Request):
+    """Delete one message from the conversation history by index. Use it to drop
+    the message where a merge model first flipped into refusal - removing it from
+    the context breaks the self-reinforcing loop that kept it stuck."""
+    result = _require_session(request)
+    if isinstance(result, JSONResponse):
+        return result
+    _token, state = result
+    body = _decrypt(await request.json())
+    idx = _history_index(body)
+    with _state_lock:
+        history = state["chat"]["history"]
+        if idx is None or not (0 <= idx < len(history)):
+            return JSONResponse({"error": "no such message"}, status_code=400)
+        del history[idx]
+        hist = [dict(m) for m in history]
+    return JSONResponse(_encrypt({"history": hist}))
+
+
+@app.post("/api/chat-image")
+async def chat_image(request: Request):
+    """'Get image' in conversation mode: distill the scene from the last few
+    messages (local LLM), prepend the configured character appearance, render
+    in the background. The client polls /api/image-status (mode 'chat')."""
     result = _require_session(request)
     if isinstance(result, JSONResponse):
         return result
     if _model_status != "ready":
         return JSONResponse({"error": "not initialized"}, status_code=503)
+    if image_pipe is None and ref_pipe is None:
+        return JSONResponse(
+            {"error": "images are off in GPU-chat mode - shut down models and re-initialize in 'CPU chat + images' to generate"},
+            status_code=409)
     token, state = result
-    body = _decrypt(await request.json())
-    message = (body.get("message") or "").strip()[:4000]
-    if not message:
-        return JSONResponse({"error": "empty message"}, status_code=400)
+    _decrypt(await request.json())  # envelope validated; no params needed
 
-    mode_state = state["chat_images"]
+    mode_state = state["chat"]
     history = mode_state["history"]
-    history.append({"role": "user", "content": message})
+    if not history:
+        return JSONResponse({"error": "no conversation yet"}, status_code=400)
 
-    # Kick the image off the USER's message FIRST, so it renders on the GPU in
-    # PARALLEL with the reply generating on the CPU (different hardware, genuine
-    # overlap). The image reflects what the user said - the reply doesn't exist
-    # yet when the image starts, which is the inherent cost of parallelism. The
-    # client polls /api/image-status on the returned job_id.
+    loop = asyncio.get_event_loop()
+    scene = await loop.run_in_executor(_llm_executor, _distill_scene, history[-6:])
+    with _config_lock:
+        appearance = _prompts["image_prompt_prefix"]
+    image_prompt = f"{appearance}. {scene}"[:400]
+
     job_id = secrets.token_urlsafe(8)
     jobs = mode_state["jobs"]
     jobs[job_id] = {"status": "pending", "image": None}
     for old_id in list(jobs)[:-10]:
         del jobs[old_id]
-    image_prompt = _build_image_prompt_from_message(message)
-    loop = asyncio.get_event_loop()
     loop.run_in_executor(_gpu_executor, _run_image_job, job_id, image_prompt, mode_state)
+    return JSONResponse(_encrypt({"job_id": job_id}))
 
-    reply = await loop.run_in_executor(_llm_executor, _run_llm, history[-MAX_HISTORY:])
-    history.append({"role": "assistant", "content": reply})
-    del history[:-MAX_HISTORY]
-    return JSONResponse(_encrypt({"reply": reply, "job_id": job_id}))
+
+SCENE_SYSTEM = (
+    "You describe the single image implied by the CURRENT moment of a "
+    "conversation between a user and their assistant companion. From the last "
+    "messages, output a concise scene for an image generator: where she is, "
+    "what she is doing, pose, setting, clothing if mentioned, mood, time of "
+    "day. Do NOT describe her face or body (her appearance is added "
+    "separately). Comma-separated fragments, max ~30 words. Output ONLY the "
+    "scene description."
+)
+
+
+def _distill_scene(history: list[dict]) -> str:
+    convo = "\n".join(f"{m['role']}: {m['content'][:300]}" for m in history)
+    try:
+        with _llm_lock:
+            completion = llm.create_chat_completion(
+                messages=[{"role": "system", "content": SCENE_SYSTEM},
+                          {"role": "user", "content": convo}],
+                max_tokens=90, temperature=0.6, top_p=0.9, repeat_penalty=1.15,
+            )
+        scene = _clean_llm_text(completion["choices"][0]["message"]["content"]).strip('"')
+        return scene or "a candid moment from the conversation"
+    except Exception as e:
+        print(f"scene distill failed: {e}", flush=True)
+        return "a candid moment from the conversation"
 
 
 @app.post("/api/image-status")
@@ -607,59 +1221,198 @@ async def image_only(request: Request):
         return result
     if _model_status != "ready":
         return JSONResponse({"error": "not initialized"}, status_code=503)
+    if image_pipe is None and ref_pipe is None:
+        return JSONResponse(
+            {"error": "images are off in GPU-chat mode - re-initialize in 'CPU chat + images'"},
+            status_code=409)
     token, state = result
     body = _decrypt(await request.json())
     prompt = (body.get("prompt") or "").strip()[:2000]
     if not prompt:
         return JSONResponse({"error": "empty prompt"}, status_code=400)
+    quality = body.get("quality")
+    if quality not in IMG_PRESETS:
+        quality = IMG_DEFAULT_PRESET
+    negative = body.get("negative")
+    if negative is not None:
+        negative = str(negative).strip()[:1000]
 
-    image_b64 = await asyncio.get_event_loop().run_in_executor(_gpu_executor, _run_image, prompt)
+    refs = []
+    for ref_b64 in (body.get("refs") or [])[:IMG_REF_MAX]:
+        try:
+            refs.append(_decode_ref(str(ref_b64)))
+        except Exception:
+            return JSONResponse({"error": "could not read a reference image"}, status_code=400)
+    try:
+        ref_strength = min(1.0, max(0.1, float(body.get("ref_strength", IMG_REF_DEFAULT_STRENGTH))))
+    except (TypeError, ValueError):
+        ref_strength = IMG_REF_DEFAULT_STRENGTH
+
+    final_prompt = prompt
+    if body.get("assist"):
+        final_prompt = await asyncio.get_event_loop().run_in_executor(
+            _llm_executor, _expand_image_prompt, prompt)
+
+    try:
+        image_b64 = await asyncio.get_event_loop().run_in_executor(
+            _gpu_executor, _run_image, final_prompt, quality, negative, refs, ref_strength)
+    except NoFaceInReference:
+        return JSONResponse(
+            {"error": "couldn't find a face in that photo - use a clear, front-facing headshot"},
+            status_code=400)
+    except ReferenceUnavailable as e:
+        return JSONResponse({"error": str(e)}, status_code=501)
+    except RuntimeError:
+        # Almost always CUDA OOM - the nightly Captain's Log transcription
+        # holds ~4GB of the 6GB card while it runs.
+        return JSONResponse(
+            {"error": "GPU is busy (likely the nightly Captain's Log run) - try again in ~30 minutes"},
+            status_code=503,
+        )
     gallery = state["image"]["gallery"]
     gallery.append(image_b64)
     del gallery[:-MAX_GALLERY]
-    return JSONResponse(_encrypt({"image": image_b64}))
+    return JSONResponse(_encrypt({
+        "image": image_b64,
+        "used_prompt": final_prompt if final_prompt != prompt else None,
+    }))
+
+
+def _spawn_chat_worker(chat_path: str):
+    """Start the GPU chat subprocess (transcribe-env python + CUDA llama) and
+    block until it signals ready. Raises on failure."""
+    global _chat_worker, _chat_worker_layers
+    print(f"starting GPU chat worker for {_chat_selection['model']}...", flush=True)
+    env = {**os.environ}
+    if _GPU_CHAT_NVIDIA_LIBS:
+        env["LD_LIBRARY_PATH"] = _GPU_CHAT_NVIDIA_LIBS + ":" + env.get("LD_LIBRARY_PATH", "")
+    p = subprocess.Popen(
+        [GPU_CHAT_PY, CHAT_WORKER_PATH, chat_path, str(GPU_CHAT_LAYERS), str(GPU_CHAT_CTX)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1, env=env,
+    )
+    line = p.stdout.readline()
+    if not line:
+        p.kill()
+        raise RuntimeError("chat worker exited before signalling ready")
+    msg = json.loads(line)
+    if not msg.get("ready"):
+        p.kill()
+        raise RuntimeError(msg.get("error", "chat worker failed to load model"))
+    _chat_worker = p
+    _chat_worker_layers = int(msg.get("gpu_layers", 0))
+    print(f"GPU chat worker ready ({_chat_worker_layers} layers on GPU)", flush=True)
+
+
+def _kill_worker():
+    global _chat_worker, _chat_worker_layers
+    with _worker_lock:
+        p = _chat_worker
+        _chat_worker = None
+        _chat_worker_layers = 0
+    if p is not None:
+        try:
+            p.stdin.close()
+        except Exception:
+            pass
+        p.terminate()
+        try:
+            p.wait(timeout=5)
+        except Exception:
+            p.kill()
 
 
 def _load_models():
     # Runs on the shared executor, kicked off by /api/initialize - nothing
-    # loads at process startup, so the idle process footprint is near-zero
-    # until someone actually asks for it (see the "Initialize" button in the
-    # UI). Both models are loaded together since either mode can be opened
-    # once ready; there is currently no auto-unload - they stay resident
-    # until the process restarts.
-    global image_pipe, llm, _model_status
+    # loads at process startup, so the idle footprint is near-zero until
+    # someone asks. Two modes (see CHAT_MODES): cpu_images loads SDXL + the
+    # in-process CPU chat model; gpu_chat loads ONLY the GPU chat worker (no
+    # SDXL). They can't coexist on the 6GB card.
+    global image_pipe, llm, _model_status, _model_error
+    mode = _chat_selection["mode"]
+    chat_path = str(GGUF_DIR / _chat_selection["model"])
     try:
-        print("loading SDXL checkpoint (GPU)...", flush=True)
-        image_pipe = StableDiffusionXLPipeline.from_single_file(
-            IMAGE_MODEL_PATH, torch_dtype=torch.float16, use_safetensors=True
-        )
-        # Speed, no model change: DPM++ 2M Karras converges in fewer steps than
-        # the default scheduler, and TAESD (a tiny distilled VAE) decodes far
-        # faster than the full SDXL VAE and removes the VAE-decode VRAM spike
-        # that used to flirt with OOM on the 6GB card. Set the VAE BEFORE
-        # enable_model_cpu_offload so the offload hooks attach to it.
-        image_pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-            image_pipe.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++"
-        )
-        image_pipe.vae = AutoencoderTiny.from_pretrained("madebyollin/taesdxl", torch_dtype=torch.float16)
-        image_pipe.enable_model_cpu_offload()
-        print("image model ready", flush=True)
+        if mode == "gpu_chat":
+            _spawn_chat_worker(chat_path)  # GPU; SDXL stays unloaded
+        else:
+            image_pipe = _build_base_pipe()
 
-        print("loading Gemma-4-12B-OBLITERATED (CPU)...", flush=True)
-        llm = Llama(
-            model_path=LLM_MODEL_PATH,
-            n_ctx=LLM_CONTEXT,
-            n_threads=8,
-            n_gpu_layers=0,  # deliberately CPU-only - see module docstring
-            verbose=False,
-        )
-        print("chat model ready", flush=True)
+            print(f"loading chat model {_chat_selection['model']} (CPU)...", flush=True)
+            llm = Llama(model_path=chat_path, n_ctx=LLM_CONTEXT, n_threads=8,
+                        n_gpu_layers=CHAT_GPU_LAYERS, verbose=False)
+            print("chat model ready", flush=True)
         with _model_status_lock:
             _model_status = "ready"
+            _model_error = ""
     except Exception as e:
         print(f"model load failed: {e}", flush=True)
+        # Drop any half-loaded state so a retry starts clean and doesn't
+        # strand VRAM/RAM or a zombie worker.
+        _kill_worker()
+        image_pipe = None
+        llm = None
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
         with _model_status_lock:
             _model_status = "error"
+            _model_error = str(e)[:200]
+
+
+def _unload_models():
+    """Free the GPU (and the chat model's RAM) without killing anything user-
+    visible: sessions, conversations, and galleries live in _sessions, not in
+    the model objects, so everything picks up where it left off after the next
+    Initialize. Runs on _gpu_executor so teardown happens on the same thread
+    (and CUDA context) that loaded the models."""
+    global image_pipe, ref_pipe, _face_app, llm, _model_status
+    _kill_worker()  # GPU-chat subprocess, if any
+    with _gpu_lock:
+        image_pipe = None
+        ref_pipe = None      # lazy FaceID pipe, if it was built this session
+        _face_app = None     # InsightFace (CPU) - frees its RAM
+        llm = None
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    with _model_status_lock:
+        _model_status = "cold"
+    print("models unloaded, GPU released", flush=True)
+
+
+@app.post("/api/unload")
+async def unload(request: Request):
+    result = _require_session(request)
+    if isinstance(result, JSONResponse):
+        return result
+    with _model_status_lock:
+        busy = _model_status == "loading"
+    if not busy and _model_status != "cold":
+        await asyncio.get_event_loop().run_in_executor(_gpu_executor, _unload_models)
+    return JSONResponse(_encrypt(_init_payload()))
+
+
+@app.post("/api/release-gpu")
+async def release_gpu(request: Request):
+    # Internal coordination endpoint for the nightly Captain's Log pipeline:
+    # it asks Chloe to vacate the GPU before transcription. Requests proxied
+    # through the Cloudflare tunnel always carry CF-Connecting-IP (Cloudflare
+    # overwrites any client-supplied value), so its absence == a genuinely
+    # local caller. No session, no envelope - this endpoint holds no data.
+    if request.headers.get("cf-connecting-ip"):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    with _model_status_lock:
+        status = _model_status
+    released = False
+    if status == "ready" or status == "error":
+        await asyncio.get_event_loop().run_in_executor(_gpu_executor, _unload_models)
+        released = True
+    with _model_status_lock:
+        status = _model_status
+    return JSONResponse({"status": status, "released": released})
 
 
 @app.post("/api/initialize")
@@ -667,16 +1420,29 @@ async def initialize(request: Request):
     result = _require_session(request)
     if isinstance(result, JSONResponse):
         return result
-    global _model_status
+    body = _decrypt(await request.json())
+    global _model_status, _model_error
     with _model_status_lock:
-        if _model_status == "cold":
+        # Startable from a fresh process (cold) OR after a failed attempt
+        # (error) - a transient load failure (e.g. GPU busy) must not brick
+        # the picker. Only 'loading'/'ready' are guarded.
+        if _model_status in ("cold", "error"):
+            model = body.get("chat_model")
+            if model in _list_chat_models():
+                _chat_selection["model"] = model
+            img_model = body.get("image_model")
+            if img_model in _list_image_models():
+                _image_selection["model"] = img_model
+            mode = body.get("chat_mode")
+            if mode in CHAT_MODES:
+                _chat_selection["mode"] = mode
             _model_status = "loading"
+            _model_error = ""
             # Load on _gpu_executor's thread specifically, so the CUDA
             # context SDXL initializes here is the same one every later
             # _run_image call reuses - not a different thread's context.
             asyncio.get_event_loop().run_in_executor(_gpu_executor, _load_models)
-        status = _model_status
-    return JSONResponse(_encrypt({"status": status}))
+    return JSONResponse(_encrypt(_init_payload()))
 
 
 @app.post("/api/init-status")
@@ -684,7 +1450,7 @@ async def init_status(request: Request):
     result = _require_session(request)
     if isinstance(result, JSONResponse):
         return result
-    return JSONResponse(_encrypt({"status": _model_status}))
+    return JSONResponse(_encrypt(_init_payload()))
 
 
 if __name__ == "__main__":
