@@ -299,13 +299,23 @@ use with Chloe (asks her image tool to free VRAM). Driven nightly at **7 pm MT**
 Chloe already has the scaffolding: a configurable **`system_prompt`** (persona =
 "tracks itself"), per-conversation **`history`** ("tracks the conversation"), a
 **GGUF model picker**, and a clean **`_run_llm(history)`** primitive, all on a
-**local llama.cpp** backend (no cloud, no per-token cost). A two-assistant "room" =
-**two personas** (two system prompts, optionally two different GGUFs) + a **shared,
-speaker-labeled transcript** fed to both + an **orchestrator loop** (you → A → B → A…
-with a **turn cap + stop word**). Build it in-app in `app.py`, or as a standalone
-orchestrator driving the local model. Caveat: chat is **CPU** here, so 12B models are
-slow and a two-agent loop doubles calls per round — use a smaller model
-(e.g. Qwen2.5-7B) if you want snappy multi-turn.
+**local llama.cpp** backend (no cloud, no per-token cost).
+
+**Implemented — "group chat" is a setting in Chloe** (`imagegen/app.py` + `static/app.js`;
+a mirror lives in this repo at `ai-box/chloe/`). Settings → *group chat (personas)*:
+toggle it on, set your name, and add personas (name + personality). Each turn every
+persona replies **round-robin, streaming, one at a time to completion** (so the next
+persona sees the previous reply and can respond to it); address one by name and they
+answer first. Separation from ONE model: each persona is a distinct system prompt over
+the shared speaker-labeled transcript, with name-tag stop sequences — no second model
+needed. It's persisted in the encrypted `_prompts` and defaults **off** (Chloe behaves
+normally until enabled).
+- Runs in **CPU chat mode** (`cpu_images`). 12B models are slow and a group round
+  doubles calls per turn — pick **Qwen2.5-7B** for snappy multi-turn.
+- ⚠️ **GPU chat mode is broken** post the CUDA-13.2 driver move: the GPU-chat worker
+  (`transcribe-env`) can't load its CUDA llama build (`libcudart.so.12` missing). Use
+  CPU chat. Restoring GPU chat needs the CUDA-12 runtime installed (and only a small
+  model fits the 6 GB card anyway).
 
 ---
 
