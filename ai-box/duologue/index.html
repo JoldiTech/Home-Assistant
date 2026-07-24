@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Duologue — multi-persona chat</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a;
+    --ink:#e7e9ee; --muted:#9aa2b1; --accent:#6ea8fe; --you:#2b3550;
+    --p0:#7ee0b8; --p1:#f4b183; --p2:#c9a7f5; --p3:#8fd0ff;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.5 system-ui,Segoe UI,Roboto,sans-serif;
+         background:var(--bg); color:var(--ink); }
+  header { padding:14px 18px; border-bottom:1px solid var(--line);
+           display:flex; align-items:center; gap:10px; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  header .tag { color:var(--muted); font-size:12px; }
+  .wrap { max-width:900px; margin:0 auto; padding:16px; }
+  details.settings { background:var(--panel); border:1px solid var(--line);
+                     border-radius:12px; margin-bottom:16px; }
+  details.settings > summary { cursor:pointer; padding:12px 16px; font-weight:600;
+                     list-style:none; display:flex; justify-content:space-between; }
+  details.settings > summary::after { content:"▸"; color:var(--muted); }
+  details.settings[open] > summary::after { content:"▾"; }
+  .settings .body { padding:0 16px 16px; }
+  label { display:block; font-size:12px; color:var(--muted); margin:12px 0 4px; }
+  input, select, textarea {
+    width:100%; background:var(--panel2); color:var(--ink); border:1px solid var(--line);
+    border-radius:8px; padding:9px 10px; font:inherit; }
+  textarea { min-height:70px; resize:vertical; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; }
+  .row > div { flex:1; min-width:140px; }
+  .persona { background:var(--panel2); border:1px solid var(--line); border-radius:10px;
+             padding:12px; margin-top:10px; position:relative; }
+  .persona .rm { position:absolute; top:8px; right:10px; background:none; border:none;
+             color:var(--muted); cursor:pointer; font-size:18px; width:auto; }
+  .btns { display:flex; gap:10px; margin-top:14px; flex-wrap:wrap; }
+  button.act { background:var(--accent); color:#0b1020; border:none; border-radius:8px;
+             padding:9px 16px; font-weight:600; cursor:pointer; width:auto; }
+  button.ghost { background:var(--panel2); color:var(--ink); border:1px solid var(--line);
+             border-radius:8px; padding:9px 14px; cursor:pointer; width:auto; }
+  #chat { display:flex; flex-direction:column; gap:12px; padding:6px 2px 20px; }
+  .msg { max-width:78%; padding:9px 13px; border-radius:12px; }
+  .msg .who { font-size:11px; color:var(--muted); margin-bottom:2px; font-weight:600; }
+  .msg .txt { white-space:pre-wrap; }
+  .msg.you { align-self:flex-end; background:var(--you); }
+  .msg.bot { align-self:flex-start; background:var(--panel); border:1px solid var(--line); }
+  .msg.bot.p0 { border-left:3px solid var(--p0); }
+  .msg.bot.p1 { border-left:3px solid var(--p1); }
+  .msg.bot.p2 { border-left:3px solid var(--p2); }
+  .msg.bot.p3 { border-left:3px solid var(--p3); }
+  .composer { position:sticky; bottom:0; background:var(--bg); padding:12px 0;
+              border-top:1px solid var(--line); display:flex; gap:10px; }
+  .composer input { flex:1; }
+  .thinking { color:var(--muted); font-size:13px; font-style:italic; align-self:flex-start; }
+  .hint { color:var(--muted); font-size:12px; margin-top:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Duologue</h1>
+  <span class="tag">multi-persona chat · one local model, hard-separated personas</span>
+</header>
+
+<div class="wrap">
+  <details class="settings" id="settings" open>
+    <summary>Settings</summary>
+    <div class="body">
+      <div class="row">
+        <div>
+          <label>Model (loaded at first message; change re-loads)</label>
+          <select id="model"></select>
+          <div class="hint">Model-agnostic — any GGUF on the box. Uses that model's own chat template.</div>
+        </div>
+        <div>
+          <label>Your name (what the personas call you)</label>
+          <input id="user_name" placeholder="David">
+        </div>
+      </div>
+
+      <div class="row">
+        <div><label>Temperature</label><input id="temperature" type="number" step="0.05" min="0" max="2"></div>
+        <div><label>Max tokens / reply</label><input id="max_tokens" type="number" min="32" max="2048"></div>
+        <div><label>Threads</label><input id="n_threads" type="number" min="1" max="64"></div>
+      </div>
+
+      <label style="margin-top:16px">Personas — each replies every turn; address one by name and they answer first</label>
+      <div id="personas"></div>
+      <div class="btns">
+        <button class="ghost" id="addPersona">+ Add persona</button>
+        <button class="act" id="save">Save settings</button>
+        <span id="saved" class="hint"></span>
+      </div>
+    </div>
+  </details>
+
+  <div id="chat"></div>
+
+  <div class="composer">
+    <input id="text" placeholder="Type a message…  (try: &quot;Ada, what do you think?&quot;)" autocomplete="off">
+    <button class="act" id="send">Send</button>
+    <button class="ghost" id="reset" title="Start a new conversation">New</button>
+  </div>
+</div>
+
+<script>
+const PCOLORS = ["p0","p1","p2","p3"];
+let CFG = null, MODELS = [], NAMES = new Set();
+
+async function api(path, method="GET", body=null){
+  const r = await fetch(path, {method, headers:{"Content-Type":"application/json"},
+                               body: body? JSON.stringify(body): null});
+  return r.json();
+}
+
+function el(tag, attrs={}, ...kids){
+  const e=document.createElement(tag);
+  for(const k in attrs){ if(k==="class") e.className=attrs[k]; else if(k==="html") e.innerHTML=attrs[k]; else e.setAttribute(k,attrs[k]); }
+  for(const c of kids) e.append(c);
+  return e;
+}
+
+function personaCard(p={name:"",personality:""}){
+  const wrap = el("div",{class:"persona"});
+  const rm = el("button",{class:"rm",title:"Remove"},"×");
+  rm.onclick = ()=>wrap.remove();
+  const name = el("input",{placeholder:"Name (e.g. Ada)"}); name.value=p.name; name.dataset.f="name";
+  const per  = el("textarea",{placeholder:"Personality / instructions for this assistant…"}); per.value=p.personality; per.dataset.f="personality";
+  wrap.append(rm, el("label",{},"Name"), name, el("label",{},"Personality"), per);
+  return wrap;
+}
+
+function renderModels(){
+  const sel=document.getElementById("model"); sel.innerHTML="";
+  MODELS.forEach(m=>{
+    const o=el("option",{value:m}, m.split("/").pop());
+    if(m===CFG.model_path) o.selected=true;
+    sel.append(o);
+  });
+}
+
+function renderPersonas(){
+  const box=document.getElementById("personas"); box.innerHTML="";
+  (CFG.personas||[]).forEach(p=>box.append(personaCard(p)));
+}
+
+function collectConfig(){
+  const personas=[...document.querySelectorAll("#personas .persona")].map(card=>{
+    const o={}; card.querySelectorAll("[data-f]").forEach(i=>o[i.dataset.f]=i.value.trim());
+    return o;
+  }).filter(p=>p.name);
+  return {
+    user_name: document.getElementById("user_name").value.trim() || "You",
+    model_path: document.getElementById("model").value,
+    temperature: parseFloat(document.getElementById("temperature").value),
+    max_tokens: parseInt(document.getElementById("max_tokens").value),
+    n_threads: parseInt(document.getElementById("n_threads").value),
+    personas,
+  };
+}
+
+function bubble(m){
+  const you = m.speaker === CFG.user_name;
+  let cls="msg "+(you?"you":"bot");
+  if(!you){ const idx=[...NAMES].indexOf(m.speaker); cls+=" "+PCOLORS[(idx>=0?idx:0)%PCOLORS.length]; }
+  return el("div",{class:cls}, el("div",{class:"who"}, m.speaker), el("div",{class:"txt"}, m.text));
+}
+
+function renderTranscript(t){
+  const chat=document.getElementById("chat"); chat.innerHTML="";
+  NAMES = new Set((CFG.personas||[]).map(p=>p.name));
+  t.forEach(m=>chat.append(bubble(m)));
+  chat.scrollIntoView({block:"end"});
+  window.scrollTo(0, document.body.scrollHeight);
+}
+
+async function load(){
+  const s = await api("/api/state");
+  CFG = s.config; MODELS = s.models;
+  document.getElementById("user_name").value = CFG.user_name;
+  document.getElementById("temperature").value = CFG.temperature;
+  document.getElementById("max_tokens").value = CFG.max_tokens;
+  document.getElementById("n_threads").value = CFG.n_threads;
+  renderModels(); renderPersonas(); renderTranscript(s.transcript);
+}
+
+document.getElementById("addPersona").onclick = ()=>document.getElementById("personas").append(personaCard());
+document.getElementById("save").onclick = async ()=>{
+  const cfg=collectConfig();
+  const r=await api("/api/config","POST",cfg);
+  CFG=r.config; renderModels(); renderPersonas();
+  const s=document.getElementById("saved"); s.textContent="saved ✓"; setTimeout(()=>s.textContent="",1500);
+};
+
+async function send(){
+  const inp=document.getElementById("text"); const text=inp.value.trim(); if(!text) return;
+  inp.value=""; inp.disabled=true; document.getElementById("send").disabled=true;
+  const chat=document.getElementById("chat");
+  chat.append(bubble({speaker:CFG.user_name, text}));
+  const think=el("div",{class:"thinking"},"…the assistants are replying");
+  chat.append(think); window.scrollTo(0,document.body.scrollHeight);
+  try{
+    const r=await api("/api/say","POST",{text});
+    think.remove();
+    if(r.error){ chat.append(el("div",{class:"thinking"},"error: "+r.error)); }
+    else { renderTranscript(r.transcript); }
+  }catch(e){ think.remove(); chat.append(el("div",{class:"thinking"},"error: "+e)); }
+  inp.disabled=false; document.getElementById("send").disabled=false; inp.focus();
+}
+document.getElementById("send").onclick = send;
+document.getElementById("text").addEventListener("keydown", e=>{ if(e.key==="Enter") send(); });
+document.getElementById("reset").onclick = async ()=>{ await api("/api/reset","POST",{}); load(); };
+
+load();
+</script>
+</body>
+</html>
