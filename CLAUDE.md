@@ -310,12 +310,17 @@ answer first. Separation from ONE model: each persona is a distinct system promp
 the shared speaker-labeled transcript, with name-tag stop sequences — no second model
 needed. It's persisted in the encrypted `_prompts` and defaults **off** (Chloe behaves
 normally until enabled).
-- Runs in **CPU chat mode** (`cpu_images`). 12B models are slow and a group round
-  doubles calls per turn — pick **Qwen2.5-7B** for snappy multi-turn.
-- ⚠️ **GPU chat mode is broken** post the CUDA-13.2 driver move: the GPU-chat worker
-  (`transcribe-env`) can't load its CUDA llama build (`libcudart.so.12` missing). Use
-  CPU chat. Restoring GPU chat needs the CUDA-12 runtime installed (and only a small
-  model fits the 6 GB card anyway).
+- **CPU chat mode** (`cpu_images`, CPU chat + SDXL on GPU): 12B models are slow and a
+  group round doubles calls per turn — pick **Qwen2.5-7B** for snappy multi-turn.
+- **GPU chat mode** (`gpu_chat`, chat on GPU, **image gen off** — they can't share the
+  6 GB card): the worker runs under `transcribe-env` (CUDA llama + torch's bundled
+  CUDA-12 runtime, put on `LD_LIBRARY_PATH` by app.py). It offloads as many layers as
+  fit: a ~7B **fully** fits (~0.6 s/reply); bigger models partial-offload (12B ≈ 3 s).
+  `_spawn_chat_worker` tries a **descending layer chain across separate processes** and
+  the worker does a **1-token warm-up before signalling ready**, so a too-tight offload
+  falls back cleanly instead of OOM-crashing mid-reply (the old fixed 28-layer / 4096-ctx
+  default OOM'd on the 6 GB card). Tunables: `GPU_CHAT_LAYERS` (default 999 = all),
+  `GPU_CHAT_CTX` (default 2048).
 
 ---
 

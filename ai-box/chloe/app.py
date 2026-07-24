@@ -137,8 +137,13 @@ CHAT_GPU_LAYERS = 0  # CPU-only in-process build ignores this; kept explicit
 CHAT_MODES = ("cpu_images", "gpu_chat")
 GPU_CHAT_PY = os.environ.get("GPU_CHAT_PY", os.path.expanduser("~/transcribe-env/bin/python"))
 CHAT_WORKER_PATH = str(Path(__file__).resolve().parent / "chat_worker.py")
-GPU_CHAT_LAYERS = int(os.environ.get("GPU_CHAT_LAYERS", "28"))
-GPU_CHAT_CTX = int(os.environ.get("GPU_CHAT_CTX", "4096"))
+# Top of the GPU-offload fallback chain (see _gpu_layer_chain). Default 999 =
+# "offload everything", which fully fits a ~7B on the 6GB card (fast); bigger
+# models OOM at this and the chain steps down until one loads AND generates.
+GPU_CHAT_LAYERS = int(os.environ.get("GPU_CHAT_LAYERS", "999"))
+# 2048 keeps the KV cache + CUDA compute buffers small enough to leave headroom
+# on a 6GB card (4096 was OOMing at generation time with a big offload).
+GPU_CHAT_CTX = int(os.environ.get("GPU_CHAT_CTX", "2048"))
 # The GPU chat worker runs under transcribe-env, whose CUDA llama build needs
 # the torch-bundled CUDA runtime on LD_LIBRARY_PATH (same trick the captains-
 # log runner uses to load the summarizer on the GPU).
@@ -1428,29 +1433,60 @@ async def image_only(request: Request):
     }))
 
 
+def _gpu_layer_chain() -> list[int]:
+    """Descending GPU-layer counts to try, each in a SEPARATE worker process.
+    Starts at GPU_CHAT_LAYERS (default 999 = offload everything, which fully fits
+    a ~7B on this 6GB card) and steps down so bigger models that OOM still land
+    on a count that loads and generates."""
+    top = GPU_CHAT_LAYERS if GPU_CHAT_LAYERS > 0 else 999
+    out, seen = [], set()
+    for n in [top, 24, 20, 16, 12, 8]:
+        n = min(n, top)
+        if n >= 1 and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
 def _spawn_chat_worker(chat_path: str):
     """Start the GPU chat subprocess (transcribe-env python + CUDA llama) and
-    block until it signals ready. Raises on failure."""
+    block until it signals ready. Tries decreasing GPU-layer counts across
+    SEPARATE processes: a CUDA OOM in llama.cpp can abort the whole worker
+    process (uncatchable in Python), so a fresh process is the only way to fall
+    back. The worker also warms up with a 1-token generation before signalling
+    ready, so a count that loads but can't generate is rejected here rather than
+    dying mid-reply. Raises if no layer count works."""
     global _chat_worker, _chat_worker_layers
-    print(f"starting GPU chat worker for {_chat_selection['model']}...", flush=True)
     env = {**os.environ}
     if _GPU_CHAT_NVIDIA_LIBS:
         env["LD_LIBRARY_PATH"] = _GPU_CHAT_NVIDIA_LIBS + ":" + env.get("LD_LIBRARY_PATH", "")
-    p = subprocess.Popen(
-        [GPU_CHAT_PY, CHAT_WORKER_PATH, chat_path, str(GPU_CHAT_LAYERS), str(GPU_CHAT_CTX)],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1, env=env,
-    )
-    line = p.stdout.readline()
-    if not line:
-        p.kill()
-        raise RuntimeError("chat worker exited before signalling ready")
-    msg = json.loads(line)
-    if not msg.get("ready"):
-        p.kill()
-        raise RuntimeError(msg.get("error", "chat worker failed to load model"))
-    _chat_worker = p
-    _chat_worker_layers = int(msg.get("gpu_layers", 0))
-    print(f"GPU chat worker ready ({_chat_worker_layers} layers on GPU)", flush=True)
+    last_err = "no GPU layer count worked"
+    for layers in _gpu_layer_chain():
+        print(f"starting GPU chat worker for {_chat_selection['model']} @ {layers} layers...", flush=True)
+        p = subprocess.Popen(
+            [GPU_CHAT_PY, CHAT_WORKER_PATH, chat_path, str(layers), str(GPU_CHAT_CTX)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1, env=env,
+        )
+        line = p.stdout.readline()
+        if line:
+            try:
+                msg = json.loads(line)
+            except Exception:
+                msg = {}
+            if msg.get("ready"):
+                _chat_worker = p
+                _chat_worker_layers = int(msg.get("gpu_layers", layers))
+                print(f"GPU chat worker ready ({_chat_worker_layers} layers on GPU)", flush=True)
+                return
+            last_err = msg.get("error", "worker failed to load")
+        else:
+            last_err = f"worker aborted at {layers} GPU layers (VRAM OOM)"
+        try:
+            p.kill()
+        except Exception:
+            pass
+        print(f"gpu chat: {last_err}; trying fewer layers", flush=True)
+    raise RuntimeError(f"GPU chat failed to load: {last_err}")
 
 
 def _kill_worker():

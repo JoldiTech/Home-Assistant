@@ -48,6 +48,13 @@ restarting.
 
 ## Runtime note
 
-Runs in **CPU chat mode**. GPU chat mode is currently broken (the CUDA-13.2
-driver move left the GPU-chat worker without `libcudart.so.12`); use CPU. For
-snappy multi-turn use a smaller model (Qwen2.5-7B) rather than a 12B.
+Group chat runs in **CPU chat mode** (`cpu_images`). For snappy multi-turn use a
+smaller model (Qwen2.5-7B) rather than a 12B.
+
+`chat_worker.py` + `_spawn_chat_worker` are the **GPU chat** path (separate mode,
+image gen off). It's here because they were fixed alongside: the worker now warms
+up (1-token generation) before signalling ready, and the app tries a descending
+GPU-layer chain across separate processes, so a too-tight offload on the 6 GB card
+falls back instead of OOM-crashing. A ~7B fully offloads (~0.6 s/reply); bigger
+models partial-offload. Tunables: `GPU_CHAT_LAYERS` (default 999=all), `GPU_CHAT_CTX`
+(default 2048).
