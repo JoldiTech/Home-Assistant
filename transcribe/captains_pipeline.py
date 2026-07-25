@@ -767,6 +767,45 @@ _UNAVAILABLE_RE = re.compile(
     r"didn't have|don't carry|not carried|ran out|restock", re.IGNORECASE)
 
 
+_REORDER_RE = re.compile(
+    r"reorder|re-order|restock|re-stock|out of stock|unmet demand|confirm availability", re.I)
+
+
+def _reject_sold_reorders(markdown: str, biz: dict) -> str:
+    """A sale is proof of stock - the opposite of unmet demand.
+
+    SYSTEM_PROMPT states this outright ("a sale is proof of stock ... 'Reorder
+    X' is valid ONLY when speech says X was asked for and unavailable") and the
+    model does it anyway: it asked to reorder Lady Londonderry on a day a
+    customer bought 8oz of it, and to reorder cactus nectar off the line "we
+    have cactus nectar, which is super delicious". Checked against the register,
+    not the model's judgment.
+
+    Deliberately NOT extended to catalog stock: "floor says out, website says in
+    stock" is a real finding the log is supposed to surface (see
+    _flag_stock_contradictions). Only an actual sale settles it.
+    """
+    sold = set()
+    for o in ((biz.get("sales") or {}).get("orders") or []):
+        for it in (o.get("items") or []):
+            n = _norm_name(str(it.get("name") or ""))
+            if len(n) >= 6:
+                sold.add(n)
+    if not sold:
+        return markdown
+    out = []
+    for line in markdown.splitlines():
+        if line.lstrip().startswith(("-", "*")) and _REORDER_RE.search(line):
+            nline = _norm_name(line)
+            hit = next((s for s in sold
+                        if re.search(r"\b" + re.escape(s) + r"\b", nline)), None)
+            if hit:
+                _warn(f"dropped reorder bullet - it sold today: {hit}")
+                continue
+        out.append(line)
+    return "\n".join(out)
+
+
 def _flag_stock_contradictions(markdown: str, products: list[dict]) -> str:
     """Deterministic cross-check the user asked for: when the floor says a
     product was out of stock but the website (3dcart, the canonical catalog)
@@ -1445,6 +1484,7 @@ def main():
     # garbled string ("…rye, brunckel, Strawberry Black") gets stock-flagged,
     # dressing mic noise up as a verified reorder.
     markdown = _drop_garble_bullets(markdown)
+    markdown = _reject_sold_reorders(markdown, biz)
     markdown = _flag_stock_contradictions(markdown, products)
     # Runs BEFORE the stats block is appended: timeclock names belong there,
     # what must not survive is a staff name attached to something they said.
