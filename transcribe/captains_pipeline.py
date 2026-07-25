@@ -1546,6 +1546,12 @@ def main():
         _warn(f"{date_str}: no speech and no business data - nothing to log")
         return
 
+    # Keep the un-woven speech: the discrepancy gate asks "did a human say this
+    # amount out loud", and _weave_orders injects every POS total into the
+    # transcript. Checking the woven text would let a sale total vouch for
+    # itself as a discrepancy - exactly the failure the gate exists to catch.
+    raw_speech = transcript
+
     if have_speech:
         transcript = _weave_orders(transcript, biz.get("sales"), date_str)
         markdown = _summarize(transcript, day, slack_text, _records_index(biz),
@@ -1567,7 +1573,7 @@ def main():
     # dressing mic noise up as a verified reorder.
     markdown = _drop_garble_bullets(markdown)
     markdown = _reject_sold_reorders(markdown, biz)
-    markdown = _reject_unsupported_discrepancies(markdown, transcript if have_speech else "")
+    markdown = _reject_unsupported_discrepancies(markdown, raw_speech if have_speech else "")
     markdown = _flag_stock_contradictions(markdown, products)
     # Runs BEFORE the stats block is appended: timeclock names belong there,
     # what must not survive is a staff name attached to something they said.
