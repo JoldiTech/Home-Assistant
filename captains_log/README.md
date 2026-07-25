@@ -63,6 +63,16 @@ raw transcript deleted
   out of stock but the website shows stock, the contradiction itself is
   flagged in code — `⚠ website shows in stock: …` — either the site is
   overselling or the floor missed inventory, and both are worth knowing.
+- **Discrepancy gate (`_reject_unsupported_discrepancies`)**: the summarizer
+  invents register discrepancies — it fabricated one on three consecutive days,
+  turning a cashier reading a total ("62.15 today") and a $50.31 sale into
+  shortfalls to reconcile. Rewording the prompt didn't stop it; it is matching
+  the Unresolved format rather than reading the day. A discrepancy bullet now
+  has to survive two tests against the day's speech: somebody must have
+  reported money going wrong at all, **and** the amount must have been said
+  aloud — on a day with a genuine till count the model still attached the
+  wrong figure. Either test sinks the bullet. The vocabulary is deliberately
+  narrow: a bare "short" ("short on time") is not a till problem.
 - **Sold-today gate (`_reject_sold_reorders`)**: a sale is proof of stock, so a
   "reorder / restock / confirm availability" bullet naming something the
   register rang up that day is dropped outright. The prompt says this too, and
