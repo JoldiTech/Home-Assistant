@@ -531,6 +531,7 @@ function renderChat() {
         <form id="chat-form">
           <textarea id="chat-message" rows="2" placeholder="say something..." autofocus required></textarea>
           <button type="submit" id="send-btn">send</button>
+          <button type="button" id="skip-btn" style="display:none" title="let the assistants talk to each other for one round, without you">skip my turn &rarr;</button>
           <button type="button" id="stop-btn" style="display:none">stop</button>
           ${imgControls}
         </form>
@@ -547,6 +548,7 @@ function renderChat() {
   });
   $("chat-form").addEventListener("submit", onChatSubmit);
   $("stop-btn").addEventListener("click", onChatStop);
+  if ($("skip-btn")) $("skip-btn").addEventListener("click", onSkipTurn);
   if ($("get-image-btn")) $("get-image-btn").addEventListener("click", onGetImage);
 }
 
@@ -697,30 +699,30 @@ async function refreshTranscript() {
 
 async function loadState(mode) {
   try {
-    const { history, gallery } = await apiCall("/api/state", { mode });
+    const { history, gallery, group_mode } = await apiCall("/api/state", { mode });
     renderTranscript(history || []);
     if (gallery) for (const img of gallery) appendGalleryImage(img);
+    if (group_mode && $("skip-btn")) $("skip-btn").style.display = "";
   } catch (err) {
     // fresh conversation, nothing to load
   }
 }
 
-async function onChatSubmit(e) {
-  e.preventDefault();
-  const message = $("chat-message").value.trim();
-  if (!message) return;
-  $("chat-message").value = "";
-  appendMessage("user", message);
+// Shared streaming turn. bodyObj is {message} for a normal turn or
+// {advance:true} to "skip my turn" (personas continue talking to each other,
+// no user message). The reply streams as newline-delimited encrypted envelopes:
+// single-Chloe mode emits {delta}/{replace}/{done} for one bubble; group mode
+// tags events with {speaker} and brackets each persona with {start}/{end}, so
+// we open a fresh bubble per persona - each types to completion, in turn.
+async function streamTurn(bodyObj) {
   const btn = $("send-btn");
+  const skipBtn = $("skip-btn");
   btn.disabled = true;
+  if (skipBtn) skipBtn.disabled = true;
   const stopBtn = $("stop-btn");
   stopBtn.style.display = "";
   stopBtn.disabled = false;
   $("chat-status").textContent = "thinking...";
-  // The reply streams as newline-delimited encrypted envelopes. Single-Chloe
-  // mode emits {delta}/{replace}/{done} for one bubble. Group mode tags events
-  // with {speaker} and brackets each persona with {start}/{end}, so we open a
-  // fresh bubble per persona - each types to completion, in turn.
   let curSpan = null, curSpeaker = null, text = "";
   const ensureBubble = (speaker) => {
     if (curSpan && curSpeaker === (speaker || null)) return;
@@ -732,7 +734,7 @@ async function onChatSubmit(e) {
     const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(await encryptEnvelope({ message })),
+      body: JSON.stringify(await encryptEnvelope(bodyObj)),
     });
     if (res.status === 401) {
       showLogin("session expired - enter password again");
@@ -771,9 +773,25 @@ async function onChatSubmit(e) {
     $("chat-status").textContent = err.message || "failed to get a reply";
   } finally {
     btn.disabled = false;
+    if (skipBtn) skipBtn.disabled = false;
     if ($("stop-btn")) $("stop-btn").style.display = "none";
     await refreshTranscript();   // replace live bubbles with indexed, editable ones
   }
+}
+
+async function onChatSubmit(e) {
+  e.preventDefault();
+  const message = $("chat-message").value.trim();
+  if (!message) return;
+  $("chat-message").value = "";
+  appendMessage("user", message);
+  await streamTurn({ message });
+}
+
+// "Skip my turn": one round where every persona replies with no input from you,
+// so they respond to each other. Push again for another round.
+async function onSkipTurn() {
+  await streamTurn({ advance: true });
 }
 
 function appendPlaceholder() {

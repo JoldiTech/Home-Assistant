@@ -306,7 +306,9 @@ a mirror lives in this repo at `ai-box/chloe/`). Settings → *group chat (perso
 toggle it on, set your name, and add personas (name + personality). Each turn every
 persona replies **round-robin, streaming, one at a time to completion** (so the next
 persona sees the previous reply and can respond to it); address one by name and they
-answer first. Separation from ONE model: each persona is a distinct system prompt over
+answer first. A **"skip my turn"** button (chat composer, group mode only) runs one
+round with no input from you, so the personas talk to each other — push again for
+another round (`{"advance": true}` to `/api/chat`). Separation from ONE model: each persona is a distinct system prompt over
 the shared speaker-labeled transcript, with name-tag stop sequences — no second model
 needed. It's persisted in the encrypted `_prompts` and defaults **off** (Chloe behaves
 normally until enabled).

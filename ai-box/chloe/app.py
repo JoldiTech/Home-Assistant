@@ -694,7 +694,8 @@ async def get_state(request: Request):
     mode = body.get("mode")
     mode_state = state.get(mode, {})
     return JSONResponse(
-        _encrypt({"history": mode_state.get("history", []), "gallery": mode_state.get("gallery")})
+        _encrypt({"history": mode_state.get("history", []), "gallery": mode_state.get("gallery"),
+                  "group_mode": bool(_prompts and _prompts.get("group_mode") and _prompts.get("personas"))})
     )
 
 
@@ -1121,16 +1122,20 @@ async def chat(request: Request):
     token, state = result
     aes = _current_aesgcm.get()
     body = _decrypt(await request.json())
+    advance = bool(body.get("advance"))   # "skip my turn": personas continue with no user message
     message = (body.get("message") or "").strip()[:4000]
-    if not message:
-        return JSONResponse({"error": "empty message"}, status_code=400)
-
-    history = state["chat"]["history"]
-    history.append({"role": "user", "content": message})
     with _config_lock:
         system_prompt = _prompts["system_prompt"]
         personas = list(_prompts.get("personas", [])) if _prompts.get("group_mode") else []
         user_name = _prompts.get("user_name", "You")
+    if advance and not personas:
+        return JSONResponse({"error": "skip only works in group chat"}, status_code=400)
+    if not advance and not message:
+        return JSONResponse({"error": "empty message"}, status_code=400)
+
+    history = state["chat"]["history"]
+    if message:
+        history.append({"role": "user", "content": message})
     messages = [{"role": "system", "content": system_prompt},
                 *history[-MAX_HISTORY:]]
     # A fresh cancel event per turn; /api/chat-stop sets it.

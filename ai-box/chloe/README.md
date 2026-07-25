@@ -22,7 +22,9 @@ llama.cpp model and converse with you *and each other*.
 - **Each turn, every persona replies round-robin, streaming, one at a time to
   completion**, so the next persona sees the previous reply and can respond to
   it. Address a persona by name and they answer first (the lead rotates
-  otherwise).
+  otherwise). A **"skip my turn"** button runs one round with no input from you,
+  so the personas talk to each other (push again for another round) — it POSTs
+  `{"advance": true}` to `/api/chat`.
 - **Separation from one model instance:** a chat LLM is stateless between calls,
   so each persona is just a distinct system prompt over the shared,
   speaker-labeled transcript, with stop sequences on the other speakers' name
