@@ -755,6 +755,12 @@ def _context_block(biz: dict) -> str:
 
 _ANNOT_RE = re.compile(r"\s*\((?:likely\s+)?(order|ticket)\s*#([A-Za-z0-9\-]+)[^)]*\)")
 
+# Lines about money handled at the counter - these can only concern an order
+# rung up during store hours, never an overnight online one.
+_REGISTERISH = re.compile(r"register|drawer|till|cash|shortfall|discrepan", re.I)
+STORE_OPEN_HOUR = int(os.environ.get("TRANSCRIBE_START_HOUR", "8"))
+STORE_CLOSE_HOUR = int(os.environ.get("TRANSCRIBE_END_HOUR", "20"))
+
 
 _UNAVAILABLE_RE = re.compile(
     r"reorder|out of stock|sold out|unavailable|not available|wasn't available|"
@@ -947,9 +953,12 @@ def _validate_annotations(markdown: str, biz: dict) -> str:
     whose amount contradicts the amount already stated in the same line
     (the 8B model keeps attaching $20.99 orders to $70 shortfalls no matter
     what the prompt says)."""
-    amounts = {}
+    amounts, order_hour = {}, {}
     for o in ((biz.get("sales") or {}).get("orders") or []):
         amounts[str(o.get("id"))] = float(o.get("total") or 0)
+        t = str(o.get("time_local") or "")
+        if len(t) >= 13 and t[11:13].isdigit():
+            order_hour[str(o.get("id"))] = int(t[11:13])
     sup = biz.get("support") or {}
     ticket_ids = {str(t.get("id"))
                   for t in (sup.get("created") or []) + (sup.get("closed") or [])}
@@ -962,6 +971,17 @@ def _validate_annotations(markdown: str, biz: dict) -> str:
                 return m.group(0) if rid in ticket_ids else ""
             if rid not in amounts:
                 return ""
+            # CORRELATE_SYSTEM asks for time AND amount corroboration; the code
+            # only ever checked amount, which is how a $62.15 order timed 05:24
+            # got stapled to speech at 11:27 purely because the number matched.
+            # A general proximity test isn't possible (the log line rarely
+            # states when the event happened), but a register/cash/drawer line
+            # is by definition about something that happened on the floor, so
+            # an order placed outside store hours cannot be it.
+            if _REGISTERISH.search(line):
+                h = order_hour.get(rid)
+                if h is not None and not (STORE_OPEN_HOUR <= h < STORE_CLOSE_HOUR):
+                    return ""
             line_amts = [float(a.replace(",", ""))
                          for a in re.findall(r"\$([\d,]+(?:\.\d+)?)", line[:m.start()])]
             if line_amts:

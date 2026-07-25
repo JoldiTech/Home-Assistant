@@ -58,6 +58,51 @@ HOTWORDS = (
 )
 _NOISE = {"[blank_audio]", "(blank_audio)", "[silence]", "[music]", "(music)", "you", "."}
 
+# The 6GB card is shared with Chloe (imagegen), whose SDXL pass can hold ~4GB.
+# large-v3 float16 needs ~4GB, so a badly-timed overlap OOMs mid-run. The
+# summarizer already degrades gracefully via its [30,20,0] layer chain; this
+# gives the transcriber the same courtesy instead of dying. Order matters:
+# float16 is the quality baseline, int8_float16 roughly halves the weights.
+_LOAD_PLAN = (
+    dict(device="cuda", compute_type="float16"),
+    dict(device="cuda", compute_type="int8_float16"),
+    dict(device="cpu", compute_type="int8"),
+)
+_OOM_MARKERS = ("out of memory", "cuda failed", "cublas", "cudnn")
+
+
+def _is_oom(e: Exception) -> bool:
+    return any(m in str(e).lower() for m in _OOM_MARKERS)
+
+
+def _free_vram_mb() -> int:
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return int(r.stdout.split("\n")[0].strip())
+    except Exception:
+        return -1
+
+
+def _load_model(plan_from: int = 0):
+    """Load large-v3, degrading through _LOAD_PLAN on VRAM failure."""
+    last = None
+    for i in range(plan_from, len(_LOAD_PLAN)):
+        cfg = _LOAD_PLAN[i]
+        try:
+            print(f"[transcribe_day] loading large-v3 ({cfg['device']}/{cfg['compute_type']}, "
+                  f"{_free_vram_mb()}MB VRAM free)...", file=sys.stderr, flush=True)
+            return WhisperModel("large-v3", **cfg), i
+        except Exception as e:
+            last = e
+            print(f"[transcribe_day] load failed ({cfg['compute_type']}): {e}",
+                  file=sys.stderr, flush=True)
+            if not _is_oom(e) and cfg["device"] == "cpu":
+                break
+    raise RuntimeError(f"could not load large-v3 in any mode: {last}")
+
 OUT_DIR = Path.home() / "captains_transcripts"
 TMP = Path("/tmp/transcribe_day")
 
@@ -107,7 +152,12 @@ async def main():
     OUT_DIR.mkdir(exist_ok=True)
     TMP.mkdir(exist_ok=True)
     out_log = OUT_DIR / f"tea_one_{date_str}.log"
-    out_log.write_text("")
+    # Write to a sidecar and swap in only on success. Truncating the real
+    # transcript up front meant a mid-run crash (a CUDA OOM at 16:00 on
+    # 2026-07-24) destroyed a complete transcript and left a truncated one in
+    # its place, with no way back short of re-pulling the audio.
+    part_log = OUT_DIR / f"tea_one_{date_str}.log.partial"
+    part_log.write_text("")
 
     client = ProtectApiClient(
         creds["PROTECT_HOST"], 443, creds["PROTECT_LOCAL_USER"], creds["PROTECT_LOCAL_PASS"],
@@ -115,10 +165,10 @@ async def main():
     )
     await client.update()
     print(f"[transcribe_day] {date_str}: Protect login OK", file=sys.stderr, flush=True)
-    print("[transcribe_day] loading large-v3 on GPU...", file=sys.stderr, flush=True)
-    model = WhisperModel("large-v3", device="cuda", compute_type="float16")
+    model, plan_i = _load_model()
 
     total = 0
+    failed_chunks = 0
     for i, (start, end) in enumerate(_windows(day)):
         mp4 = TMP / f"chunk_{i}.mp4"
         wav = TMP / f"chunk_{i}.wav"
@@ -135,25 +185,47 @@ async def main():
              "-map", "0:a:0", "-ac", "1", "-ar", "16000", str(wav)],
             check=True,
         )
-        segs, _ = model.transcribe(
-            str(wav), language="en", vad_filter=True, vad_parameters=VAD_PARAMS,
-            condition_on_previous_text=False, hotwords=HOTWORDS,
-        )
-        lines = []
-        prev, run = None, 0
-        for s in segs:
-            text = s.text.strip()
-            if not text or text.lower() in _NOISE:
-                continue
-            if text == prev:
-                run += 1
-                if run > MAX_REPEAT:
-                    continue
-            else:
-                prev, run = text, 1
-            ts = start + timedelta(seconds=s.start)
-            lines.append(f"{ts.strftime('%Y-%m-%d %H:%M:%S %Z')} | {text}")
-        with open(out_log, "a") as f:
+        # faster-whisper yields lazily, so OOM surfaces while draining `segs`,
+        # not at the transcribe() call - hence the whole drain is inside the
+        # retry. On a VRAM failure, wait for Chloe to let go, then reload one
+        # step down the plan; one bad hour must not cost the whole day.
+        lines = None
+        for attempt in range(3):
+            try:
+                segs, _ = model.transcribe(
+                    str(wav), language="en", vad_filter=True, vad_parameters=VAD_PARAMS,
+                    condition_on_previous_text=False, hotwords=HOTWORDS,
+                )
+                lines = []
+                prev, run = None, 0
+                for s in segs:
+                    text = s.text.strip()
+                    if not text or text.lower() in _NOISE:
+                        continue
+                    if text == prev:
+                        run += 1
+                        if run > MAX_REPEAT:
+                            continue
+                    else:
+                        prev, run = text, 1
+                    ts = start + timedelta(seconds=s.start)
+                    lines.append(f"{ts.strftime('%Y-%m-%d %H:%M:%S %Z')} | {text}")
+                break
+            except Exception as e:
+                if not _is_oom(e) or attempt == 2:
+                    print(f"[transcribe_day] chunk {i} failed: {e}", file=sys.stderr, flush=True)
+                    break
+                print(f"[transcribe_day] chunk {i} VRAM failure ({_free_vram_mb()}MB free), "
+                      f"reloading a step down...", file=sys.stderr, flush=True)
+                del model
+                time.sleep(20)
+                model, plan_i = _load_model(min(plan_i + 1, len(_LOAD_PLAN) - 1))
+        if lines is None:
+            failed_chunks += 1
+            mp4.unlink(missing_ok=True)
+            wav.unlink(missing_ok=True)
+            continue
+        with open(part_log, "a") as f:
             for ln in lines:
                 f.write(ln + "\n")
         total += len(lines)
@@ -166,7 +238,20 @@ async def main():
         wav.unlink(missing_ok=True)
 
     await client.close_session()
-    print(f"[transcribe_day] DONE {date_str}: {total} lines -> {out_log}", file=sys.stderr, flush=True)
+
+    # Only now does the previous transcript get replaced. If every chunk failed
+    # we keep whatever was already on disk rather than overwriting it with
+    # nothing - a stale complete transcript beats a fresh empty one.
+    if total == 0 and failed_chunks and out_log.exists() and out_log.stat().st_size:
+        print(f"[transcribe_day] {failed_chunks} chunk(s) failed and nothing was "
+              f"transcribed - keeping the existing {out_log}", file=sys.stderr, flush=True)
+        part_log.unlink(missing_ok=True)
+        sys.stdout.write(out_log.read_text())
+        return
+    part_log.replace(out_log)
+    note = f" ({failed_chunks} chunk(s) failed)" if failed_chunks else ""
+    print(f"[transcribe_day] DONE {date_str}: {total} lines -> {out_log}{note}",
+          file=sys.stderr, flush=True)
     # transcript to stdout for the caller
     sys.stdout.write(out_log.read_text())
 
