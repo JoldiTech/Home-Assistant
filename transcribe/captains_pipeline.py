@@ -1267,7 +1267,11 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
     # CPU. Covers the edge case where Chloe's image tool is holding VRAM at run
     # time - the summary still completes (slower) instead of failing the job.
     llm = None
-    for layers in [SUMMARIZER_GPU_LAYERS, 20, 0]:
+    # Strictly decreasing, and derived from the configured value rather than a
+    # fixed 20 - a bigger model needs a LOWER starting offload, and the old
+    # [configured, 20, 0] chain would retry with MORE layers than just failed.
+    _plan = sorted({SUMMARIZER_GPU_LAYERS, SUMMARIZER_GPU_LAYERS // 2, 0}, reverse=True)
+    for layers in _plan:
         try:
             llm = Llama(model_path=SUMMARIZER_MODEL, n_ctx=SUMMARIZER_CTX, n_threads=8,
                         n_gpu_layers=layers, verbose=False)
@@ -1446,6 +1450,14 @@ def main():
     # what must not survive is a staff name attached to something they said.
     markdown = _strip_staff_attribution(markdown, _staff_names(biz, slack_names))
     markdown = markdown.rstrip() + "\n\n" + _business_sections(biz)
+
+    # DRY_RUN builds the log and prints it without touching git - the only way
+    # to compare summarizer models on a real day without republishing it.
+    if os.environ.get("DRY_RUN"):
+        _warn(f"{date_str}: DRY_RUN - built but not pushed")
+        sys.stdout.write(markdown)
+        return
+
     _commit_and_push(date_str, markdown, env)
 
     # Transcripts stay on this box (never in git) so test reruns skip the
