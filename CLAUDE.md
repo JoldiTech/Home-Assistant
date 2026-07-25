@@ -311,23 +311,53 @@ recent detection cleared (≈ last seen).
 
 ### Person-detection cameras
 
-⚠️ **Entity IDs do NOT match friendly names.** Map via `friendly_name`, not the
-entity prefix — this mismatch is the #1 time-sink.
+✅ **Entity IDs now match the camera names** (fixed 2026-07-25). They used to
+encode each camera's *original* name — `binary_sensor.g6_dome_person_detected`
+was Tea One, `g6_180` was Back Yard, `tea_two` was Emporium Floor — which was
+documented here as the #1 time-sink. After the cameras were renamed in Protect,
+all 15 camera and 98 related `binary_sensor` entity IDs were renamed to match
+their device name, so `<camera>_person_detected` is now the reliable pattern.
 
-| Location (friendly name) | Person-detected entity |
-|---|---|
-| Emporium Floor | `binary_sensor.tea_two_person_detected` |
-| Emporium Hall | `binary_sensor.emporium_hall_person_detected` |
-| Tea One | `binary_sensor.g6_dome_person_detected` |
-| Tea Two Camera | `binary_sensor.tea_two_neo_person_detected` |
-| Packing Station | `binary_sensor.packing_station_person_detected` |
-| Store Room | `binary_sensor.store_room_person_detected` |
-| Back Yard | `binary_sensor.g6_180_person_detected` |
-| Tea One (secondary, often offline) | `binary_sensor.tea_one_person_detected` |
+**13 cameras** (all CONNECTED in Protect). Person-AI on 11 of them:
 
-Motion-only cameras (no person AI): **Kitchen**, **Curbside / Backdoor**,
-**12th Street Emporium**. Each camera also exposes `_motion`, `_vehicle_detected`,
-`_animal_detected`, plus audio detections.
+| Camera | Person-detected entity | Feed used on the dashboard |
+|---|---|---|
+| Back Yard | `binary_sensor.back_yard_person_detected` | `camera.back_yard_high_resolution_channel` |
+| Curbside / Backdoor | `binary_sensor.curbside_backdoor_person_detected` | `camera.curbside_backdoor_high_resolution_channel` |
+| Emporium Floor | `binary_sensor.emporium_floor_person_detected` | `camera.emporium_floor_high_resolution_channel` |
+| Emporium Hall | `binary_sensor.emporium_hall_person_detected` | `camera.emporium_hall_high_resolution_channel` |
+| G6 180 | `binary_sensor.g6_180_person_detected` | `camera.g6_180_high_resolution_channel` |
+| Packing Station | `binary_sensor.packing_station_person_detected` | `camera.packing_station_high_resolution_channel` |
+| Parking Lot | `binary_sensor.parking_lot_person_detected` | `camera.parking_lot_high_resolution_channel` |
+| Store Room | `binary_sensor.store_room_person_detected` | `camera.store_room_high_resolution_channel` |
+| Tea One | `binary_sensor.tea_one_person_detected` | `camera.tea_one_low_resolution_channel` ¹ |
+| Tea Two Camera | `binary_sensor.tea_two_camera_person_detected` | `camera.tea_two_camera_high_resolution_channel` |
+| West Side | `binary_sensor.west_side_person_detected` | `camera.west_side_high_resolution_channel` |
+
+¹ Tea One's and 12th Street Emporium's **high-resolution** entities report
+`unavailable` even though both cameras are CONNECTED; their low-res channels
+record fine, so the dashboard uses those. The Protect *integration* API doesn't
+expose per-channel config and the legacy Protect admin API rejects the console
+key with 401 (unlike the Network legacy API), so channel state can't be checked
+from a script — use the Protect UI.
+
+Motion-only cameras (no person AI): **Kitchen**, **12th Street Emporium**. Each
+camera also exposes `_motion`, `_vehicle_detected`, `_animal_detected`, plus
+audio detections.
+
+> **HA device names can override Protect.** "Tea Two Camera" is a `name_by_user`
+> set in HA; Protect calls that camera **Tea Two Neo**. Entity IDs follow the HA
+> name. If a camera's IDs look unrelated to Protect, check for a name override.
+
+**When cameras are renamed in Protect again:** reload the UniFi Protect config
+entry first (`homeassistant.reload_config_entry` targeting any Protect entity) —
+device names refresh, but **entity IDs never follow automatically**. Renaming
+them is a websocket-API job (`config/entity_registry/update`, not REST), and it
+silently breaks `automations.yaml`: the `last_person_detected_snapshot` cam_map
+and the two person-detection trigger lists all hardcode entity IDs. Worse, an
+old ID can survive pointing at a *different* camera (`g6_180` meant Back Yard
+before the rename and means G6 180 after), so replace whole blocks rather than
+find-and-replacing tokens, and re-check with `ha core check`.
 
 ### Useful raw API calls (cameras)
 
