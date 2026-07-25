@@ -63,6 +63,27 @@ raw transcript deleted
   out of stock but the website shows stock, the contradiction itself is
   flagged in code — `⚠ website shows in stock: …` — either the site is
   overselling or the floor missed inventory, and both are worth knowing.
+- **Sold-today gate (`_reject_sold_reorders`)**: a sale is proof of stock, so a
+  "reorder / restock / confirm availability" bullet naming something the
+  register rang up that day is dropped outright. The prompt says this too, and
+  the model ignored it — asking to reorder Lady Londonderry on a day someone
+  bought 8oz of it. Checked against the register, not the model's judgment.
+  (Distinct from the stock cross-check above: an unsold item the *website*
+  claims to stock is a finding worth keeping, not a bullet to delete.)
+- **Garble gate (`_drop_garble_bullets`)**: action items whose subject is
+  mis-transcription — mixed scripts, 7+ word strings, comma-salad — are
+  removed, and the catalog matcher refuses to rename garble into a real
+  product. Without this the stock cross-check finds a genuine product name
+  buried inside noise and promotes the whole string to a verified reorder.
+  Deliberately conservative: real unmet demand is the log's most valuable
+  content, so only unmistakable noise is rejected.
+- **Annotation cap (`_validate_annotations`)**: the correlation prompt allows
+  at most 3 record references and forbids attaching them to product mentions;
+  neither was enforced, and logs shipped 5+, mostly on products. Excess
+  references are now dropped by priority — action bullets and money-gone-wrong
+  lines keep theirs, narrative product mentions lose theirs. Register/cash
+  lines additionally reject orders placed outside store hours, since money
+  handled at the counter cannot be an overnight online order.
 - **Deterministic sections**: dollar figures, counts, names, and hours never
   pass through the LLM — they're rendered directly from the datalog JSON after
   redaction, so they can't be mangled or hallucinated.
