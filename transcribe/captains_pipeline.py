@@ -75,6 +75,9 @@ SUMMARIZER_MODEL = os.environ.get(
 # the smaller 7B (which has fewer layers). Env-overridable; 0 forces CPU.
 SUMMARIZER_GPU_LAYERS = int(os.environ.get("SUMMARIZER_GPU_LAYERS", "30"))
 SUMMARIZER_CTX = int(os.environ.get("SUMMARIZER_CTX", "8192"))
+# Keep the Qwen3 hybrid "/no_think" suffix (see _gen). Set 0 for non-hybrid
+# instruct models, where it is just noise on the end of every system prompt.
+_NOTHINK = os.environ.get("SUMMARIZER_NOTHINK", "1") != "0"
 
 DEFAULT_REPO = "JoldiTech/Home-Assistant"
 LOG_BRANCH = "captains-log"
@@ -1332,6 +1335,11 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
     INPUT_BUDGET = SUMMARIZER_CTX - 2600 - _tok(slack_block)  # room for system + template + output
 
     def _gen(system, user, max_tokens, temperature=0.3):
+        # "/no_think" is a Qwen3 HYBRID control token. Non-hybrid instruct models
+        # (e.g. Qwen3-*-Instruct-2507) don't understand it and just see a stray
+        # token at the end of every system prompt. SUMMARIZER_NOTHINK=0 strips it.
+        if not _NOTHINK:
+            system = system.replace(" /no_think", "").replace("/no_think", "")
         out = llm.create_chat_completion(
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             max_tokens=max_tokens, temperature=temperature, top_p=0.9, repeat_penalty=1.1,
