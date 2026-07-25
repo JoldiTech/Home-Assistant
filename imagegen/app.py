@@ -33,6 +33,7 @@ import asyncio
 import base64
 import concurrent.futures
 import contextvars
+import ctypes
 import re
 import gc
 import hashlib
@@ -137,8 +138,13 @@ CHAT_GPU_LAYERS = 0  # CPU-only in-process build ignores this; kept explicit
 CHAT_MODES = ("cpu_images", "gpu_chat")
 GPU_CHAT_PY = os.environ.get("GPU_CHAT_PY", os.path.expanduser("~/transcribe-env/bin/python"))
 CHAT_WORKER_PATH = str(Path(__file__).resolve().parent / "chat_worker.py")
-GPU_CHAT_LAYERS = int(os.environ.get("GPU_CHAT_LAYERS", "28"))
-GPU_CHAT_CTX = int(os.environ.get("GPU_CHAT_CTX", "4096"))
+# Top of the GPU-offload fallback chain (see _gpu_layer_chain). Default 999 =
+# "offload everything", which fully fits a ~7B on the 6GB card (fast); bigger
+# models OOM at this and the chain steps down until one loads AND generates.
+GPU_CHAT_LAYERS = int(os.environ.get("GPU_CHAT_LAYERS", "999"))
+# 2048 keeps the KV cache + CUDA compute buffers small enough to leave headroom
+# on a 6GB card (4096 was OOMing at generation time with a big offload).
+GPU_CHAT_CTX = int(os.environ.get("GPU_CHAT_CTX", "2048"))
 # The GPU chat worker runs under transcribe-env, whose CUDA llama build needs
 # the torch-bundled CUDA runtime on LD_LIBRARY_PATH (same trick the captains-
 # log runner uses to load the summarizer on the GPU).
@@ -382,7 +388,7 @@ def _record_failure(ip: str) -> None:
 
 def _new_conversation_state() -> dict:
     return {
-        "chat": {"history": [], "gallery": [], "jobs": {}},
+        "chat": {"history": [], "gallery": [], "jobs": {}, "turn": 0},
         "image": {"gallery": []},
     }
 
@@ -552,6 +558,7 @@ async def login(request: Request):
                 _record_failure(ip)
                 return JSONResponse({"error": "incorrect password"}, status_code=401)
             K_ENC, _aesgcm, _prompts = ek, candidate, prompts
+            _normalize_prompts(_prompts)
         else:
             # Very first login ever: seed the prompt store under this key.
             K_ENC, _aesgcm = ek, candidate
@@ -559,6 +566,7 @@ async def login(request: Request):
                 "system_prompt": DEFAULT_SYSTEM_PROMPT,
                 "image_prompt_prefix": DEFAULT_APPEARANCE,
             }
+            _normalize_prompts(_prompts)
             _write_prompts_locked()
 
     token = base64.urlsafe_b64encode(os.urandom(32)).decode()
@@ -634,6 +642,13 @@ async def set_prompts(request: Request):
     with _config_lock:
         _prompts["system_prompt"] = system_prompt
         _prompts["image_prompt_prefix"] = image_prompt_prefix
+        if "group_mode" in body:
+            _prompts["group_mode"] = bool(body.get("group_mode"))
+        if "user_name" in body:
+            _prompts["user_name"] = (str(body.get("user_name") or "").strip()[:40]) or "You"
+        if "personas" in body:
+            _prompts["personas"] = body.get("personas") or []
+        _normalize_prompts(_prompts)
         _write_prompts_locked()  # re-encrypt to disk under the current key
     return JSONResponse(_encrypt({"ok": True}))
 
@@ -680,7 +695,8 @@ async def get_state(request: Request):
     mode = body.get("mode")
     mode_state = state.get(mode, {})
     return JSONResponse(
-        _encrypt({"history": mode_state.get("history", []), "gallery": mode_state.get("gallery")})
+        _encrypt({"history": mode_state.get("history", []), "gallery": mode_state.get("gallery"),
+                  "group_mode": bool(_prompts and _prompts.get("group_mode") and _prompts.get("personas"))})
     )
 
 
@@ -724,6 +740,94 @@ def _clean_llm_text(text: str) -> str:
                   text, flags=re.IGNORECASE)
     return text.strip()
 
+
+# --- group chat (multiple personas share ONE model) --------------------------
+# No second model is needed for separation: a chat LLM is stateless between
+# calls, so each persona is just a distinct system prompt over the shared,
+# speaker-labeled transcript, generated one at a time (the single llama.cpp
+# context is serialized anyway). Stop sequences on the other speakers' name tags
+# stop a persona writing anyone else's turn; _strip_other_speakers is the
+# belt-and-suspenders guard for the GPU worker path, which can't take a stop list.
+
+def _normalize_prompts(p: dict) -> dict:
+    """Ensure the group-chat fields exist so older prompt stores keep working."""
+    p.setdefault("group_mode", False)
+    p.setdefault("user_name", "You")
+    personas = p.get("personas")
+    if not isinstance(personas, list):
+        personas = []
+    clean = []
+    for it in personas[:8]:
+        name = str((it or {}).get("name", "")).strip()[:40]
+        pers = str((it or {}).get("personality", "")).strip()[:4000]
+        if name:
+            clean.append({"name": name, "personality": pers})
+    p["personas"] = clean
+    return p
+
+
+def _persona_names(personas: list[dict]) -> list[str]:
+    return [p["name"] for p in personas if p.get("name")]
+
+
+def _addressed_personas(text: str, personas: list[dict]) -> list[str]:
+    hits = []
+    for p in personas:
+        nm = p.get("name", "")
+        if nm and re.search(rf"(^|[^\w]){re.escape(nm)}([^\w]|$)", text, re.IGNORECASE):
+            hits.append(nm)
+    return hits
+
+
+def _render_labeled_transcript(history: list[dict], user_name: str,
+                               assistant_default: str = "Chloe") -> str:
+    lines = []
+    for m in history:
+        who = user_name if m.get("role") == "user" else (m.get("name") or assistant_default)
+        lines.append(f"{who}: {m.get('content', '')}")
+    return "\n".join(lines) if lines else "(the conversation is just beginning)"
+
+
+def _persona_turn_messages(persona: dict, history: list[dict], personas: list[dict],
+                           user_name: str, addressed: list[str]) -> tuple[list[dict], list[str]]:
+    me = persona["name"]
+    others = [user_name] + [n for n in _persona_names(personas) if n != me]
+    if me in addressed:
+        note = f"{user_name} is speaking directly to you right now. Respond to them."
+    elif addressed:
+        note = (f"{user_name} is speaking to {' and '.join(addressed)} right now, not you. "
+                f"Chime in briefly as {me} only if you have something worth adding.")
+    else:
+        note = f"{user_name} is addressing the whole group. Respond as {me}."
+    system = (
+        f"You are {me}.\n{persona.get('personality', '').strip()}\n\n"
+        f"You are one participant in a group chat. The others are: {', '.join(others)}.\n"
+        "Rules:\n"
+        f"- Speak ONLY as {me}. Write a single reply in your own voice.\n"
+        f"- Never write words, actions, or narration for {user_name} or the other assistants.\n"
+        "- Do not prefix your reply with your name or any label.\n"
+        "- Keep replies conversational and reasonably brief.\n"
+        f"{note}"
+    )
+    convo = _render_labeled_transcript(history[-MAX_HISTORY:], user_name)
+    user_block = (f"Here is the conversation so far:\n\n{convo}\n\n"
+                  f"Now write {me}'s next reply.")
+    stop = [f"\n{nm}:" for nm in others + [me]]
+    return [{"role": "system", "content": system},
+            {"role": "user", "content": user_block}], stop
+
+
+def _strip_other_speakers(text: str, me: str, personas: list[dict], user_name: str) -> str:
+    """Cut the reply if the model starts a different speaker's turn (guard for
+    the GPU worker path, which can't take a stop list)."""
+    cut = len(text)
+    for nm in [user_name] + _persona_names(personas):
+        if nm == me:
+            continue
+        m = re.search(rf"\n\s*{re.escape(nm)}\s*:", text)
+        if m:
+            cut = min(cut, m.start())
+    return text[:cut]
 
 
 def _expand_image_prompt(user_prompt: str) -> str:
@@ -936,7 +1040,7 @@ def _is_oom(exc: Exception) -> bool:
     return "out of memory" in s or "oom" in s or "cuda error" in s or "alloc" in s
 
 
-def _cpu_token_stream(messages, cancel):
+def _cpu_token_stream(messages, cancel, stop=None):
     """Yield raw delta strings from the in-process CPU chat model. Breaking the
     loop (on cancel) stops llama.cpp - the generator is lazy, so not pulling
     the next token stops evaluation."""
@@ -945,7 +1049,7 @@ def _cpu_token_stream(messages, cancel):
             raise RuntimeError("models were shut down - re-initialize")
         for chunk in llm.create_chat_completion(
                 messages=messages, max_tokens=LLM_MAX_TOKENS, stream=True,
-                temperature=0.75, top_p=0.9, repeat_penalty=1.18):
+                temperature=0.75, top_p=0.9, repeat_penalty=1.18, stop=stop or None):
             if cancel.is_set():
                 break
             delta = (chunk["choices"][0].get("delta") or {}).get("content")
@@ -953,7 +1057,7 @@ def _cpu_token_stream(messages, cancel):
                 yield delta
 
 
-def _gpu_token_stream(messages, cancel):
+def _gpu_token_stream(messages, cancel, stop=None):
     """Yield raw delta strings from the GPU worker subprocess. A cancel is
     forwarded to the worker over stdin; the worker stops within one token and
     the turn ends cleanly (worker stays healthy for the next turn)."""
@@ -962,7 +1066,7 @@ def _gpu_token_stream(messages, cancel):
         p = _chat_worker
         if p is None or p.poll() is not None:
             raise RuntimeError("chat worker is not running - re-initialize")
-        p.stdin.write(json.dumps({"messages": messages, "max_tokens": LLM_MAX_TOKENS}) + "\n")
+        p.stdin.write(json.dumps({"messages": messages, "max_tokens": LLM_MAX_TOKENS, "stop": stop or []}) + "\n")
         p.stdin.flush()
         sent_cancel = False
         while True:
@@ -1019,14 +1123,20 @@ async def chat(request: Request):
     token, state = result
     aes = _current_aesgcm.get()
     body = _decrypt(await request.json())
+    advance = bool(body.get("advance"))   # "skip my turn": personas continue with no user message
     message = (body.get("message") or "").strip()[:4000]
-    if not message:
+    with _config_lock:
+        system_prompt = _prompts["system_prompt"]
+        personas = list(_prompts.get("personas", [])) if _prompts.get("group_mode") else []
+        user_name = _prompts.get("user_name", "You")
+    if advance and not personas:
+        return JSONResponse({"error": "skip only works in group chat"}, status_code=400)
+    if not advance and not message:
         return JSONResponse({"error": "empty message"}, status_code=400)
 
     history = state["chat"]["history"]
-    history.append({"role": "user", "content": message})
-    with _config_lock:
-        system_prompt = _prompts["system_prompt"]
+    if message:
+        history.append({"role": "user", "content": message})
     messages = [{"role": "system", "content": system_prompt},
                 *history[-MAX_HISTORY:]]
     # A fresh cancel event per turn; /api/chat-stop sets it.
@@ -1071,7 +1181,58 @@ async def chat(request: Request):
             loop.call_soon_threadsafe(q.put_nowait, {"error": str(e)[:160] if "re-initialize" in str(e) else "generation failed"})
         loop.call_soon_threadsafe(q.put_nowait, {"done": True})
 
-    loop.run_in_executor(_llm_executor, produce)
+    def _stream_persona(persona, addressed):
+        """Stream ONE persona's reply to completion, tagging every event with
+        its name, then append it to the shared transcript. The next persona is
+        started only after this returns, so it sees this reply and can respond
+        to it. Reuses the same channel-token filter as single-Chloe streaming."""
+        name = persona["name"]
+        msgs, stop = _persona_turn_messages(persona, history, personas, user_name, addressed)
+        loop.call_soon_threadsafe(q.put_nowait, {"speaker": name, "start": True})
+        raw, emitted = "", ""
+        source = _gpu_token_stream(msgs, cancel, stop) if gpu_mode else _cpu_token_stream(msgs, cancel, stop)
+        for delta in source:
+            raw += delta
+            cleaned = _strip_other_speakers(_clean_llm_text(raw), name, personas, user_name)
+            tail = cleaned[-14:]
+            if "<" in tail:
+                cleaned = cleaned[:len(cleaned) - (len(tail) - tail.index("<"))]
+            if cleaned.startswith(emitted):
+                d = cleaned[len(emitted):]
+                if d:
+                    emitted = cleaned
+                    loop.call_soon_threadsafe(q.put_nowait, {"speaker": name, "delta": d})
+            else:
+                emitted = cleaned
+                loop.call_soon_threadsafe(q.put_nowait, {"speaker": name, "replace": cleaned})
+        final = _strip_other_speakers(_clean_llm_text(raw), name, personas, user_name).strip()
+        if final:
+            with _state_lock:
+                history.append({"role": "assistant", "name": name, "content": final})
+                del history[:-MAX_HISTORY]
+        if final != emitted:
+            loop.call_soon_threadsafe(q.put_nowait, {"speaker": name, "replace": final})
+        loop.call_soon_threadsafe(q.put_nowait, {"speaker": name, "end": True})
+
+    def produce_group():
+        try:
+            addressed = _addressed_personas(message, personas)
+            n = len(personas)
+            turn = state["chat"].get("turn", 0)
+            order = personas[turn % n:] + personas[:turn % n]   # round-robin lead
+            if addressed:  # whoever was named answers first
+                order = sorted(order, key=lambda p: 0 if p["name"] in addressed else 1)
+            state["chat"]["turn"] = turn + 1
+            for persona in order:
+                if cancel.is_set():
+                    break
+                _stream_persona(persona, addressed)
+        except Exception as e:
+            print(f"group chat failed: {e}", flush=True)
+            loop.call_soon_threadsafe(q.put_nowait, {"error": "generation failed"})
+        loop.call_soon_threadsafe(q.put_nowait, {"done": True})
+
+    loop.run_in_executor(_llm_executor, produce_group if personas else produce)
 
     async def event_stream():
         while True:
@@ -1278,29 +1439,60 @@ async def image_only(request: Request):
     }))
 
 
+def _gpu_layer_chain() -> list[int]:
+    """Descending GPU-layer counts to try, each in a SEPARATE worker process.
+    Starts at GPU_CHAT_LAYERS (default 999 = offload everything, which fully fits
+    a ~7B on this 6GB card) and steps down so bigger models that OOM still land
+    on a count that loads and generates."""
+    top = GPU_CHAT_LAYERS if GPU_CHAT_LAYERS > 0 else 999
+    out, seen = [], set()
+    for n in [top, 24, 20, 16, 12, 8]:
+        n = min(n, top)
+        if n >= 1 and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
 def _spawn_chat_worker(chat_path: str):
     """Start the GPU chat subprocess (transcribe-env python + CUDA llama) and
-    block until it signals ready. Raises on failure."""
+    block until it signals ready. Tries decreasing GPU-layer counts across
+    SEPARATE processes: a CUDA OOM in llama.cpp can abort the whole worker
+    process (uncatchable in Python), so a fresh process is the only way to fall
+    back. The worker also warms up with a 1-token generation before signalling
+    ready, so a count that loads but can't generate is rejected here rather than
+    dying mid-reply. Raises if no layer count works."""
     global _chat_worker, _chat_worker_layers
-    print(f"starting GPU chat worker for {_chat_selection['model']}...", flush=True)
     env = {**os.environ}
     if _GPU_CHAT_NVIDIA_LIBS:
         env["LD_LIBRARY_PATH"] = _GPU_CHAT_NVIDIA_LIBS + ":" + env.get("LD_LIBRARY_PATH", "")
-    p = subprocess.Popen(
-        [GPU_CHAT_PY, CHAT_WORKER_PATH, chat_path, str(GPU_CHAT_LAYERS), str(GPU_CHAT_CTX)],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1, env=env,
-    )
-    line = p.stdout.readline()
-    if not line:
-        p.kill()
-        raise RuntimeError("chat worker exited before signalling ready")
-    msg = json.loads(line)
-    if not msg.get("ready"):
-        p.kill()
-        raise RuntimeError(msg.get("error", "chat worker failed to load model"))
-    _chat_worker = p
-    _chat_worker_layers = int(msg.get("gpu_layers", 0))
-    print(f"GPU chat worker ready ({_chat_worker_layers} layers on GPU)", flush=True)
+    last_err = "no GPU layer count worked"
+    for layers in _gpu_layer_chain():
+        print(f"starting GPU chat worker for {_chat_selection['model']} @ {layers} layers...", flush=True)
+        p = subprocess.Popen(
+            [GPU_CHAT_PY, CHAT_WORKER_PATH, chat_path, str(layers), str(GPU_CHAT_CTX)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1, env=env,
+        )
+        line = p.stdout.readline()
+        if line:
+            try:
+                msg = json.loads(line)
+            except Exception:
+                msg = {}
+            if msg.get("ready"):
+                _chat_worker = p
+                _chat_worker_layers = int(msg.get("gpu_layers", layers))
+                print(f"GPU chat worker ready ({_chat_worker_layers} layers on GPU)", flush=True)
+                return
+            last_err = msg.get("error", "worker failed to load")
+        else:
+            last_err = f"worker aborted at {layers} GPU layers (VRAM OOM)"
+        try:
+            p.kill()
+        except Exception:
+            pass
+        print(f"gpu chat: {last_err}; trying fewer layers", flush=True)
+    raise RuntimeError(f"GPU chat failed to load: {last_err}")
 
 
 def _kill_worker():
@@ -1360,6 +1552,32 @@ def _load_models():
             _model_error = str(e)[:200]
 
 
+def _rss_mb() -> int:
+    """Resident set size of this process, in MB (Linux)."""
+    try:
+        with open("/proc/self/statm") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") // (1024 * 1024)
+    except Exception:
+        return -1
+
+
+def _trim_rss():
+    """Hand freed pages back to the kernel.
+
+    Unloading returned the GPU correctly but NOT host memory: the process sat
+    at 9.6 GB RSS - 13x the ~0.7 GB cold figure - while honestly reporting
+    "cold", and only a restart fixed it. Two causes, both handled here:
+    llama_cpp.Llama holds its weights in C and frees them in close(), which
+    dropping the last Python reference does not reliably trigger; and glibc
+    keeps freed arenas in the process rather than returning them, so RSS stays
+    high even once everything is genuinely freed. malloc_trim releases them.
+    """
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
 def _unload_models():
     """Free the GPU (and the chat model's RAM) without killing anything user-
     visible: sessions, conversations, and galleries live in _sessions, not in
@@ -1368,19 +1586,28 @@ def _unload_models():
     (and CUDA context) that loaded the models."""
     global image_pipe, ref_pipe, _face_app, llm, _model_status
     _kill_worker()  # GPU-chat subprocess, if any
+    before = _rss_mb()
     with _gpu_lock:
         image_pipe = None
         ref_pipe = None      # lazy FaceID pipe, if it was built this session
         _face_app = None     # InsightFace (CPU) - frees its RAM
+        # Explicit close: llama-cpp-python frees the model in close(); relying
+        # on __del__ left several GB resident for hours after "unload".
+        if llm is not None:
+            try:
+                llm.close()
+            except Exception:
+                pass
         llm = None
         gc.collect()
         try:
             torch.cuda.empty_cache()
         except Exception:
             pass
+        _trim_rss()
     with _model_status_lock:
         _model_status = "cold"
-    print("models unloaded, GPU released", flush=True)
+    print(f"models unloaded, GPU released (RSS {before}MB -> {_rss_mb()}MB)", flush=True)
 
 
 @app.post("/api/unload")
