@@ -171,9 +171,14 @@ FORMAT:
 2. "## Unresolved" - ONLY things still open at close: discrepancies to
    reconcile (with amounts), unmet commitments, broken equipment, reorders.
    0-5 bullets, each a concrete object + action someone can pick up
-   tomorrow ("reconcile the $NN register shortfall", "reorder [the
+   tomorrow ("reconcile the register shortfall", "reorder [the
    out-of-stock product]") - fill the brackets from TODAY'S input only;
-   these are format examples, never content. A product on a ⟦POS⟧ line
+   these are format examples, never content. A DISCREPANCY IS NOT A NUMBER
+   YOU HEARD: money spoken at the counter ("62.15 today") is a sale total,
+   the most ordinary event in a shop. Write a discrepancy ONLY when the input
+   actually says money is missing, short, over, uncounted, or does not match -
+   if nobody says that, there is no discrepancy, whatever amounts were said
+   aloud. Never do arithmetic on two overheard numbers to produce one. A product on a ⟦POS⟧ line
    SOLD - a sale is proof of stock, the opposite of unmet demand. "Reorder
    X" is valid ONLY when speech says X was asked for and unavailable, ran
    out, or must be restocked - never because X appears in a sale. BANNED:
@@ -965,6 +970,27 @@ def _validate_annotations(markdown: str, biz: dict) -> str:
                     return ""
             return m.group(0)
         out.append(_ANNOT_RE.sub(repl, line))
+    # CORRELATE_SYSTEM caps annotations at 3 for the whole log and says to
+    # annotate EVENTS only, never product mentions - but stating a rule and
+    # enforcing it are different things, and the 8B routinely ships 5+, mostly
+    # stapled to products. Drop by priority, not by position: an action bullet
+    # or a line about money going wrong is the kind of thing a reference helps;
+    # a product name in narrative prose is exactly what the prompt forbids.
+    _EVENTISH = re.compile(
+        r"discrepan|shortfall|reconcile|missing|refund|chargeback|void|"
+        r"short\b|over\b|dispute|problem|issue|failed|error", re.I)
+    located = []
+    for i, line in enumerate(out):
+        for m in _ANNOT_RE.finditer(line):
+            is_event = line.lstrip().startswith(("-", "*")) or _EVENTISH.search(line)
+            located.append((0 if is_event else 1, i, m.start(), m.end()))
+    if len(located) > 3:
+        _warn(f"annotations: capping {len(located)} record refs at 3")
+        keep = {(p, i, s, e) for p, i, s, e in sorted(located)[:3]}
+        # Delete right-to-left within each line so offsets stay valid.
+        for p, i, s, e in sorted(located, key=lambda t: (t[1], t[2]), reverse=True):
+            if (p, i, s, e) not in keep:
+                out[i] = out[i][:s] + out[i][e:]
     return "\n".join(out)
 
 
