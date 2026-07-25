@@ -773,6 +773,57 @@ _UNAVAILABLE_RE = re.compile(
 _REORDER_RE = re.compile(
     r"reorder|re-order|restock|re-stock|out of stock|unmet demand|confirm availability", re.I)
 
+# A bullet that claims money went missing...
+_DISCREPANCY_BULLET = re.compile(
+    r"discrepan|shortfall|short(?:fall)? of|came up short|over-?ring|unaccounted|"
+    r"does ?n[o']?t match|reconcile the", re.I)
+# ...must correspond to somebody on the floor actually SAYING so. Deliberately
+# specific phrases: a bare "short" ("short on time", "short walk") is not a
+# till problem, and a false positive here re-opens the hole this closes.
+_DISCREPANCY_SPEECH = re.compile(
+    r"discrepan|shortfall|came up short|we'?re short|is short|short by|"
+    r"does ?n[o']?t match|does not match|did ?n[o']?t balance|out of balance|"
+    r"off by|unaccounted|over by|missing money|drawer is off", re.I)
+
+
+def _reject_unsupported_discrepancies(markdown: str, transcript: str) -> str:
+    """A register discrepancy has to be one someone noticed out loud.
+
+    The summarizer invents these from ordinary money talk: "62.15 today" (a
+    cashier reading a total) became "confirm the $62.15 register discrepancy",
+    and a $50.31 sale became "reconcile the register shortfall of $50.31".
+    Three days running, and rewording the prompt did not stop it - the model
+    is pattern-matching the Unresolved format, not reading the day. So the
+    claim is now checked against the day's speech: no one reporting money
+    wrong means there is no discrepancy to reconcile, whatever amounts were
+    said aloud.
+    """
+    if not transcript:
+        return markdown
+    reported = bool(_DISCREPANCY_SPEECH.search(transcript))
+    out = []
+    for line in markdown.splitlines():
+        if line.lstrip().startswith(("-", "*")) and _DISCREPANCY_BULLET.search(line):
+            # Two independent tests, either of which sinks the bullet. The
+            # day-level one catches a day where nobody mentioned money going
+            # wrong at all. The amount test is needed as well, because on a day
+            # that DID have a real till problem the model still attaches the
+            # wrong figure - it lifted $50.31 from a sale and called it a
+            # shortfall. An amount nobody said aloud was not observed.
+            amounts = re.findall(r"\$ ?([\d,]+\.\d{2})", line)
+            unspoken = [a for a in amounts
+                        if not re.search(r"(?<!\d)" + re.escape(a.replace(",", "")) + r"(?!\d)",
+                                         transcript)]
+            if not reported:
+                _warn(f"dropped discrepancy bullet - no one reported one: {line.strip()[:70]}")
+                continue
+            if unspoken:
+                _warn(f"dropped discrepancy bullet - ${unspoken[0]} never said aloud: "
+                      f"{line.strip()[:60]}")
+                continue
+        out.append(line)
+    return "\n".join(out)
+
 
 def _reject_sold_reorders(markdown: str, biz: dict) -> str:
     """A sale is proof of stock - the opposite of unmet demand.
@@ -1516,6 +1567,7 @@ def main():
     # dressing mic noise up as a verified reorder.
     markdown = _drop_garble_bullets(markdown)
     markdown = _reject_sold_reorders(markdown, biz)
+    markdown = _reject_unsupported_discrepancies(markdown, transcript if have_speech else "")
     markdown = _flag_stock_contradictions(markdown, products)
     # Runs BEFORE the stats block is appended: timeclock names belong there,
     # what must not survive is a staff name attached to something they said.
