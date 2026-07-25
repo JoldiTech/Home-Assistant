@@ -44,6 +44,7 @@ Secrets from /etc/nmteaco/captains.env (mode 600), never hardcoded:
 The transcription half is delegated to transcribe_day.py (which loads and frees
 large-v3 in its own process, so the GPU is clear before the summarizer loads).
 """
+import gc
 import json
 import os
 import re
@@ -1308,18 +1309,38 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
     # Load with a fallback chain: the configured layer count, then fewer, then
     # CPU. Covers the edge case where Chloe's image tool is holding VRAM at run
     # time - the summary still completes (slower) instead of failing the job.
+    # Ask Chloe for the GPU first. _ensure_gpu has existed for this since the
+    # imagegen work but was never wired in, so the job just collided with her.
+    # Budget = the offload we intend plus headroom for the KV cache, which
+    # grows with n_ctx (that is what broke a 32k run that was fine at 8k).
+    size_mb = os.path.getsize(SUMMARIZER_MODEL) / (1024 * 1024)
+    per_layer_mb = size_mb / 48.0                       # ~blocks in these models
+    want_mb = int(SUMMARIZER_GPU_LAYERS * per_layer_mb + SUMMARIZER_CTX * 0.10) + 700
+    _ensure_gpu(want_mb)
+
+    # Size the offload to the VRAM that actually exists rather than discovering
+    # it by failing: a failed Llama() leaves llama.cpp in a state where the NEXT
+    # construction can abort() the whole process - an uncatchable SIGABRT, not a
+    # Python exception - so a retry chain alone is not a safety net.
+    plan = sorted({SUMMARIZER_GPU_LAYERS, SUMMARIZER_GPU_LAYERS // 2, 0}, reverse=True)
+    free = _free_vram_mb()
+    if free >= 0:
+        cap = int(max(free - 700 - SUMMARIZER_CTX * 0.10, 0) / max(per_layer_mb, 1))
+        if cap < max(plan):
+            _warn(f"{free}MB VRAM free -> capping offload at {cap} layers "
+                  f"(wanted {SUMMARIZER_GPU_LAYERS})")
+            plan = sorted({min(l, cap) for l in plan}, reverse=True)
+
     llm = None
-    # Strictly decreasing, and derived from the configured value rather than a
-    # fixed 20 - a bigger model needs a LOWER starting offload, and the old
-    # [configured, 20, 0] chain would retry with MORE layers than just failed.
-    _plan = sorted({SUMMARIZER_GPU_LAYERS, SUMMARIZER_GPU_LAYERS // 2, 0}, reverse=True)
-    for layers in _plan:
+    for layers in plan:
         try:
             llm = Llama(model_path=SUMMARIZER_MODEL, n_ctx=SUMMARIZER_CTX, n_threads=8,
                         n_gpu_layers=layers, verbose=False)
             break
         except Exception as e:
             _warn(f"load with {layers} GPU layers failed ({e}); trying fewer")
+            llm = None
+            gc.collect()
     if llm is None:
         raise RuntimeError("summarizer failed to load on GPU and CPU")
     wk, ds = day.strftime("%A"), day.strftime("%Y-%m-%d")
