@@ -482,6 +482,17 @@ the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
 - **Lazy load:** nothing loads at startup (~700 MB cold). The **Initialize**
   button (`/api/initialize`) loads both models; steady state ~17 GB RAM. The
   unit caps memory (`MemoryHigh=22G`, `MemoryMax=26G`) as a safety net.
+- ⚠️ **Unloading does NOT return RAM to the OS** (seen 2026-07-25): after a
+  session had loaded and then released, `/api/release-gpu` reported
+  `{"status":"cold","released":false}` and `nvidia-smi` showed the card free —
+  but the process still held **9.6 GB RSS**, 13× the documented cold figure,
+  16 h after start. `systemctl restart imagegen.service` brought it straight
+  back to 0.74 GB. Freed tensors are going back to the Python/torch allocator,
+  not to the kernel. It matters because the Captain's Log summarizer shares
+  this 31 GB box: a "cold" Chloe silently eats the headroom a large summarizer
+  needs, and the only current remedy is a restart (safe when cold — sessions
+  are in-memory and ephemeral by design). Check with
+  `ps -o rss= -C python` before blaming the summarizer for an OOM.
 - **Reference photos (IP-Adapter FaceID):** the image-only view accepts one
   headshot and puts that person's likeness into the generated image. Identity
   comes from an **InsightFace `buffalo_l` embedding computed on the CPU**
