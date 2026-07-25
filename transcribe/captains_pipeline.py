@@ -162,6 +162,12 @@ FORMAT:
 1. 2-4 short narrative paragraphs - the story of the day: its rhythm woven
    into a sentence or two, then the events and their causes, noting in a
    clause when a problem got resolved.
+   The FIRST sentence must contain at least one fact that could ONLY be true
+   of this day - the weather, an event, a staffing change, a named product, an
+   amount. NEVER open with generic traffic ("a steady flow of customers", "the
+   day started busy", "customers inquired about various teas"): those sentences
+   are identical every day and carry no information. If nothing distinguished
+   the day, open with its first concrete event instead.
 2. "## Unresolved" - ONLY things still open at close: discrepancies to
    reconcile (with amounts), unmet commitments, broken equipment, reorders.
    0-5 bullets, each a concrete object + action someone can pick up
@@ -192,8 +198,15 @@ cause is "unexplained". Counts too: one mention is "a customer", not
 count poisons a permanent record; an honest gap does not.
 
 PRIVACY - the rule is about LINKAGE, not names:
-- Names are fine, and often the point: a promise, hold, special order, or
-  callback NEEDS the name to be actionable (name the customer on the promise).
+- NEVER attribute words to a named STAFF member. Staff requests, opinions,
+  observations, complaints and remarks go in the log WITHOUT the name: write
+  "a staff request to restock XL gloves", never "restock XL gloves per
+  George's request"; write "staff flagged the printer jamming", never "Dominic
+  said the printer is jamming". The operational fact is the entire point; who
+  said it is not, and naming them turns a work log into a record of who said
+  what. This holds even when the remark is harmless.
+- CUSTOMER names are fine where they make a commitment actionable: a promise,
+  hold, special order, or callback NEEDS the name to be picked up tomorrow.
   Only use names ACTUALLY present in the day's material - never invent one, and
   never copy an example name from these instructions into the log.
 - What must NEVER appear is a named person tied to sensitive or personal
@@ -201,13 +214,29 @@ PRIVACY - the rule is about LINKAGE, not names:
   about other people, or "so-and-so said/felt X". Keep the operational fact,
   break the link - "a customer asked about teas safe during pregnancy" is
   fine; naming her in that sentence is not. No contact info ever.
+  Generalise the CONDITION as well as the name: record the need, never the
+  diagnosis. "A customer asked about anti-inflammatory blends" is fine; naming
+  the condition, the medication, or whose it is, is not - in a shop this size a
+  specific diagnosis identifies someone even with no name attached. If the whole
+  exchange was staff declining to give medical advice, there is no event - drop
+  it.
 - Personal-life chatter that has NO operational value (school, jobs, hobbies,
   travel, family, relationships, religion, politics, feelings, small talk)
   still gets dropped entirely - not because of names, because it's noise.
-- No gossip; no attributing opinions or verbatim remarks to a named person.
+- No gossip. Never quote anyone verbatim - named or not. Report what was
+  wanted, praised, complained about, or promised in your own words, always
+  naming the product, price, or thing at issue; a quote with no product in it
+  is unsearchable and cannot be checked against the record.
 - Audio is lossy: never repeat a garbled phrase as fact; if a detail looks
-  like mis-transcription, drop it. When in doubt privacy-wise, keep the
-  event and drop the identifying half.
+  like mis-transcription, drop it. Drop the TOKEN, not the event - if someone
+  clearly asked for something but the product name is mangled, describe it in
+  your own words from the surrounding lines, or leave the item out; never
+  print the mangled string. Nonsense in a tea shop is mis-transcription, not a
+  product: a word that is not a tea, herb, spice, or piece of equipment is
+  garble however confident it sounds. Never put an unverified phrase in
+  quotation marks - a quoted string is treated downstream as a real product
+  name. When in doubt privacy-wise, keep the event and drop the identifying
+  half.
 
 Output ONLY the markdown log in the exact format given. No preamble, no
 <think> tags, no reasoning - just the log. /no_think"""
@@ -281,10 +310,14 @@ REDACT_TEMPLATE = """You are a privacy redactor for a tea shop's operational \
 log. You are given a draft Captain's Log. Return it UNCHANGED except for the \
 removals below, then output the cleaned log in the same format.
 
-THE PRIVACY RULE IS ABOUT LINKAGE, NOT NAMES. Names attached to operational
-facts stay - naming the customer on a promise, hold, or special order is the
-point of the log (use ONLY names that actually appear in the day's material;
-never carry an example name from these instructions into the output). What
+THE PRIVACY RULE IS ABOUT LINKAGE, NOT NAMES. Customer names attached to
+operational facts stay - naming the customer on a promise, hold, or special
+order is the point of the log (use ONLY names that actually appear in the day's
+material; never carry an example name from these instructions into the output).
+But a STAFF member's name must never sit on something they said, asked for, or
+thought: rewrite "restock XL gloves per George's request" as "restock XL gloves
+(a staff request)", and "Dominic said the printer jams" as "staff reported the
+printer jamming". Keep the fact, drop the staff name. What
 must never survive is a NAMED person
 tied to sensitive content: health/medical details, personal-life
 circumstances, or "so-and-so said/felt X". Fix by breaking the link - keep
@@ -296,8 +329,9 @@ REMOVE entirely any sentence or bullet that contains:
   side-businesses, hobbies, art fairs, museums, travel, family, relationships,
   religion, politics, someone's feelings/struggles, small talk);
 - contact info (phone, email, address) for any individual;
-- a verbatim quote attributed to a person, gossip, or something that reads
-  like garbled audio rather than a real shop event.
+- any verbatim quote (attributed or not), gossip, or something that reads
+  like garbled audio rather than a real shop event. Report what was said in
+  plain words naming the product or thing at issue, instead of quoting.
 
 KEEP every id / dollar amount / time in parenthetical record references like
 "(likely order #58212, $43.50 at 2:14pm)" - those are business records.
@@ -317,9 +351,11 @@ NOTES_SYSTEM = SYSTEM_PROMPT + (
     "or stock issues, staff observations, plus one bullet on traffic feel. Routine "
     "retail chit-chat (brewing questions, browsing, tastings) and ordinary completed "
     "sales produce NO bullets. Keep POS amounts exact when a discrepancy or promise "
-    "references them. Names are fine when they carry an operational fact "
+    "references them. A CUSTOMER name is fine when it carries an operational fact "
     "(a promise, hold, or order); never pair a name with personal or health "
-    "content. No format headers - just bullets. At most 8 bullets per slice."
+    "content. NEVER put a STAFF member's name on something they said, asked for, "
+    "or thought - write 'a staff request to reorder X', not 'per George's "
+    "request'. No format headers - just bullets. At most 8 bullets per slice."
 )
 
 
@@ -444,6 +480,44 @@ def _catalog_index(products: list[dict]) -> dict[str, str]:
     return norm_to_name
 
 
+# Mic noise produces confident-looking word salad ("Brunckel, steak, ham, wheat,
+# rye, brunckel, Strawberry Black"). Left alone the catalog machinery below will
+# happily fuzzy-match that onto a real product and stock-flag it, turning noise
+# into an authoritative reorder item. This gate is deliberately CONSERVATIVE:
+# a real-but-unstocked product a customer actually asked for is the log's most
+# valuable content, so only unmistakable noise is rejected.
+_NON_LATIN = re.compile(r"[Ͱ-ϿЀ-ӿ֐-ۿ぀-ヿ一-鿿]")
+
+
+def _is_garble(q: str) -> bool:
+    s = " ".join(q.split())
+    if not s:
+        return True
+    if _NON_LATIN.search(s):          # mixed script - always mis-transcription
+        return True
+    words = re.findall(r"[A-Za-z][A-Za-z'\-]*", s)
+    if len(words) >= 7:               # real product names are short
+        return True
+    if len(words) >= 4 and s.count(",") >= 2:   # comma-salad list
+        return True
+    return False
+
+
+def _drop_garble_bullets(markdown: str) -> str:
+    """Remove action items whose subject is mis-transcription. A garbled
+    'Reorder "<noise>"' bullet is worse than no bullet: it sends someone
+    looking for a product that was never asked for."""
+    out = []
+    for line in markdown.splitlines():
+        if line.lstrip().startswith(("-", "*")):
+            quoted = re.findall(r'"([^"]{3,})"', line)
+            if quoted and all(_is_garble(q) for q in quoted):
+                _warn(f"dropped garble-based bullet: {line.strip()[:70]}")
+                continue
+        out.append(line)
+    return "\n".join(out)
+
+
 def _match_catalog(markdown: str, products: list[dict]):
     """Split the draft's unknown quoted product names into deterministic
     auto-fixes and cases needing judgment.
@@ -506,6 +580,9 @@ def _annotate_catalog(draft: str, review) -> tuple[str, int]:
         # product names; 0.65 is calibrated so "Munch's Blend"->Monk's (0.66)
         # corrects but supplier-name coincidences like "Star West"->Star
         # Anise (0.63) don't.
+        if _is_garble(q):
+            _warn(f"catalog: refused to rename garble \"{q[:50]}\"")
+            continue
         if len(q) >= 5 and cands and cands[0][1] >= 0.65:
             _warn(f"catalog correction: \"{q}\" -> \"{cands[0][0]}\"")
             draft = draft.replace(q, cands[0][0])
@@ -770,6 +847,72 @@ def _strip_linkage_names(markdown: str, findings: list[str]) -> str:
             lines[i] = new
         markdown = "\n".join(lines)
     return markdown
+
+
+# Staff names are KNOWN (timeclock roster + Slack display names), so keeping a
+# staff name off something they said needs no model judgment at all. Same
+# detect-then-surgery split as the linkage guard above - except here we don't
+# need the detect half, which is why this one is reliable.
+_SAID_VERBS = (
+    "said|says|asked|asks|noted|notes|mentioned|mentions|requested|requests|"
+    "wants|wanted|suggested|suggests|flagged|flags|reported|reports|"
+    "complained|complains|observed|observes|confirmed|confirms|explained|"
+    "explains|raised|raises|thinks|thought|believes|needs|needed"
+)
+_SAID_NOUNS = (
+    "request|suggestion|note|comment|observation|complaint|idea|report|"
+    "concern|feedback|question|reminder"
+)
+
+
+def _staff_names(biz: dict, slack_names: set | None) -> set:
+    """The day's roster: timeclock employees + Slack display names, plus bare
+    first names (which is what the log actually tends to write)."""
+    names = set(slack_names or ())
+    for sft in (biz.get("timeclock") or {}).get("shifts") or []:
+        if sft.get("employee"):
+            names.add(str(sft["employee"]))
+    out = set()
+    for n in names:
+        n = " ".join(str(n).split())
+        if not n or not n[0].isalpha():
+            continue
+        out.add(n)
+        first = n.split()[0]
+        # 3+ chars so an initial can't wildcard-match ordinary prose
+        if len(first) >= 3:
+            out.add(first)
+    return out
+
+
+def _strip_staff_attribution(markdown: str, staff: set) -> str:
+    """Never let a staff member's name sit on something they said or asked for.
+
+    Targets attribution specifically - a possessive-of-a-remark, or a name
+    followed by a speech verb - rather than every mention, so an operational
+    line that merely carries a name is left alone. The appended stats block
+    (whose staff names are timeclock data, not speech) is never touched: it is
+    added after this runs.
+    """
+    if not staff:
+        return markdown
+    ordered = sorted(staff, key=len, reverse=True)  # "George Quintero" before "George"
+    lines = markdown.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith(("#", "**")):
+            continue
+        new = line
+        for name in ordered:
+            nm = re.escape(name)
+            new = re.sub(rf"\bper {nm}(?:'s|’s)\s+({_SAID_NOUNS})\b", r"per a staff \1", new)
+            new = re.sub(rf"\b{nm}(?:'s|’s)\s+({_SAID_NOUNS})\b", r"a staff member's \1", new)
+            new = re.sub(rf"\b{nm}\s+({_SAID_VERBS})\b", r"a staff member \1", new)
+            new = re.sub(rf"\bper {nm}\b", "per a staff member", new)
+        if new != line:
+            new = re.sub(r"(^|[.!?]\s+|^- )a staff", lambda m: m.group(1) + "A staff", new)
+            _warn("staff attribution: dropped a staff name from a remark")
+            lines[i] = new
+    return "\n".join(lines)
 
 
 def _cap_bullet_lists(markdown: str, cap: int = 6) -> str:
@@ -1248,7 +1391,14 @@ def main():
     markdown = markdown.replace("⟦", "").replace("⟧", "")
     markdown = _validate_annotations(markdown, biz)
     markdown = _cap_bullet_lists(markdown)
+    # Before the stock flagger: otherwise a real catalog name buried inside a
+    # garbled string ("…rye, brunckel, Strawberry Black") gets stock-flagged,
+    # dressing mic noise up as a verified reorder.
+    markdown = _drop_garble_bullets(markdown)
     markdown = _flag_stock_contradictions(markdown, products)
+    # Runs BEFORE the stats block is appended: timeclock names belong there,
+    # what must not survive is a staff name attached to something they said.
+    markdown = _strip_staff_attribution(markdown, _staff_names(biz, slack_names))
     markdown = markdown.rstrip() + "\n\n" + _business_sections(biz)
     _commit_and_push(date_str, markdown, env)
 

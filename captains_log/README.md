@@ -72,22 +72,38 @@ raw transcript deleted
 
 ## Privacy policy (the summarizer MUST follow this)
 
-**The rule is linkage, not names.** A name attached to an operational fact is
-welcome — "send samples to Nancy Brown", "hold two tins for the Duran
-account" are exactly what makes the log actionable. What must never appear is
-a **named person tied to sensitive content**: health/medical details,
+**The rule is linkage, not names.** A *customer* name attached to an
+operational fact is welcome — "send samples to Nancy Brown", "hold two tins for
+the Duran account" are exactly what makes the log actionable. What must never
+appear is a **named person tied to sensitive content**: health/medical details,
 personal-life circumstances, or attributed remarks ("so-and-so said/felt X").
 The fix is breaking the link, not deleting the fact — "a customer asked about
-teas safe during pregnancy" stays; naming her in that sentence doesn't.
+teas safe during pregnancy" stays; naming her in that sentence doesn't. The
+*condition* is generalised too, not just the name: record the need, never the
+diagnosis — in a shop this size a specific diagnosis identifies someone even
+with no name on it.
+
+**Staff names never sit on something a staff member said.** Requests, opinions,
+observations and remarks go in without the name — "restock XL gloves (a staff
+request)", never "per George's request". The operational fact is the point;
+who said it is not. This is enforced in code (`_strip_staff_attribution`)
+against the day's real roster, not left to the model. The one place staff names
+do appear is the appended **Staff** stats line, which is timeclock data — hours
+worked, not words spoken — and is added after the scrub runs.
 
 Still dropped entirely, name or no name:
 
 - Personal-life chatter with no operational value (school, jobs, hobbies,
   travel, family, relationships, religion, politics, feelings, small talk).
 - Contact info (phone, email, address) for any individual.
-- Verbatim quotes attributed to a person; gossip.
+- Verbatim quotes — attributed or not — and gossip. What was wanted, praised or
+  promised is reported in plain words, always naming the product at issue.
 - Garbled audio presented as fact — a detail that looks mis-transcribed is
   dropped, never guessed at. Register (POS) product names are never garble.
+  Action items whose subject is mis-transcription are removed in code
+  (`_drop_garble_bullets`), and the catalog matcher refuses to rename garble
+  into a real product — noise dressed up as a verified reorder is worse than
+  no bullet at all.
 
 ## Format
 
