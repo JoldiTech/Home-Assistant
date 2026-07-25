@@ -44,7 +44,6 @@ Secrets from /etc/nmteaco/captains.env (mode 600), never hardcoded:
 The transcription half is delegated to transcribe_day.py (which loads and frees
 large-v3 in its own process, so the GPU is clear before the summarizer loads).
 """
-import gc
 import json
 import os
 import re
@@ -1331,18 +1330,21 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
                   f"(wanted {SUMMARIZER_GPU_LAYERS})")
             plan = sorted({min(l, cap) for l in plan}, reverse=True)
 
-    llm = None
-    for layers in plan:
-        try:
-            llm = Llama(model_path=SUMMARIZER_MODEL, n_ctx=SUMMARIZER_CTX, n_threads=8,
-                        n_gpu_layers=layers, verbose=False)
-            break
-        except Exception as e:
-            _warn(f"load with {layers} GPU layers failed ({e}); trying fewer")
-            llm = None
-            gc.collect()
-    if llm is None:
-        raise RuntimeError("summarizer failed to load on GPU and CPU")
+    # ONE attempt, then re-exec. A failed llama_context poisons the process:
+    # the next construction dies on an uncatchable SIGABRT, so an in-process
+    # retry chain doesn't degrade, it core-dumps (confirmed twice - the first
+    # load raised a normal Python exception, the retry aborted). Dropping the
+    # reference and collecting doesn't help; only a fresh process does.
+    try:
+        llm = Llama(model_path=SUMMARIZER_MODEL, n_ctx=SUMMARIZER_CTX, n_threads=8,
+                    n_gpu_layers=plan[0], verbose=False)
+    except Exception as e:
+        if os.environ.get("SUMMARIZER_GPU_LAYERS") == "0":
+            raise RuntimeError(f"summarizer failed to load even on CPU: {e}")
+        _warn(f"load with {plan[0]} GPU layers failed ({e}); re-exec on CPU")
+        os.environ["SUMMARIZER_GPU_LAYERS"] = "0"
+        sys.stderr.flush()
+        os.execv(sys.executable, [sys.executable] + sys.argv)  # never returns
     wk, ds = day.strftime("%A"), day.strftime("%Y-%m-%d")
     first_ts, last_ts = _active_window(transcript)
     compact = _compact_transcript(transcript)
