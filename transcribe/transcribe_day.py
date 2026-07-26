@@ -72,11 +72,14 @@ _NOISE = {"[blank_audio]", "(blank_audio)", "[silence]", "[music]", "(music)", "
 # separate speech from silence, so only unmistakable phrases are removed here.
 # A bare "thank you" is NOT matched - customers say it constantly.
 _HALLUCINATION_RE = re.compile(
-    r"^\W*(thanks?\s+(you\s+)?for\s+watching"
+    r"(thanks?\s+(you\s+)?for\s+watching"
+    r"|in\s+(the\s+next|this)\s+video"          # "In the next video, we will learn..."
+    r"|see\s+you\s+(in|on)\s+the\s+next"
     r"|please\s+(like\s+and\s+)?subscribe"
-    r"|subscribe\s+to\s+(my|the)\s+channel"
-    r"|see\s+you\s+in\s+the\s+next\s+video"
-    r"|don'?t\s+forget\s+to\s+subscribe)\b",
+    r"|subscribe\s+to\s+(my|the|our)\s+channel"
+    r"|don'?t\s+forget\s+to\s+(like|subscribe)"
+    r"|hit\s+the\s+like\s+button"
+    r"|welcome\s+back\s+to\s+(my|the|our)\s+channel)",
     re.I,
 )
 
@@ -224,7 +227,7 @@ async def main():
                     text = s.text.strip()
                     if not text or text.lower() in _NOISE:
                         continue
-                    if _HALLUCINATION_RE.match(text):
+                    if _HALLUCINATION_RE.search(text):
                         print(f"[transcribe_day] dropped silence-hallucination: {text[:60]}",
                               file=sys.stderr, flush=True)
                         continue
