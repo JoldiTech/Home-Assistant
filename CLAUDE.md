@@ -408,6 +408,44 @@ deployed to `~/transcribe/` on the AI box and run as the
   Integrations API, creds from `/etc/nmteaco/protect.env`) — no HA in the audio
   path. `condition_on_previous_text=False` + strict VAD to avoid hallucination
   loops.
+- **Whisper hallucinates on silence, and it reaches the log.** The empty closing
+  hour produced *"Thank you for watching, and I'll see you in the next video"*
+  and a fabricated distressed monologue that the summarizer wrote up as a real
+  event. 30–49 such lines a day. Two things that do NOT fix it, both measured:
+  **`no_speech_prob` is useless on this mic** (real speech p50 0.63 / p90 0.65
+  vs 0.64 for the hallucination — a 0.6 cut deletes 26 of 51 genuine segments),
+  and **`initial_prompt` is dangerous** — Whisper echoed the priming sentence
+  back as a transcript line, i.e. it injects invented speech into the record.
+  Use `hotwords` only. `transcribe_day.py` now drops the canonical video-isms
+  by phrase (`_HALLUCINATION_RE`).
+- **Audio conditioning (mic is fixed, the signal isn't):** band-pass + `dynaudnorm`
+  and `speechnorm` both recover real content that raw audio loses; spectral
+  denoise (`afftdn`) actively HURTS — it strips speech to rows of ".".
+
+#### Parakeet evaluated as a Whisper replacement (2026-07-25)
+
+`nvidia/parakeet-tdt-0.6b-v2` (2.3 GB, `~/transcribe/models/parakeet.nemo`,
+loaded via `EncDecRNNTBPEModel.restore_from`). Measured on this box against the
+same audio:
+
+| | faster-whisper large-v3 | Parakeet TDT 0.6B |
+| --- | --- | --- |
+| 10 min of empty shop | "Thank you" ×8 + a fabricated monologue | **5 of 6 chunks EMPTY** |
+| speed, 10 min audio | ~90 s | **4.0 s** (RTF 0.007) |
+| timestamps | yes | yes (segment/word/char) |
+| product names | `hotwords` bias helps | weaker — "Sencha" → "Scentage" |
+| long audio on 6 GB | 30 s internal windows | **OOMs past ~2 min; needs chunking** |
+
+Being a transducer rather than autoregressive-over-text, it emits nothing from
+silence — which is the defect class that put a distressing invented passage
+into a permanent record. Its weaker product names are largely handled by the
+catalog-correction stage the pipeline already runs (`_match_catalog` corrected
+3 names on the 07-25 run unaided).
+
+> **`numpy` is pinned `<2.5` in `~/transcribe-env`** (2.4.6). NeMo's numba
+> dependency refuses NumPy 2.5. Verified after downgrading that
+> faster-whisper produces byte-identical output, so the pin is safe — but do
+> not casually `pip install -U numpy` on this box.
 - **Business data:** the pipeline also pulls the **6pm–6pm MT business day**
   (log for date D = 6pm D-1 → 6pm D) from the dashboard's **datalog API**
   (`/dashboard/tools/datalog/{sales,shipping,support,calls,texts,timeclock}.php`,
