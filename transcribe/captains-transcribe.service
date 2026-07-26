@@ -8,6 +8,15 @@ User=nmteaco
 Group=nmteaco
 WorkingDirectory=/home/nmteaco/transcribe
 EnvironmentFile=/etc/nmteaco/captains.env
+# Parakeet backbone + Whisper rescue. Measured over three days: Parakeet is
+# ~5.5x faster and found MORE than Whisper on two of the three, and it does not
+# confabulate from silence the way an autoregressive decoder must - which is the
+# failure that put an invented distressed passage into a permanent log. Whisper
+# still runs, but only to rescue windows Parakeet missed. Total transcription
+# time is about the same as the whisper-only setup this replaces.
+# Set ASR_ENGINE=whisper to revert, or =parakeet to drop the rescue pass
+# (~5 min/day instead of ~32, at the cost of 8-149 lines depending on the day).
+Environment=ASR_ENGINE=dual
 # Reuse the transcribe venv (has faster-whisper, uiprotect, llama-cpp, fastapi).
 ExecStart=/home/nmteaco/transcribe-env/bin/python /home/nmteaco/transcribe/trigger_service.py
 Restart=on-failure
