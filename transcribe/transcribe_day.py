@@ -23,6 +23,7 @@ phrases. Timestamps stay mapped to the original (untrimmed) audio.
 import argparse
 import asyncio
 import os
+import re
 import subprocess
 import sys
 import time
@@ -57,6 +58,27 @@ HOTWORDS = (
     "lemongrass, tisane, Wenshan, tulsi Krishna, Rama, Vana"
 )
 _NOISE = {"[blank_audio]", "(blank_audio)", "[silence]", "[music]", "(music)", "you", "."}
+
+# Whisper's canonical silence-hallucinations. Its training data is full of video
+# outros, so given near-silence it emits these almost verbatim - the shop's
+# empty closing hour produced "Thank you for watching, and I'll see you in the
+# next video."
+#
+# Deliberately phrase-specific. The obvious-looking filter here is segment
+# no_speech_prob, and it does NOT work on this mic: measured over a busy ten
+# minutes, real speech runs p50 0.63 / p90 0.65 while the hallucination scored
+# 0.64. A 0.6 cut dropped 26 of 51 genuine segments ("I know, it's the pretzel
+# stuff"). The signal is too marginal for the model's own confidence to
+# separate speech from silence, so only unmistakable phrases are removed here.
+# A bare "thank you" is NOT matched - customers say it constantly.
+_HALLUCINATION_RE = re.compile(
+    r"^\W*(thanks?\s+(you\s+)?for\s+watching"
+    r"|please\s+(like\s+and\s+)?subscribe"
+    r"|subscribe\s+to\s+(my|the)\s+channel"
+    r"|see\s+you\s+in\s+the\s+next\s+video"
+    r"|don'?t\s+forget\s+to\s+subscribe)\b",
+    re.I,
+)
 
 # The 6GB card is shared with Chloe (imagegen), whose SDXL pass can hold ~4GB.
 # large-v3 float16 needs ~4GB, so a badly-timed overlap OOMs mid-run. The
@@ -201,6 +223,10 @@ async def main():
                 for s in segs:
                     text = s.text.strip()
                     if not text or text.lower() in _NOISE:
+                        continue
+                    if _HALLUCINATION_RE.match(text):
+                        print(f"[transcribe_day] dropped silence-hallucination: {text[:60]}",
+                              file=sys.stderr, flush=True)
                         continue
                     if text == prev:
                         run += 1
