@@ -446,6 +446,34 @@ catalog-correction stage the pipeline already runs (`_match_catalog` corrected
 > dependency refuses NumPy 2.5. Verified after downgrading that
 > faster-whisper produces byte-identical output, so the pin is safe — but do
 > not casually `pip install -U numpy` on this box.
+
+**Dual-ASR measured over three full days** (`ASR_ENGINE=dual`, Parakeet backbone
++ Whisper rescue):
+
+| day | parakeet | whisper | rescued | suppressed |
+| --- | --- | --- | --- | --- |
+| 07-23 | 2646 (266 s) | 2845 (1342 s) | 149 | 2 |
+| 07-24 | **5259** (287 s) | 4402 (1606 s) | 10 | 1 |
+| 07-25 | **4287** (285 s) | 3999 (1663 s) | 8 | 6 |
+
+Parakeet is ~5.5× faster and on two of three days found MORE than Whisper. The
+Whisper pass costs ~27 min and earned 8–10 lines on those days, 149 on 07-23.
+Known garbles: `foie`, `cinnamates`, `malignant` all eliminated; `Sencha`
+regressed to `Scentage` (the catalog stage fixes that class). Note Parakeet did
+not *correct* `foie` to pu-erh — it heard that minute differently; the engines
+genuinely disagree on marginal audio.
+
+**The merge discriminator is ISOLATION, not length.** The first rule suppressed
+Whisper-only windows under 60 chars and was wrong — over one day it deleted 31
+windows, mostly real short speech ("Yeah, have a good one.", "Well, it's in the
+back of the drawer."). Real conversation is full of short utterances; what the
+confabulations shared was sitting alone in a 19-minute dead stretch. Switching
+to "rescue if Parakeet heard anything within 4 minutes" moved 07-23 from
+112 rescued / 31 suppressed to **149 rescued / 2 suppressed**, and the two
+survivors are textbook ("I have to be some sort of master of the universe?").
+
+Each engine's raw output is kept in `~/captains_transcripts/engine_raw/` so a
+merge rule can be re-tuned in seconds instead of a 30-min re-transcription.
 - **Business data:** the pipeline also pulls the **6pm–6pm MT business day**
   (log for date D = 6pm D-1 → 6pm D) from the dashboard's **datalog API**
   (`/dashboard/tools/datalog/{sales,shipping,support,calls,texts,timeclock}.php`,
