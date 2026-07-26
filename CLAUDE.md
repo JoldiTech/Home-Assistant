@@ -474,6 +474,95 @@ survivors are textbook ("I have to be some sort of master of the universe?").
 
 Each engine's raw output is kept in `~/captains_transcripts/engine_raw/` so a
 merge rule can be re-tuned in seconds instead of a 30-min re-transcription.
+
+#### ⏳ UniFi Protect keeps only ~8 days of Tea One footage
+
+Probed 2026-07-26: 07-18 onward exported fine, **07-17 and 07-16 returned
+`Request failed: /proxy/protect/api/video`** — the recordings are gone. So:
+
+- **A backfill is only possible inside ~8 days.** After that the audio does not
+  exist and no amount of pipeline work recovers it.
+- A nightly run that fails and goes unnoticed for over a week is **permanent
+  data loss**. Nothing currently alerts on a missing day — `sensor.captains_log`
+  shows whatever is on GitHub, so a missing day looks exactly like a quiet day.
+  A "did today's log appear by 20:30 MT?" check is the cheapest insurance here.
+- Days whose audio has aged out still get a real log from the business data
+  alone (`_No speech captured today._` + the stats block) — that is what
+  2026-07-16 and 2026-07-17 are, and it is the best they can ever be.
+
+#### 🎵 The shop's Sonos is transcribed as speech
+
+Both engines do it — it is genuine audio, not hallucination. Whisper produced
+recognisable song lyrics in the 07-22 transcript ("The strength to go other ways
+than singing in the street", "If you think that you are in the ocean"), and the
+2026-07-23 closing passage that read as a distressed monologue overlapped music
+that HA shows playing until it paused at **18:32:07**.
+
+The dual merge only catches the Whisper half (music plays when nobody is
+talking, so those windows look "marooned"). Parakeet's share stays, because it
+is the backbone. **HA already holds the signal to fix this properly**:
+`media_player.store_store` records `playing` / `paused` with track titles and
+timestamps, so music-only windows could be excluded before the summarizer sees
+them. Not yet implemented — measure the coverage first.
+
+#### Summarizer: bigger is NOT better (tested, rejected 2026-07-25)
+
+Before reaching for a larger summarizer, read this. `Qwen3-30B-A3B-Instruct-2507`
+(MoE, 3B active, 17.3 GB) was downloaded, run against a real day at both 8k
+chunked and 32k single-pass, and **rejected**. It produced the most fluent,
+most specific, most readable log of anything tried — and fabricated nearly all
+of the specifics: a yoga class, a receipt-printer jam, a person ("Shawns
+office"), a product ("Tummy Tisane"), and it turned the transcript's *"she has
+RA"* into *"her mother who has rheumatoid arthritis"* — inventing a family
+relationship and expanding a diagnosis, the exact privacy failure the policy
+exists to prevent. Zero transcript support for any of it.
+
+**More capacity against lossy mic audio buys more convincing confabulation.**
+Qwen3-8B's clumsiness is a safety feature: it garbles visibly where the 30B
+invents plausibly. Keep `Qwen3-8B-Q4_K_M` at `SUMMARIZER_CTX=8192`. The model
+is staged at `~/transcribe/models/` if you want to re-verify; don't re-litigate
+it from first principles.
+
+Two related dead ends, both measured: the `/no_think` suffix is a Qwen3 *hybrid*
+control token and is meaningless to Instruct-2507 models (`SUMMARIZER_NOTHINK=0`
+strips it), and at 32k context the KV cache alone is ~4.8 GB on the 6 GB card,
+so single-pass summarization is CPU-bound regardless of model.
+
+#### llama.cpp: a failed load poisons the process
+
+A `Llama()` construction that fails raises a normal Python exception — but the
+**next** construction in that process dies on an uncatchable `SIGABRT`. So a
+retry chain is not a safety net; it turns a recoverable failure into a core
+dump, and `gc.collect()` does not help. `_summarize` now makes ONE attempt with
+the offload sized from measured free VRAM, then `os.execv`s itself with
+`SUMMARIZER_GPU_LAYERS=0`. Verified: the same 17-layer config that core-dumped
+twice now re-execs and completes.
+
+Relatedly, `_ensure_gpu()` had existed since the imagegen work and was **never
+called** — the summarizer simply collided with Chloe instead of asking her to
+release the card. It is wired in now; Chloe's `/api/release-gpu` works and is
+loopback-only.
+
+#### Verification traps that cost real time here
+
+Every one of these produced a confident wrong conclusion at least once:
+
+- **The log has FOUR sources** — audio, POS, Slack, business records. Grepping
+  only the transcript "proved" `XL gloves` was fabricated three times; it was a
+  real Slack request from George on 07-23. Check every source before calling
+  something invented.
+- **`grep "50.31"` matches `10:50:31`** — `.` is a regex wildcard. That
+  "confirmed" a fabricated dollar amount as real. Use `grep -F` for amounts.
+- **A running process is not a working process.** A backfill was checked with
+  `pgrep` ("alive"), produced zero output for 5.5 h, and was silently stuck.
+  Verify by output — a non-empty log — never by process existence.
+- **`pkill -f <pattern>` kills your own SSH session** when the pattern appears
+  in the remote command line. Killed the session twice. Resolve the PID first
+  and kill that.
+- **The transcript is POS-woven before post-processing.** A gate that asks "was
+  this amount said aloud?" must read the RAW speech; against the woven text a
+  sale total vouches for itself, which silently no-op'd the discrepancy gate in
+  production while passing every local test.
 - **Business data:** the pipeline also pulls the **6pm–6pm MT business day**
   (log for date D = 6pm D-1 → 6pm D) from the dashboard's **datalog API**
   (`/dashboard/tools/datalog/{sales,shipping,support,calls,texts,timeclock}.php`,
