@@ -475,20 +475,31 @@ survivors are textbook ("I have to be some sort of master of the universe?").
 Each engine's raw output is kept in `~/captains_transcripts/engine_raw/` so a
 merge rule can be re-tuned in seconds instead of a 30-min re-transcription.
 
-#### ⏳ UniFi Protect keeps only ~8 days of Tea One footage
+#### ⏳ How far back the audio goes
 
 Probed 2026-07-26: 07-18 onward exported fine, **07-17 and 07-16 returned
-`Request failed: /proxy/protect/api/video`** — the recordings are gone. So:
+`Request failed: /proxy/protect/api/video`**.
 
-- **A backfill is only possible inside ~8 days.** After that the audio does not
-  exist and no amount of pipeline work recovers it.
-- A nightly run that fails and goes unnoticed for over a week is **permanent
-  data loss**. Nothing currently alerts on a missing day — `sensor.captains_log`
-  shows whatever is on GitHub, so a missing day looks exactly like a quiet day.
-  A "did today's log appear by 20:30 MT?" check is the cheapest insurance here.
-- Days whose audio has aged out still get a real log from the business data
-  alone (`_No speech captured today._` + the stats block) — that is what
-  2026-07-16 and 2026-07-17 are, and it is the best they can ever be.
+**That boundary is the start of the current recording setup, NOT a retention
+limit.** Retention is **~30 days** (per the owner, who configured it). I
+originally recorded this as "~8 day retention" purely by inferring a cause from
+two failed exports — a reminder that a boundary in the data tells you *where*
+something changes, never *why*.
+
+- **A backfill is possible within roughly 30 days**, not one week.
+- A nightly run that fails and goes unnoticed until the window closes is still
+  **permanent data loss** — the deadline is just further out. Nothing currently
+  alerts on a missing day: `sensor.captains_log` shows whatever is on GitHub, so
+  a missing day looks exactly like a quiet day. A "did today's log appear by
+  20:30 MT?" check remains the cheapest insurance.
+- Days with no audio still get a real log from the business data alone
+  (`_No speech captured today._` + the stats block) — that is what 2026-07-16
+  and 2026-07-17 are, and given nothing was recording then, it is the best they
+  can ever be.
+- **Retention is not queryable from here.** The integration API's `/nvrs`
+  returns only identity/doorbell/arm fields, and `/nvr`, `/storage`,
+  `/system-info` are 404; the legacy Protect admin API rejects the console key
+  with 401 (unlike the Network legacy API). Check the Protect UI.
 
 #### 🎵 The shop's Sonos is transcribed as speech
 
