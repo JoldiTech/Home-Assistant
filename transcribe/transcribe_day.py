@@ -66,9 +66,15 @@ PARAKEET_MODEL = os.path.expanduser(
     os.environ.get("PARAKEET_MODEL", "~/transcribe/models/parakeet.nemo"))
 # Parakeet decodes a whole file in one pass and OOMs past ~2 min on the 6GB card.
 PARAKEET_CHUNK_S = int(os.environ.get("PARAKEET_CHUNK_S", "120"))
-# A Whisper-only window is a hallucination when it is SHORT. Measured: the three
-# confabulations ran 10-23 chars; Parakeet's genuine miss ran 258.
-WHISPER_RESCUE_MIN_CHARS = int(os.environ.get("WHISPER_RESCUE_MIN_CHARS", "60"))
+# What separates a Whisper hallucination from a window Parakeet genuinely missed
+# is ISOLATION, not length. The first cut of this used a >=60 char threshold and
+# it was wrong: over one day it suppressed 31 windows, most of them real short
+# speech ("Yeah, have a good one.", "Well, it's in the back of the drawer.").
+# Real conversation is full of short utterances. What the confabulations had in
+# common was being marooned - alone in a 19-minute dead stretch - while genuine
+# short lines sit next to other speech. So a Whisper-only window is rescued when
+# Parakeet heard anything nearby, and suppressed only when nothing did.
+WHISPER_RESCUE_NEAR_S = int(os.environ.get("WHISPER_RESCUE_NEAR_S", "240"))
 # Domain vocabulary injected into every decode window (hotwords work with
 # condition_on_previous_text=False; initial_prompt would only reach the first
 # window). Whisper mishears tea terms it doesn't know - "pu-erh" became "poire",
@@ -239,28 +245,41 @@ def _merge_dual(pk: list[tuple[datetime, str]],
     only when Parakeet returned nothing AND the window holds enough text to be a
     real exchange rather than a confabulated one-liner.
     """
+    import bisect
     win = timedelta(seconds=PARAKEET_CHUNK_S)
 
     def bucket(t: datetime) -> int:
         return int(t.timestamp() // win.total_seconds())
 
     spoken = {bucket(t) for t, _ in pk}
+    pk_times = sorted(t.timestamp() for t, _ in pk)
+
+    def parakeet_nearby(t: datetime) -> bool:
+        """Did Parakeet hear anything within WHISPER_RESCUE_NEAR_S either side?"""
+        if not pk_times:
+            return False
+        x = t.timestamp()
+        i = bisect.bisect_left(pk_times, x)
+        for j in (i - 1, i):
+            if 0 <= j < len(pk_times) and abs(pk_times[j] - x) <= WHISPER_RESCUE_NEAR_S:
+                return True
+        return False
+
     by_win: dict[int, list[tuple[datetime, str]]] = {}
     for t, txt in wh:
         by_win.setdefault(bucket(t), []).append((t, txt))
 
     rescued, suppressed = [], 0
-    for b, items in by_win.items():
+    for b, items in sorted(by_win.items()):
         if b in spoken:
             continue                                  # Parakeet already has it
-        chars = sum(len(t) for _, t in items)
-        if chars >= WHISPER_RESCUE_MIN_CHARS:
-            rescued.extend(items)
+        if parakeet_nearby(items[0][0]):
+            rescued.extend(items)                     # a miss inside an active stretch
         else:
-            suppressed += chars and len(items) or 0
+            suppressed += len(items)
             for _, t in items:
                 print(f"[transcribe_day] suppressed whisper-only fragment "
-                      f"({chars} chars, parakeet silent): {t[:60]}",
+                      f"(no parakeet speech within {WHISPER_RESCUE_NEAR_S}s): {t[:60]}",
                       file=sys.stderr, flush=True)
     merged = sorted(pk + rescued, key=lambda x: x[0])
     return merged, {"parakeet": len(pk), "rescued": len(rescued),
@@ -382,6 +401,16 @@ async def run_dual(client, day: datetime) -> tuple[list[str], dict]:
             for p in segdir.glob("*.wav"):
                 p.unlink(missing_ok=True)
             segdir.rmdir()
+
+    # Keep each engine's raw output. Re-tuning the merge rule against a stored
+    # pair costs seconds; without these it costs a ~30 min re-transcription per
+    # day, which is how the first (wrong) rule survived long enough to ship.
+    stamp = day.strftime("%Y-%m-%d")
+    side = OUT_DIR / "engine_raw"
+    side.mkdir(exist_ok=True)
+    for name, rows in (("parakeet", pk_all), ("whisper", wh_all)):
+        (side / f"tea_one_{stamp}.{name}.log").write_text(
+            "".join(f"{t.strftime('%Y-%m-%d %H:%M:%S %Z')} | {x}\n" for t, x in sorted(rows)))
 
     merged, stats = _merge_dual(pk_all, wh_all) if wh_all else (sorted(pk_all), {
         "parakeet": len(pk_all), "rescued": 0, "suppressed": 0})
