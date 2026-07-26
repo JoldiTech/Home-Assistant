@@ -22,6 +22,7 @@ phrases. Timestamps stay mapped to the original (untrimmed) audio.
 """
 import argparse
 import asyncio
+import gc
 import os
 import re
 import subprocess
@@ -45,6 +46,29 @@ END_HOUR = int(os.environ.get("TRANSCRIBE_END_HOUR", "20"))
 
 MAX_REPEAT = 2  # collapse a line repeated more than this many times in a row
 VAD_PARAMS = dict(threshold=0.6, min_silence_duration_ms=500)
+
+# ASR engine: "whisper" (default, unchanged), "parakeet", or "dual".
+#
+# Measured head-to-head on this shop's audio (2026-07-25). Over ten minutes of
+# empty closing time Whisper produced "Thank you for watching.", "I love you."
+# and "Thank you." from silence, in the three chunks where Parakeet returned
+# NOTHING; on real speech Parakeet was also the more intelligible of the two
+# ("I'm looking for a lower caffeine for the tea" vs Whisper's "it's a purchase
+# caffeine green tea"). A transducer cannot generate prose from noise the way an
+# autoregressive decoder must, which is the whole point.
+#
+# But Parakeet is not a strict superset: on one busy chunk it returned empty
+# where Whisper found 258 characters of real conversation. So "dual" keeps
+# Parakeet as the backbone and uses Whisper only to rescue windows Parakeet
+# missed - never to overrule it.
+ASR_ENGINE = os.environ.get("ASR_ENGINE", "whisper")
+PARAKEET_MODEL = os.path.expanduser(
+    os.environ.get("PARAKEET_MODEL", "~/transcribe/models/parakeet.nemo"))
+# Parakeet decodes a whole file in one pass and OOMs past ~2 min on the 6GB card.
+PARAKEET_CHUNK_S = int(os.environ.get("PARAKEET_CHUNK_S", "120"))
+# A Whisper-only window is a hallucination when it is SHORT. Measured: the three
+# confabulations ran 10-23 chars; Parakeet's genuine miss ran 258.
+WHISPER_RESCUE_MIN_CHARS = int(os.environ.get("WHISPER_RESCUE_MIN_CHARS", "60"))
 # Domain vocabulary injected into every decode window (hotwords work with
 # condition_on_previous_text=False; initial_prompt would only reach the first
 # window). Whisper mishears tea terms it doesn't know - "pu-erh" became "poire",
@@ -132,6 +156,117 @@ OUT_DIR = Path.home() / "captains_transcripts"
 TMP = Path("/tmp/transcribe_day")
 
 
+# --- Parakeet (NeMo) ----------------------------------------------------------
+
+def _load_parakeet():
+    """Import NeMo lazily - it is heavy and only needed for the parakeet paths.
+    numpy is pinned <2.5 in this venv because NeMo's numba refuses 2.5."""
+    from nemo.collections.asr.models import EncDecRNNTBPEModel
+    print(f"[transcribe_day] loading parakeet ({_free_vram_mb()}MB VRAM free)...",
+          file=sys.stderr, flush=True)
+    m = EncDecRNNTBPEModel.restore_from(PARAKEET_MODEL, map_location="cuda")
+    m.eval()
+    return m
+
+
+def _split_wav(wav: Path, seconds: int) -> list[tuple[Path, float]]:
+    """Cut a wav into fixed-length pieces, returning (path, offset_seconds)."""
+    outdir = wav.parent / f"{wav.stem}_seg"
+    if outdir.exists():
+        for p in outdir.glob("*.wav"):
+            p.unlink()
+    outdir.mkdir(exist_ok=True)
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(wav),
+         "-f", "segment", "-segment_time", str(seconds), "-c", "copy",
+         str(outdir / "s_%04d.wav")],
+        check=True,
+    )
+    segs = sorted(outdir.glob("s_*.wav"))
+    return [(p, i * seconds) for i, p in enumerate(segs)]
+
+
+def _parakeet_lines(model, wav: Path, base: datetime) -> list[tuple[datetime, str]]:
+    """Transcribe one hour with Parakeet, chunked, with real timestamps."""
+    pieces = _split_wav(wav, PARAKEET_CHUNK_S)
+    if not pieces:
+        return []
+    out = model.transcribe([str(p) for p, _ in pieces], batch_size=1, timestamps=True)
+    if isinstance(out, tuple):
+        out = out[0]
+    lines = []
+    for (path, offset), hyp in zip(pieces, out):
+        ts = getattr(hyp, "timestamp", None) or {}
+        segs = ts.get("segment") or []
+        if segs:
+            for s in segs:
+                txt = (s.get("segment") or "").strip()
+                if txt:
+                    lines.append((base + timedelta(seconds=offset + float(s["start"])), txt))
+        else:  # no timestamps came back - fall back to the chunk's own start
+            txt = (hyp if isinstance(hyp, str) else getattr(hyp, "text", "")).strip()
+            if txt:
+                lines.append((base + timedelta(seconds=offset), txt))
+        path.unlink(missing_ok=True)
+    return lines
+
+
+def _clean(text: str, prev: str, run: int) -> tuple[str | None, str, int]:
+    """Shared line hygiene: noise words, repeat collapsing, video-isms."""
+    text = text.strip()
+    if not text or text.lower() in _NOISE:
+        return None, prev, run
+    if _HALLUCINATION_RE.search(text):
+        print(f"[transcribe_day] dropped silence-hallucination: {text[:60]}",
+              file=sys.stderr, flush=True)
+        return None, prev, run
+    if text == prev:
+        run += 1
+        if run > MAX_REPEAT:
+            return None, prev, run
+    else:
+        prev, run = text, 1
+    return text, prev, run
+
+
+def _merge_dual(pk: list[tuple[datetime, str]],
+                wh: list[tuple[datetime, str]]) -> tuple[list[tuple[datetime, str]], dict]:
+    """Parakeet is the transcript; Whisper only fills windows Parakeet missed.
+
+    Whisper never overrules Parakeet where both heard speech - measured, Parakeet
+    is the cleaner of the two on real conversation, and its weaker product names
+    are corrected downstream against the 3dcart catalog. Whisper earns a window
+    only when Parakeet returned nothing AND the window holds enough text to be a
+    real exchange rather than a confabulated one-liner.
+    """
+    win = timedelta(seconds=PARAKEET_CHUNK_S)
+
+    def bucket(t: datetime) -> int:
+        return int(t.timestamp() // win.total_seconds())
+
+    spoken = {bucket(t) for t, _ in pk}
+    by_win: dict[int, list[tuple[datetime, str]]] = {}
+    for t, txt in wh:
+        by_win.setdefault(bucket(t), []).append((t, txt))
+
+    rescued, suppressed = [], 0
+    for b, items in by_win.items():
+        if b in spoken:
+            continue                                  # Parakeet already has it
+        chars = sum(len(t) for _, t in items)
+        if chars >= WHISPER_RESCUE_MIN_CHARS:
+            rescued.extend(items)
+        else:
+            suppressed += chars and len(items) or 0
+            for _, t in items:
+                print(f"[transcribe_day] suppressed whisper-only fragment "
+                      f"({chars} chars, parakeet silent): {t[:60]}",
+                      file=sys.stderr, flush=True)
+    merged = sorted(pk + rescued, key=lambda x: x[0])
+    return merged, {"parakeet": len(pk), "rescued": len(rescued),
+                    "suppressed": suppressed}
+
+
 def _load_creds():
     # /etc/nmteaco/protect.env is `KEY=value` lines (mode 600). Parse without a
     # shell so a child process doesn't need it exported.
@@ -162,6 +297,105 @@ def _windows(day: datetime):
         cur = nxt
 
 
+async def _export_hours(client, day: datetime) -> list[tuple[Path, datetime, datetime]]:
+    """Pull every hour of the day to wav and KEEP them - both engines need the
+    same audio, and they cannot be resident together on a 6GB card (large-v3
+    ~4GB + parakeet ~2.4GB), so the day is walked twice."""
+    out = []
+    for i, (start, end) in enumerate(_windows(day)):
+        mp4 = TMP / f"chunk_{i}.mp4"
+        wav = TMP / f"chunk_{i}.wav"
+        t0 = time.time()
+        try:
+            await client.get_camera_video(CAM_ID, start, end, channel_index=CHANNEL,
+                                          output_file=mp4)
+        except Exception as e:
+            print(f"[transcribe_day] chunk {i} export failed: {e}", file=sys.stderr, flush=True)
+            continue
+        if not mp4.exists() or mp4.stat().st_size == 0:
+            continue
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(mp4),
+             "-map", "0:a:0", "-ac", "1", "-ar", "16000", str(wav)], check=True)
+        mp4.unlink(missing_ok=True)
+        out.append((wav, start, end))
+        print(f"[transcribe_day] exported {start:%H:%M}-{end:%H:%M} ({time.time()-t0:.0f}s)",
+              file=sys.stderr, flush=True)
+    return out
+
+
+async def run_dual(client, day: datetime) -> tuple[list[str], dict]:
+    """Parakeet backbone + Whisper rescue. Returns formatted lines and stats."""
+    hours = await _export_hours(client, day)
+    if not hours:
+        return [], {}
+
+    # --- pass 1: parakeet over everything (fast: RTF ~0.007) ---
+    pk_all: list[tuple[datetime, str]] = []
+    pk = _load_parakeet()
+    t0 = time.time()
+    for wav, start, end in hours:
+        try:
+            got = _parakeet_lines(pk, wav, start)
+        except Exception as e:
+            print(f"[transcribe_day] parakeet {start:%H:%M} failed: {e}",
+                  file=sys.stderr, flush=True)
+            got = []
+        pk_all.extend(got)
+        print(f"[transcribe_day] parakeet {start:%H:%M}-{end:%H:%M} -> {len(got)} lines",
+              file=sys.stderr, flush=True)
+    print(f"[transcribe_day] parakeet pass: {len(pk_all)} lines in {time.time()-t0:.0f}s",
+          file=sys.stderr, flush=True)
+    del pk
+    gc.collect()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    if ASR_ENGINE == "parakeet":
+        wh_all: list[tuple[datetime, str]] = []
+    else:
+        # --- pass 2: whisper, purely as a safety net for what parakeet missed ---
+        wmodel, plan_i = _load_model()
+        wh_all = []
+        t0 = time.time()
+        for wav, start, end in hours:
+            try:
+                segs, _ = wmodel.transcribe(
+                    str(wav), language="en", vad_filter=True, vad_parameters=VAD_PARAMS,
+                    condition_on_previous_text=False, hotwords=HOTWORDS)
+                for s in segs:
+                    if s.text.strip():
+                        wh_all.append((start + timedelta(seconds=s.start), s.text.strip()))
+            except Exception as e:
+                print(f"[transcribe_day] whisper {start:%H:%M} failed: {e}",
+                      file=sys.stderr, flush=True)
+        print(f"[transcribe_day] whisper pass: {len(wh_all)} lines in {time.time()-t0:.0f}s",
+              file=sys.stderr, flush=True)
+
+    for wav, _, _ in hours:
+        wav.unlink(missing_ok=True)
+        segdir = wav.parent / f"{wav.stem}_seg"
+        if segdir.exists():
+            for p in segdir.glob("*.wav"):
+                p.unlink(missing_ok=True)
+            segdir.rmdir()
+
+    merged, stats = _merge_dual(pk_all, wh_all) if wh_all else (sorted(pk_all), {
+        "parakeet": len(pk_all), "rescued": 0, "suppressed": 0})
+
+    lines, prev, run = [], None, 0
+    for ts, text in merged:
+        text, prev, run = _clean(text, prev, run)
+        if text:
+            lines.append(f"{ts.strftime('%Y-%m-%d %H:%M:%S %Z')} | {text}")
+    stats["whisper_total"] = len(wh_all)
+    stats["written"] = len(lines)
+    return lines, stats
+
+
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("date", nargs="?", help="YYYY-MM-DD (America/Denver); default today")
@@ -189,7 +423,29 @@ async def main():
         verify_ssl=False,
     )
     await client.update()
-    print(f"[transcribe_day] {date_str}: Protect login OK", file=sys.stderr, flush=True)
+    print(f"[transcribe_day] {date_str}: Protect login OK  (engine={ASR_ENGINE})",
+          file=sys.stderr, flush=True)
+
+    if ASR_ENGINE in ("dual", "parakeet"):
+        lines, stats = await run_dual(client, day)
+        await client.close_session()
+        with open(part_log, "a") as f:
+            for ln in lines:
+                f.write(ln + "\n")
+        if not lines and out_log.exists() and out_log.stat().st_size:
+            print(f"[transcribe_day] nothing transcribed - keeping existing {out_log}",
+                  file=sys.stderr, flush=True)
+            part_log.unlink(missing_ok=True)
+            sys.stdout.write(out_log.read_text())
+            return
+        part_log.replace(out_log)
+        print(f"[transcribe_day] DONE {date_str}: {len(lines)} lines -> {out_log} "
+              f"| parakeet={stats.get('parakeet')} whisper_raw={stats.get('whisper_total')} "
+              f"rescued={stats.get('rescued')} suppressed={stats.get('suppressed')}",
+              file=sys.stderr, flush=True)
+        sys.stdout.write(out_log.read_text())
+        return
+
     model, plan_i = _load_model()
 
     total = 0
