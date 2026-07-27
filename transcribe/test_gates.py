@@ -103,6 +103,16 @@ keep = ("A customer expressed confusion about gift card processing, while staff 
 check("unrelated SKU far from the trigger is kept",
       has(P._reject_sold_reorders(keep, BIZ), "gift card processing"), True)
 
+# ...but an ASSERTED unavailability makes the product the subject, so distance
+# stops mattering. 2026-07-26 shipped three of these for products the register
+# rang up, each name sitting just outside the 60-char window.
+FAR = ("Jason asked for marshmallow root and requested a pound of marshmallow "
+       "roux, but it was unavailable\n")
+BIZ2 = {"sales": {"orders": [{"items": [{"name": "Marshmallow Root - Organic"},
+                                        {"name": "Gift Card"}]}]}}
+check("a sold product asserted unavailable is dropped, however far away",
+      has(P._reject_sold_reorders(FAR, BIZ2), "marshmallow"), False)
+
 
 # --- garble, quotes and non-events --------------------------------------------
 print("\ngarble / quoting / non-events")

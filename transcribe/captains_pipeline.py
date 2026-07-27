@@ -1331,6 +1331,18 @@ def _drop_non_events(markdown: str) -> str:
 _REORDER_RE = re.compile(
     r"reorder|re-order|restock|re-stock|out of stock|unmet demand|confirm availability", re.I)
 
+# An ASSERTED unavailability - "X but it was unavailable" - makes X the subject
+# of the sentence, so the sold product can sit anywhere in the claim. A reorder
+# verb does not: "confusion about gift card processing, while staff discussed
+# restocking pots" mentions restocking incidentally, and searching the whole
+# claim there deleted a real finding. Different trigger shapes, different reach.
+_ASSERTED_UNAVAILABLE_RE = re.compile(
+    r"out of stock|sold out|unavailable|not available|wasn'?t available|"
+    r"did ?n[o']?t have|do ?n[o']?t carry|does ?n[o']?t carry|not carried|"
+    r"could ?n[o']?t (?:get|find)|we (?:were|are|have been) out|"
+    r"(?:neither|none|nothing) (?:were\s+|was\s+)?available|not in stock|"
+    r"only (?:have|stock|carry)", re.I)
+
 # Register line items that are not products and so prove nothing about stock.
 _GENERIC_SKUS = frozenset({"gift card", "gift cards", "gift certificate",
                            "general item", "custom item", "shipping", "postage"})
@@ -1612,6 +1624,16 @@ def _reject_sold_reorders(markdown: str, biz: dict) -> str:
 
     def reject(text, is_bullet):
         nline = _norm_name(text)
+        # Asserted unavailability: the product is the subject, search it all.
+        # 2026-07-26 shipped "Jason asked for marshmallow root ... unavailable"
+        # and "golden orchard and India rose ... couldn't get them" on a day
+        # the register rang up all three; the names sat just outside a 60-char
+        # window from the trigger.
+        if _ASSERTED_UNAVAILABLE_RE.search(nline):
+            hit = next((s for s in sold
+                        if re.search(r"\b" + re.escape(s) + r"\b", nline)), None)
+            if hit:
+                return f'"{hit}" sold today, so it was in stock'
         for m in re.finditer(_REORDER_RE.pattern + "|" + _UNAVAILABLE_RE.pattern,
                              nline, re.I):
             # The sold product has to be what the claim is ABOUT. Without this
