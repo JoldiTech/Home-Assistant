@@ -113,6 +113,14 @@ BIZ2 = {"sales": {"orders": [{"items": [{"name": "Marshmallow Root - Organic"},
 check("a sold product asserted unavailable is dropped, however far away",
       has(P._reject_sold_reorders(FAR, BIZ2), "marshmallow"), False)
 
+# ...but a SUBSTITUTE offered after the marker is in stock on purpose. This is
+# what the sentence is telling you, and searching past the marker deleted a
+# genuine unmet-demand finding because the substitute had sold that day.
+BIZ3 = {"sales": {"orders": [{"items": [{"name": "Cinnamon Chips - Organic"}]}]}}
+SUB = "Customer asked for cinnamon sticks but we only have cinnamon chips\n"
+check("a substitution offer is not an unavailability claim about the substitute",
+      has(P._reject_sold_reorders(SUB, BIZ3), "cinnamon sticks"), True)
+
 
 # --- garble, quotes and non-events --------------------------------------------
 print("\ngarble / quoting / non-events")

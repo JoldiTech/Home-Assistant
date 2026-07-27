@@ -399,7 +399,7 @@ NOTES_SYSTEM = SYSTEM_PROMPT + (
     "content. NEVER put a STAFF member's name on something they said, asked for, "
     "or thought - write 'a staff request to reorder [the item]', not '[name] "
     "asked for it'. Nothing in [square brackets] is content; fill those slots "
-    "from this slice only. No format headers - just bullets. At most 8 bullets "
+    "from this slice only. No format headers - just bullets. At most 12 bullets "
     "per slice.\n\nStart EVERY bullet with one tag in square brackets, chosen "
     "from exactly this list:\n"
     "[UNMET] a product/size/service asked for and not available\n"
@@ -1340,8 +1340,16 @@ _ASSERTED_UNAVAILABLE_RE = re.compile(
     r"out of stock|sold out|unavailable|not available|wasn'?t available|"
     r"did ?n[o']?t have|do ?n[o']?t carry|does ?n[o']?t carry|not carried|"
     r"could ?n[o']?t (?:get|find)|we (?:were|are|have been) out|"
-    r"(?:neither|none|nothing) (?:were\s+|was\s+)?available|not in stock|"
-    r"only (?:have|stock|carry)", re.I)
+    r"(?:neither|none|nothing) (?:were\s+|was\s+)?available|not in stock", re.I)
+
+# "asked for cinnamon sticks but we only have cinnamon chips" offers chips as a
+# SUBSTITUTE - they are in stock, that is the whole point of the sentence. The
+# unavailable thing sits before the marker. Searching past it deleted a real
+# unmet-demand finding because the substitute had sold that day.
+_SUBSTITUTION_RE = re.compile(
+    r"\b(?:but\s+)?we (?:only |do |)(?:have|stock|carry)\b|\binstead\b|"
+    r"\bonly (?:have|stock|carry)\b|\bwe suggested\b|\boffered (?:them|her|him)\b",
+    re.I)
 
 # Register line items that are not products and so prove nothing about stock.
 _GENERIC_SKUS = frozenset({"gift card", "gift cards", "gift certificate",
@@ -1630,8 +1638,10 @@ def _reject_sold_reorders(markdown: str, biz: dict) -> str:
         # the register rang up all three; the names sat just outside a 60-char
         # window from the trigger.
         if _ASSERTED_UNAVAILABLE_RE.search(nline):
+            sub = _SUBSTITUTION_RE.search(nline)
+            subject = nline[:sub.start()] if sub else nline
             hit = next((s for s in sold
-                        if re.search(r"\b" + re.escape(s) + r"\b", nline)), None)
+                        if re.search(r"\b" + re.escape(s) + r"\b", subject)), None)
             if hit:
                 return f'"{hit}" sold today, so it was in stock'
         for m in re.finditer(_REORDER_RE.pattern + "|" + _UNAVAILABLE_RE.pattern,
