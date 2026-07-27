@@ -1422,7 +1422,11 @@ _DISCREPANCY_SPEECH = re.compile(
     r"charged (?:someone |them |her |him )?twice|double.?charg", re.I)
 
 
-_MONEY_RE = re.compile(r"\$ ?([\d,]+(?:\.\d{2})?)")
+# The comma group must be a real thousands separator. "[\d,]+" swallowed the
+# comma in "$70, possibly from an order", capturing "70," - which then made the
+# gate search the transcript for "70," and never find it, so a genuine spoken
+# amount read as unsupported.
+_MONEY_RE = re.compile(r"\$ ?(\d{1,3}(?:,\d{3})+(?:\.\d{2})?|\d+(?:\.\d{2})?)")
 # How close a spoken amount has to sit to somebody reporting money wrong.
 DISCREPANCY_NEAR_LINES = int(os.environ.get("DISCREPANCY_NEAR_LINES", "12"))
 
@@ -1563,7 +1567,14 @@ def _reject_unsupported_discrepancies(markdown: str, transcript: str) -> str:
             return None
         if not reported:
             return "no one reported money wrong today"
-        for a in _MONEY_RE.findall(_ANNOTATION_RE.sub("", text)):
+        amounts = _MONEY_RE.findall(_ANNOTATION_RE.sub("", text))
+        if not amounts:
+            # "A register shortfall was noted during the shift, though no
+            # specific cause was identified" - passes the day-level test on a
+            # day that did have a real till problem, names no figure, and is
+            # unactionable. Tomorrow cannot start from it.
+            return "a discrepancy with no amount is not actionable"
+        for a in amounts:
             if not _spoken_near_report(a, lines, flags):
                 return f"${a} was never said near anyone reporting money wrong"
         return None
@@ -1881,6 +1892,19 @@ def _already_covered(text: str, markdown: str) -> bool:
 
 def _same_claim(a: str, b: str) -> bool:
     """Two bullets about the same thing, however differently worded."""
+    # A shared distinctive figure settles it before any wording comparison.
+    # 2026-07-19 shipped "Investigate unexplained register overage of $70" and
+    # "The register had an unexplained overage of $70, possibly from an order
+    # that didn't go through" as two bullets: word order differs enough that
+    # neither the bigram nor the trigram test fired, but a shop does not have
+    # two separate $70 drawer problems in one day.
+    fa, fb = set(_MONEY_RE.findall(a)), set(_MONEY_RE.findall(b))
+    if fa & fb:
+        return True
+    ia = set(re.findall(r"#\s?([A-Za-z0-9-]+)", a))
+    ib = set(re.findall(r"#\s?([A-Za-z0-9-]+)", b))
+    if ia & ib:
+        return True
     return _already_covered(a, b)
 
 

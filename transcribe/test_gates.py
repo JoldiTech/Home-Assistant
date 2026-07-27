@@ -584,6 +584,27 @@ out = P._rebuild_bullet_sections(ANN, REAL_NOTES, [], want=1)
 check("an annotated draft bullet keeps its slot", has(out, "#58212"), True)
 
 
+
+# --- one problem, one bullet --------------------------------------------------
+print("\nsame-claim dedupe / amount-less discrepancies")
+
+check("two bullets citing the same amount are one claim",
+      P._same_claim("Investigate unexplained register overage of $70",
+                    "The register had an unexplained overage of $70, possibly "
+                    "from an order that didn't go through"), True)
+check("different amounts stay separate",
+      P._same_claim("Reconcile the $70 overage", "Reconcile the $12.35 shortfall"), False)
+check("the same record id is one claim",
+      P._same_claim("Chase ticket #3128", "Reply to #3128 about sponsorship"), True)
+
+out = P._reject_unsupported_discrepancies(
+    "## Unresolved\n"
+    "- A register shortfall was noted during the shift, though no cause was identified\n"
+    "- Reconcile the register discrepancy of $37.66\n", SPEECH_REAL)
+check("an amount-less discrepancy is dropped", has(out, "no cause was identified"), False)
+check("...the one with a figure survives", has(out, "$37.66"), True)
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")
