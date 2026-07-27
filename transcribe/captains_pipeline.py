@@ -899,6 +899,41 @@ def _drop_vague_bullets(markdown: str, products: list) -> str:
     return _edit_claims(markdown, reject)
 
 
+# Health talk is only loggable when it is a SHOPPING question - "a customer
+# asked about anti-inflammatory blends" is the shop's business; somebody's
+# dental anxiety is not. The redaction pass is supposed to drop the latter and
+# on 2026-07-26 it shipped "another customer expressed concern about dental
+# issues and tooth anxiety" instead.
+_HEALTH_RE = re.compile(
+    r"\b(?:anxiet\w+|depress\w+|diagnos\w+|dental|teeth|tooth|migraine|"
+    r"pregnan\w+|medication|prescription|surgery|cancer|diabet\w+|arthrit\w+|"
+    r"symptoms?|illness|sick|injur\w+|therapy|disorder)\b", re.I)
+# ...unless the same claim is anchored to something the shop sells or does.
+_SHOP_CONTEXT_RE = re.compile(
+    r"\b(?:tea|teas|blend|blends|tisane|herb|herbal|rooibos|matcha|infusion|"
+    r"sample|samples|recommend\w*|asked for|requested|bought|ordered|stock\w*|"
+    r"caffeine|decaf)\b", re.I)
+
+
+def _drop_personal_health(markdown: str) -> str:
+    """Drop health talk that is not a shopping question.
+
+    Deliberately keyed on the ABSENCE of shop context rather than on the health
+    word alone: this shop sells wellness blends, so "a customer asked about
+    anti-inflammatory blends" and "wanted something caffeine-free for
+    migraines" are its actual trade and must survive. What must not survive is
+    a person's condition recorded for its own sake - it has no operational
+    value, and in a shop this size a specific complaint identifies someone even
+    with no name on it.
+    """
+    def reject(text, is_bullet):
+        if _HEALTH_RE.search(text) and not _SHOP_CONTEXT_RE.search(text):
+            return "personal health content with no shop context"
+        return None
+
+    return _edit_claims(markdown, reject)
+
+
 def _mark_empty_sections(markdown: str) -> str:
     """A heading with nothing under it reads as a broken render, not as "there
     was nothing". Empty beats padded, but say so."""
@@ -2193,6 +2228,7 @@ def main():
     markdown = _drop_overheard_quotes(markdown)
     markdown = _drop_record_name_lists(markdown, biz)
     markdown = _drop_vague_bullets(markdown, products)
+    markdown = _drop_personal_health(markdown)
     markdown = _fix_generic_opener(markdown, biz)
     # Runs BEFORE the stats block is appended: timeclock names belong there,
     # what must not survive is a staff name attached to something they said.

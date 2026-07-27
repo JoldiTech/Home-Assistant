@@ -340,6 +340,21 @@ check("'the shop experienced steady traffic' is caught too",
       has(out, "experienced steady"), False)
 
 
+
+# --- personal health ----------------------------------------------------------
+print("\npersonal-health gate")
+
+out = P._drop_personal_health(
+    "- Feedback: a customer expressed concern about dental issues and tooth anxiety.\n"
+    "- A customer asked about anti-inflammatory blends for arthritis.\n"
+    "- Wanted something caffeine-free because of migraines; recommended rooibos.\n"
+    "- The label printer was on the wrong settings.\n")
+check("condition recorded for its own sake is dropped", has(out, "tooth anxiety"), False)
+check("...a wellness shopping question survives", has(out, "anti-inflammatory"), True)
+check("...so does a caffeine-free request", has(out, "migraines"), True)
+check("...and unrelated items are untouched", has(out, "label printer"), True)
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")
