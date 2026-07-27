@@ -248,3 +248,79 @@ None of these require a larger model. The Qwen3-30B experiment already showed
 more capacity buys more convincing confabulation, not less; every failure above
 is a missing deterministic check around an 8B model that is behaving exactly as
 an 8B model does.
+
+---
+
+# After: what the fixes actually changed
+
+Re-measured 2026-07-27 by regenerating all four days through the real
+pipeline (`DRY_RUN=1`) and re-scoring. Reproduce with
+`evaluation/score_coverage.py`.
+
+| | published | after fixes | hand-written |
+| --- | --- | --- | --- |
+| fabricated or unsupported claims | **15** | **0** | 0 |
+| garble printed as a quoted product | 9 | 0 | 0 |
+| completed sales called unavailable | 3 | 0 | 0 |
+| coverage of the 40 hand-identified findings | ~9 | **14 (35%)** | 40 |
+
+**Truthfulness is solved. Recall is not.** The log no longer invents money
+problems, no longer prints mic noise as product names, and no longer copies
+its own instructions into the record. It reaches about a third of what a
+careful reader finds in the same input.
+
+## The three sequencing bugs
+
+Every one of these was the right mechanism in the wrong place, and none was
+visible in the code - only in the output:
+
+1. **Gates ran on bullets only.** Half the log - the narrative - was
+   unguarded for months.
+2. **Carry-through ran before the gates.** The draft still had full bullet
+   lists, so the top-up declined; the gates then pruned those bullets and
+   nothing filled the gap. It fired zero times across three runs while
+   appearing to work.
+3. **Ranking ran before filtering.** A fabricated "$2.50 register shortfall"
+   scores higher than "ordered 2 cases of tins" (money + the word register),
+   so phantoms took every slot and were deleted immediately afterwards.
+   Coverage went 30% -> 20% before this was found.
+
+## What the notes probe established
+
+Dumping the tagged notes - rather than reading logs - settled where recall is
+lost. For 2026-07-19 the notes pass had already found the day's real event:
+
+```
+[PROBLEM] The register had a $70 discrepancy, likely from an order that
+          didn't go through but was charged twice, needing reconciliation
+```
+
+It was then deleted downstream by the discrepancy gate, because
+`_DISCREPANCY_SPEECH` knew only till vocabulary and the staff had said "we're
+over today we charged people $70 more". **The gate built to stop invented
+shortfalls was deleting the only real one in four days.**
+
+The same probe caught a `[PROMISE]` note carrying a customer's email address,
+headed for Unresolved verbatim. No log had shown it, because no log had got
+that far.
+
+## Two mistakes worth keeping on the record
+
+- The first vagueness gate tested for the ABSENCE of specificity and deleted
+  the saffron request, the label-printer fault and the exposed-wiring hazard.
+  Equipment, supplies and products we do NOT stock are ordinary lowercase
+  nouns with no catalog entry - so an unstocked product having no catalog
+  match, the definition of unmet demand, read as vagueness.
+- `_MONEY_RE` used `[\d,]+`, which captured `"70,"` from `"$70, possibly"`.
+  The gate then searched the transcript for `70,` and never found it, marking
+  genuinely spoken amounts unsupported. Silent for the whole session; found
+  while chasing an unrelated duplicate.
+
+## Where the remaining gap is
+
+The notes contain the findings. The merge drops them, the ranking recovers
+some, and the rest are lost to slot competition against a 5-bullet cap. The
+next honest step is not another gate: it is that a day with fifteen real
+findings cannot report them in ten bullets, and either the format grows or
+the selection has to get much better at ranking importance rather than
+searchability.
