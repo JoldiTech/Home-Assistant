@@ -134,6 +134,20 @@ out = P._drop_garble_claims(
     '- Reorder "Earl Grey - Organic" and "rye, brunckel, strawberry black, mott"\n')
 check("one garbled quote sinks a mixed bullet", has(out, "earl grey"), False)
 
+# The same garble with the quotes removed. The gate had been reading
+# punctuation rather than content: 2026-07-26 re-shipped this verbatim the
+# moment the model stopped quoting it.
+CATALOG = [{"name": "Earl Grey - Organic"}, {"name": "Sandia Spice"}]
+UNQUOTED = "- A customer asked for a 16-ounce Nahili mill jury and cleaner but it wasn't available\n"
+check("unquoted garble is caught too",
+      has(P._drop_garble_claims(UNQUOTED, CATALOG), "nahili"), False)
+
+# A long request naming real products is an order, not noise.
+LONG_REAL = ("- A customer asked for a pound of Earl Grey - Organic and two "
+             "ounces of Sandia Spice but neither was available\n")
+check("a long request naming catalog products survives",
+      has(P._drop_garble_claims(LONG_REAL, CATALOG), "earl grey"), True)
+
 # Short mis-hears are NOT garble by word count - they lose their quotes instead,
 # which is what the policy actually asks for: keep the event, drop the false
 # authority of a quoted product name.

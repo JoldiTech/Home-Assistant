@@ -557,7 +557,15 @@ def _is_garble(q: str) -> bool:
     return False
 
 
-def _drop_garble_claims(markdown: str) -> str:
+# What a customer asked for, as the model writes it: "asked for <phrase> but it
+# wasn't available". The phrase is the claim's whole payload, and until now it
+# was only ever checked when the model put quotes round it.
+_REQUEST_PHRASE_RE = re.compile(
+    r"(?:asked for|requested|wanted|was looking for|enquired about|inquired about)\s+"
+    r"(.{5,90}?)\s*(?:,?\s+but\b|;|\.|$)", re.I)
+
+
+def _drop_garble_claims(markdown: str, products: list | None = None) -> str:
     """Remove any claim whose subject is mis-transcription.
 
     A garbled 'Reorder "<noise>"' bullet is worse than no bullet: it sends
@@ -574,9 +582,27 @@ def _drop_garble_claims(markdown: str) -> str:
       is not an event - without the name there is nothing left to act on, and
       printing the noise is what the policy bans outright.
     """
+    known = [k for k in ({_norm_name(str(p.get("name") or "")) for p in (products or [])}
+                         - {""}) if len(k) >= 6]
+
     def reject(text, is_bullet):
         bad = [q for q in re.findall(r'"([^"]{3,})"', text) if _is_garble(q)]
-        return f'garbled quoted name "{bad[0][:40]}"' if bad else None
+        if bad:
+            return f'garbled quoted name "{bad[0][:40]}"'
+        # Unquoted garble. 2026-07-26 re-shipped "a 16-ounce Nahili mill jury
+        # and cleaner" the moment the model stopped putting quotes round it -
+        # the gate had been reading punctuation, not content, the whole time.
+        # A long request phrase is only noise when NO catalog name appears in
+        # it: "a pound of New Mexico Breakfast and two ounces of Earl Grey" is
+        # also long, and is a real order.
+        for m in _REQUEST_PHRASE_RE.finditer(text):
+            phrase = m.group(1).strip()
+            if not _is_garble(phrase):
+                continue
+            if any(k in _norm_name(phrase) for k in known):
+                continue
+            return f'garbled request phrase "{phrase[:40]}"'
+        return None
 
     return _edit_claims(markdown, reject)
 
@@ -2690,7 +2716,7 @@ def main():
         # Before the stock flagger: otherwise a real catalog name buried inside
         # a garbled string ("…rye, brunckel, Strawberry Black") gets
         # stock-flagged, dressing mic noise up as a verified reorder.
-        md = _drop_garble_claims(md)
+        md = _drop_garble_claims(md, products)
         md = _drop_non_events(md)
         md = _reject_sold_reorders(md, biz)
         md = _reject_unsupported_discrepancies(md, raw_speech if have_speech else "")
