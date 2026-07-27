@@ -287,6 +287,27 @@ ran between those times; do not invent a wider window.
 TRANSCRIPT:
 {transcript}"""
 
+RANK_SYSTEM = COMPANY_CONTEXT + """
+
+You are choosing which of today's findings earn a place in the shop's daily
+log. You will be given a numbered list of candidate lines, all of which are
+already true - your ONLY job is to order them by consequence.
+
+Judge each by the two readers: could tomorrow's shift ACT on it, and would
+someone searching these logs in a year want to find it. Rank highest:
+- a product a customer asked for and could not get, named
+- something broken, failing, unsafe, mis-priced or miscounted
+- a promise someone made that another person is now waiting on
+- specific praise or complaint about a named product
+Rank lowest, always:
+- anything that restates a receipt, a text message or a pickup notification
+- anything vague enough to be true of any day
+- two lines describing the same event: keep the more specific one
+
+Reply with ONLY numbers, best first, separated by commas. No words, no
+explanation, no line you were not given. Numbers outside the list are ignored.
+"""
+
 NOTES_TEMPLATE = "Notes for time slice {i} of {n} (times are HH:00 markers):\n\n{chunk}"
 
 # On a long day the transcript becomes ten slices of notes and the staff chat
@@ -2063,8 +2084,45 @@ def _section_bullets(lines: list, heading: str):
     return i, j, bullets
 
 
+def _llm_rank(cands: list, heading: str, k: int, rank) -> list:
+    """Reorder `cands` by the model's judgment of consequence.
+
+    Safe by construction: the model only ever returns INDICES into a list it
+    was given, so nothing new can enter the log and nothing unvetted can be
+    reworded. An unparseable or partial answer costs nothing - whatever it
+    does not rank keeps its keyword order behind what it did.
+
+    This exists because keyword scoring cannot tell a real finding from a
+    plausible-looking one. Raising the per-slice notes cap took the candidate
+    pool from 32 to 59 on one day and coverage FELL: more to choose from is
+    only an advantage if the chooser is any good.
+    """
+    if not rank or len(cands) <= k:
+        return cands
+    listing = "\n".join(f"{i+1}. {t}" for i, (t, _s, _src) in enumerate(cands))
+    want = min(k, len(cands))
+    try:
+        reply = rank(f"Section: {heading[3:]}\nPick the {want} most consequential.\n\n"
+                     f"{listing}")
+    except Exception as e:                      # a ranking pass must never fail a run
+        _warn(f"rank pass failed ({e}); keeping keyword order")
+        return cands
+    order, seen = [], set()
+    for n in re.findall(r"\d+", reply or ""):
+        i = int(n) - 1
+        if 0 <= i < len(cands) and i not in seen:
+            seen.add(i)
+            order.append(cands[i])
+    if not order:
+        _warn("rank pass returned nothing usable; keeping keyword order")
+        return cands
+    rest = [c for i, c in enumerate(cands) if i not in seen]
+    _warn(f"{heading[3:]}: model ranked {len(order)} of {len(cands)} candidates")
+    return order + rest
+
+
 def _rebuild_bullet_sections(markdown: str, notes: list, products: list,
-                             want: int | None = None, keep=None) -> str:
+                             want: int | None = None, keep=None, rank=None) -> str:
     """Build the bullet sections FROM the slice notes, not from the merge.
 
     The merge is the lossiest stage in the pipeline and always will be: an 8B
@@ -2116,8 +2174,13 @@ def _rebuild_bullet_sections(markdown: str, notes: list, products: list,
                 _warn(f"{heading[3:]}: {before - len(cands)} candidate(s) failed the "
                       f"gates before ranking, {len(cands)} left")
 
+        # Keyword order first - it is what decides the floor and is a sane
+        # fallback - then the model reorders the survivors it can see.
+        cands = sorted(cands, key=lambda c: -c[1])
+        cands = _llm_rank(cands, heading, limit, rank)
+
         picked = []
-        for text, score, src in sorted(cands, key=lambda c: -c[1]):
+        for text, score, src in cands:
             if score < CLAIM_SCORE_FLOOR:
                 break                           # ranked list: the rest are worse
             if any(_same_claim(text, p) for p, _, _ in picked):
@@ -2612,7 +2675,10 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
     findings = [l for l in scan.splitlines() if "|" in l]
     if findings:
         draft = _strip_linkage_names(draft, findings)
-    return draft, notes
+    def rank(user: str) -> str:
+        return _gen(RANK_SYSTEM, user, 300, temperature=0.1)
+
+    return draft, notes, rank
 
 
 # --- git ----------------------------------------------------------------------
@@ -2686,11 +2752,12 @@ def main():
     # itself as a discrepancy - exactly the failure the gate exists to catch.
     raw_speech = transcript
 
-    notes = []
+    notes, rank = [], None
     if have_speech:
         transcript = _weave_orders(transcript, biz.get("sales"), date_str)
-        markdown, notes = _summarize(transcript, day, slack_text, _records_index(biz),
-                                     _context_block(biz), products)
+        markdown, notes, rank = _summarize(transcript, day, slack_text,
+                                           _records_index(biz),
+                                           _context_block(biz), products)
     else:
         _warn(f"{date_str}: no speech captured - business sections only")
         markdown = (
@@ -2747,7 +2814,8 @@ def main():
         return bool(found and found[2])
 
     markdown = gates(markdown)
-    rebuilt = _rebuild_bullet_sections(markdown, notes, products, keep=survives)
+    rebuilt = _rebuild_bullet_sections(markdown, notes, products,
+                                       keep=survives, rank=rank)
     if rebuilt != markdown:
         markdown = gates(rebuilt)
     # Cap last, at the policy's own number: the rebuild deliberately keeps more

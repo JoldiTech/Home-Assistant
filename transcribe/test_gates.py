@@ -702,6 +702,35 @@ out = P._rebuild_bullet_sections(EMPTY, THIN, [])
 check("a quiet day stays quiet", out.count("- "), 1)
 
 
+
+# --- model re-ranking ---------------------------------------------------------
+print("\nllm re-ranking")
+
+CANDS = [(f"candidate {i}", 0, "note") for i in range(6)]
+
+# The model can only ever return INDICES into a list it was given, so nothing
+# new can enter the log however badly it answers.
+out = P._llm_rank(CANDS, "## Unresolved", 3, lambda u: "4, 2, 6")
+check("model order is honoured", [t for t, _, _ in out[:3]],
+      ["candidate 3", "candidate 1", "candidate 5"])
+check("unranked candidates keep their place behind", len(out), len(CANDS))
+
+check("out-of-range indices are ignored",
+      [t for t, _, _ in P._llm_rank(CANDS, "## X", 3, lambda u: "99, 1, 0, -4")[:1]],
+      ["candidate 0"])
+check("a duplicate index is not repeated",
+      len(P._llm_rank(CANDS, "## X", 3, lambda u: "2, 2, 2")), len(CANDS))
+check("garbage reply falls back to keyword order",
+      [t for t, _, _ in P._llm_rank(CANDS, "## X", 3, lambda u: "no idea")],
+      [t for t, _, _ in CANDS])
+def boom(u):
+    raise RuntimeError("model died")
+check("a failed rank pass never fails the run",
+      [t for t, _, _ in P._llm_rank(CANDS, "## X", 3, boom)],
+      [t for t, _, _ in CANDS])
+check("no ranker at all is fine", P._llm_rank(CANDS, "## X", 3, None), CANDS)
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")
