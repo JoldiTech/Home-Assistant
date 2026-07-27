@@ -368,7 +368,7 @@ NOTES = ["""- [PROBLEM] Phones are not transferring calls to the warehouse
 - [FEEDBACK] The new Witch's Broom batch tastes lighter than the last"""]
 
 DRAFT = ("# Log\n\nThe rain brought people in off the street.\n\n"
-         "## Unresolved\n- Chase the invoice\n\n## Worth remembering\n- a real thing\n")
+         "## Unresolved\n- Chase the unpaid invoice from the tea supplier\n\n## Worth remembering\n- A customer asked for a size we do not carry\n")
 out = P._rebuild_bullet_sections(DRAFT, NOTES, [])
 check("dropped PROBLEM carried into Unresolved", has(out, "not transferring calls"), True)
 check("second PROBLEM carried too", has(out, "red basket"), True)
@@ -378,7 +378,7 @@ check("FEEDBACK carried into Worth remembering", has(out, "witch's broom"), True
 check("TRAFFIC is not carried as a bullet", has(out, "farmers market"), False)
 check("CAUSE already in the draft is not duplicated",
       out.lower().count("brought people in off the street"), 1)
-check("the model's own bullets are kept", has(out, "chase the invoice"), True)
+check("the model's own bullets are kept", has(out, "unpaid invoice"), True)
 
 # Carried lines land in the right sections, not appended at the end.
 uns = out.split("## Unresolved")[1].split("## Worth")[0]
@@ -549,6 +549,39 @@ wr = out.split("## Worth remembering")[1]
 check("a real product outranks a placeholder", has(wr, "sandia spice"), True)
 check("...and the placeholder is cut", has(wr, "exact item is unclear"), False)
 check("saffron - a product we do NOT stock - still ranks", has(wr, "saffron"), True)
+
+
+
+# --- what earns a slot --------------------------------------------------------
+print("\nslot competition")
+
+# 2026-07-19: five pickup-notification restatements held the whole Unresolved
+# section while the day's real findings sat unused in the notes.
+REAL_NOTES = ["""- [UNMET] A customer asked for saffron, which we don't carry
+- [PROBLEM] The label printer was on the wrong settings and misprinted labels
+- [PROMISE] Staff promised to call the customer back about a special order"""]
+RESTATE_DRAFT = ("# Log\n\nBody.\n\n## Unresolved\n"
+                 "- Send email details for Josh's pickup order\n"
+                 "- Send email details for Melo's pickup order\n"
+                 "- Josh's order is ready for pickup at NM Tea Co.\n\n"
+                 "## Worth remembering\n- Customer texts confirming order readiness\n")
+out = P._rebuild_bullet_sections(RESTATE_DRAFT, REAL_NOTES, [], want=3)
+uns = out.split("## Unresolved")[1].split("## Worth")[0]
+check("the label printer beats a pickup restatement", has(uns, "label printer"), True)
+check("the callback promise beats one too", has(uns, "call the customer back"), True)
+check("pickup-email restatements lose their slots", has(uns, "send email details"), False)
+wr = out.split("## Worth remembering")[1]
+check("saffron - carries no number and no catalog match - still wins a slot",
+      has(wr, "saffron"), True)
+check("a restatement does not ship even into an empty slot",
+      has(wr, "texts confirming order readiness"), False)
+
+# A draft bullet that earned a record reference keeps its edge.
+ANN = ("# Log\n\nBody.\n\n## Unresolved\n"
+       "- Reconcile the shortfall (likely order #58212, $43.50 at 2:14pm)\n\n"
+       "## Worth remembering\n- x\n")
+out = P._rebuild_bullet_sections(ANN, REAL_NOTES, [], want=1)
+check("an annotated draft bullet keeps its slot", has(out, "#58212"), True)
 
 
 print()

@@ -863,7 +863,10 @@ def _drop_record_name_lists(markdown: str, biz: dict) -> str:
 # These are the shapes the policy means by "a VAGUE line answers no future
 # question at any length - cut it".
 _PLACEHOLDER_RE = re.compile(
-    r"\b(?:a|an|the|some|another) (?:product|item|thing|blend|tea)\b|"
+    # NOT "tea" or "blend": in this shop those are the product, not a blank.
+    # "Chase the unpaid invoice from the tea supplier" was being scored as
+    # placeholder language because "the tea" matched.
+    r"\b(?:a|an|the|some|another) (?:product|item|thing)\b|"
     r"exact (?:item|product|name)[^.]{0,25}(?:unclear|unspecified|not specified)|"
     r"did ?n[o']?t specify|was ?n[o']?t specified|not specified\b|"
     r"asked for clarification|expressed (?:dis)?satisfaction with", re.I)
@@ -1822,6 +1825,11 @@ _NARRATIVE_TAGS = ("CAUSE", "TRAFFIC", "RHYTHM", "WEATHER", "MOOD")
 # Where each kind belongs, and which are worth rescuing at all. CAUSE and
 # TRAFFIC shape the narrative rather than standing alone as bullets.
 CARRY_SECTION_TARGET = int(os.environ.get("CARRY_SECTION_TARGET", "5"))
+# Below this a candidate does not ship at all, even into an empty section.
+# "Empty beats padded" is the policy's own rule and the ranking cannot honour
+# it by ordering alone: with nothing better available, a pickup-notification
+# restatement scoring -5 was still taking the last slot.
+CLAIM_SCORE_FLOOR = int(os.environ.get("CLAIM_SCORE_FLOOR", "0"))
 
 
 def _carry_section(tag: str) -> str | None:
@@ -1876,6 +1884,27 @@ def _same_claim(a: str, b: str) -> bool:
     return _already_covered(a, b)
 
 
+# What the log is FOR, in the form these bullets actually take.
+_UNMET_SHAPE_RE = re.compile(
+    r"do ?n[o']?t carry|does ?n[o']?t carry|not carried|out of stock|unavailable|"
+    r"not available|ran out|we are out|we're out|we only (?:stock|carry|have)|"
+    r"only .{0,25}(?:are|is) (?:stocked|carried|available)|"
+    r"asked for .{0,40}(?:but|which) (?:we|it|they)|unmet", re.I)
+_EQUIPMENT_RE = re.compile(
+    r"printer|fridge|refrigerat|phone|register|till|drawer|alarm|wiring|batter|"
+    r"scale|kettle|freezer|leak|broken|not working|jam(?:med|ming)?|"
+    r"out of order|unsafe|shelv|storage|POS\b|terminal|card reader", re.I)
+_COMMITMENT_RE = re.compile(
+    r"promised|committed|agreed to|will (?:call|send|hold|order|follow)|"
+    r"call(?:ing)? back|on hold for|special order|quote for|follow up", re.I)
+# Restating a record. These are stored forever and the narrative is told not to
+# spend itself on them; a bullet doing it is worse, because it occupies a slot.
+_RESTATEMENT_RE = re.compile(
+    r"order is ready for pickup|ready for pickup|send email details|"
+    r"email details (?:for|to)|notification[s]? (?:sent|to)|text (?:sent|message sent)|"
+    r"voicemail (?:received|from)|check your email", re.I)
+
+
 def _claim_score(text: str, known: list) -> int:
     """How searchable a candidate bullet is a year from now.
 
@@ -1896,6 +1925,21 @@ def _claim_score(text: str, known: list) -> int:
         score += 2
     elif re.search(r"\d", text):
         score += 1
+    # The categories the log exists for. Without these a qualitative finding -
+    # "a customer asked for saffron, which we don't carry" - scores zero,
+    # because it names no catalog product (that is the whole point of it) and
+    # carries no number. On 2026-07-19 that let five pickup-notification
+    # restatements outrank every real finding of the day.
+    if _UNMET_SHAPE_RE.search(text):
+        score += 3
+    if _EQUIPMENT_RE.search(text):
+        score += 3
+    if _COMMITMENT_RE.search(text):
+        score += 2
+    # ...and the category it exists to exclude. A line restating a text message
+    # or a pickup notification is in the records forever and answers nothing.
+    if _RESTATEMENT_RE.search(text):
+        score -= 5
     if _PLACEHOLDER_RE.search(text):
         score -= 3
     if any(_is_garble(q) for q in re.findall(r'"([^"]{3,})"', text)):
@@ -1956,7 +2000,12 @@ def _rebuild_bullet_sections(markdown: str, notes: list, products: list,
         if not found:
             continue
         i, j, existing = found
-        cands = [(b, _claim_score(b, known) + 1, "draft") for b in existing]
+        # A draft bullet is only privileged when the correlation pass gave
+        # it a record reference the raw note cannot have. Otherwise it
+        # competes on merit: a flat +1 was enough to keep five pickup-text
+        # restatements ahead of every real finding on 2026-07-19.
+        cands = [(b, _claim_score(b, known) + (2 if _ANNOTATION_RE.search(b) else 0),
+                  "draft") for b in existing]
         for tag, text in tagged:
             if _carry_section(tag) != heading:
                 continue
@@ -1964,6 +2013,8 @@ def _rebuild_bullet_sections(markdown: str, notes: list, products: list,
 
         picked = []
         for text, score, src in sorted(cands, key=lambda c: -c[1]):
+            if score < CLAIM_SCORE_FLOOR:
+                break                           # ranked list: the rest are worse
             if any(_same_claim(text, p) for p, _, _ in picked):
                 continue
             picked.append((text, score, src))
