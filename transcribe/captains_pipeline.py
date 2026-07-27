@@ -82,8 +82,18 @@ _NOTHINK = os.environ.get("SUMMARIZER_NOTHINK", "1") != "0"
 # OFF - see _llm_rank for the numbers and for why it loses.
 SUMMARIZER_RANK = os.environ.get("SUMMARIZER_RANK", "0") != "0"
 # How much transcript the notes pass reads at once. Smaller than the context
-# window on purpose - see the chunking call in _summarize for the measurement.
-NOTES_SLICE_TOKENS = int(os.environ.get("NOTES_SLICE_TOKENS", "2200"))
+# window on purpose - see the chunking call in _summarize for why. Measured on
+# 2026-07-19, one knob changed, same model and audio:
+#   5000 tok/slice ->  9 slices,  71 notes, 5 of 9 findings
+#   2200 tok/slice -> 19 slices, 150 notes, 4 of 9
+#   1200 tok/slice -> 35 slices, 280 notes, 7 of 9
+# Note volume tracks slice COUNT almost exactly - the model writes about the
+# same number of bullets per read however much it is handed - which is the
+# whole reason this is a separate knob from the prompt budget. Treat the
+# finding counts as noisy (2200 scoring under 5000 is not a real inversion;
+# repeat runs of the same budget have differed by two), so only the 1200 jump
+# is big enough to act on.
+NOTES_SLICE_TOKENS = int(os.environ.get("NOTES_SLICE_TOKENS", "1200"))
 
 DEFAULT_REPO = "JoldiTech/Home-Assistant"
 LOG_BRANCH = "captains-log"
@@ -2609,20 +2619,41 @@ def _fit_notes(tok, notes: list, n_side: int, budget: int) -> str:
     Records notes are the first `n_side` blocks and are never the ones dropped:
     they are one block against a dozen, they are the material somebody actually
     wrote down, and losing them is the failure this whole area keeps having.
-    Audio blocks are dropped latest-first so the day still reads in order.
+
+    Audio blocks are thinned EVENLY across the day, never truncated. Dropping
+    from the end is the obvious implementation and it silently rewrites what
+    the log is: the narrative is built from this text, so cutting the last
+    third of a 35-slice day produces a story that ends at four in the
+    afternoon and never says so. Keeping every Nth block instead costs the
+    same tokens and still spans opening to close.
     """
     if not notes:
         return ""
     total = tok("\n".join(notes))
     if total <= budget:
         return "\n".join(notes)
-    keep = list(notes)
-    while len(keep) > max(n_side, 1) and tok("\n".join(keep)) > budget:
-        keep.pop()
-    _warn(f"notes {total} tokens over the {budget} merge budget: "
-          f"merging {len(keep)} of {len(notes)} blocks "
+    side, audio = list(notes[:n_side]), list(notes[n_side:])
+
+    def spread(k):
+        """k audio blocks sampled evenly from first to last."""
+        if k <= 1:
+            return audio[:k]
+        step = (len(audio) - 1) / (k - 1)
+        return [audio[i] for i in
+                sorted({min(round(n * step), len(audio) - 1) for n in range(k)})]
+
+    for keep_n in range(len(audio), 0, -1):
+        kept = side + spread(keep_n)
+        if tok("\n".join(kept)) <= budget:
+            break
+    else:
+        # Not even one audio block fits beside the records notes. Records win:
+        # they are never what gets dropped, even when that is all that is left.
+        kept = side or audio[:1]
+    _warn(f"notes {total} tokens over the {budget} merge budget: merging "
+          f"{len(kept)} of {len(notes)} blocks, thinned evenly across the day "
           f"(the rest still reach the bullet sections)")
-    return "\n".join(keep)
+    return "\n".join(kept)
 
 
 def _strip_think(text: str) -> str:
