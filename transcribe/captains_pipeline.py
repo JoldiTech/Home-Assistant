@@ -924,6 +924,32 @@ _SHOP_CONTEXT_RE = re.compile(
     r"caffeine|decaf)\b", re.I)
 
 
+# "No contact info ever" is in the policy and was never enforced in code. The
+# notes pass for 2026-07-26's records produced "[PROMISE] Ticket #3259 from Joy
+# Mack and #3267 from sidhe7@juno.com pending accuracy check" - which the
+# carry-through would have inserted into Unresolved verbatim, publishing a
+# customer's email address to a GitHub branch. Found by probing the notes
+# rather than by reading a log, because no log had shown it yet.
+_EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.]{2,}\b")
+_PHONE_RE = re.compile(r"(?<!\w)(?:\+?1[ .-]?)?\(?\d{3}\)?[ .-]?\d{3}[ .-]?\d{4}(?!\w)")
+
+
+def _scrub_contact_info(markdown: str) -> str:
+    """Strip emails and phone numbers wherever they appear.
+
+    Strips rather than drops: "ticket #3259 is pending an accuracy check" is a
+    real open item, and the address is the only part that must not survive.
+    A claim left with nothing but connectives afterwards is dropped by the
+    vagueness pass downstream.
+    """
+    def scrub(m):
+        _warn(f"scrubbed contact info: {m.group(0)[:6]}…")
+        return "[contact removed]"
+
+    markdown = _EMAIL_RE.sub(scrub, markdown)
+    return _PHONE_RE.sub(scrub, markdown)
+
+
 def _drop_personal_health(markdown: str) -> str:
     """Drop health talk that is not a shopping question.
 
@@ -1237,7 +1263,9 @@ _UNAVAILABLE_RE = re.compile(
     r"didn'?t have|don'?t carry|not carried|ran out|restock|"
     # 2026-07-26 asserted "but neither were available" of two products the
     # register shows sold, and slipped through: the phrasing carries no "not".
-    r"(?:neither|none|nothing|not one)\s+(?:of\s+\w+\s+)?(?:were|was)\s+available|"
+    # The copula is optional: 2026-07-26 regenerated with "neither available"
+    # and slipped past a pattern that insisted on "neither WERE available".
+    r"(?:neither|none|nothing|not one)\s+(?:of\s+\w+\s+)?(?:were\s+|was\s+)?available|"
     r"weren'?t available|were not available|not in stock|no longer (?:carry|stocked)|"
     r"could ?n[o']?t find|we(?:'re| are|'ve been| have been) out",
     re.IGNORECASE)
@@ -1674,15 +1702,35 @@ def _strip_staff_attribution(markdown: str, staff: set) -> str:
 # code if the draft failed to mention it. Every carried line then goes through
 # the same gates as everything else - nothing skips grounding, garble or privacy
 # checks by arriving this way.
-_NOTE_TAG_RE = re.compile(r"^\s*[-*]?\s*\[(UNMET|PROBLEM|PROMISE|FEEDBACK|CAUSE|TRAFFIC)\]\s*",
-                          re.I)
-# The model copies the tags into its prose if left alone; they are scaffolding.
-_NOTE_TAG_ANY_RE = re.compile(r"\[(?:UNMET|PROBLEM|PROMISE|FEEDBACK|CAUSE|TRAFFIC)\]\s*", re.I)
+# Accept ANY [TAG], not just the six the prompt lists. Given a closed list the
+# model extends it: asked for six tags on 2026-07-26's staff chat it also
+# emitted [SUPPLY] (2 cases of gift tins ordered), [STORAGE] (matcha newly kept
+# in the fridge) and [SAFETY] (heavy stock shelved unsafely high) - the exact
+# findings this mechanism exists to rescue, thrown away by a parser that only
+# recognised its own vocabulary. An unknown tag is a classification problem,
+# never a reason to discard the finding.
+_NOTE_TAG_RE = re.compile(r"^\s*[-*]?\s*\[([A-Z][A-Z /&-]{2,20})\]\s*")
+_NOTE_TAG_ANY_RE = re.compile(r"\[[A-Z][A-Z /&-]{2,20}\]\s*")
+# Tags that mean "somebody has to do something" land in Unresolved; every other
+# tag is an observation. Substring match, so SUPPLY-ORDER and STOCK/SUPPLY work.
+_ACTIONABLE_TAGS = ("PROBLEM", "PROMISE", "SAFETY", "SUPPLY", "STORAGE", "EQUIPMENT",
+                    "STOCK", "ISSUE", "BROKEN", "REORDER", "ACTION", "REPAIR")
+# ...except these, which shape the narrative and are not bullets at all.
+_NARRATIVE_TAGS = ("CAUSE", "TRAFFIC", "RHYTHM", "WEATHER", "MOOD")
 # Where each kind belongs, and which are worth rescuing at all. CAUSE and
 # TRAFFIC shape the narrative rather than standing alone as bullets.
-_CARRY_SECTION = {"PROBLEM": "## Unresolved", "PROMISE": "## Unresolved",
-                  "UNMET": "## Worth remembering", "FEEDBACK": "## Worth remembering"}
 CARRY_SECTION_TARGET = int(os.environ.get("CARRY_SECTION_TARGET", "5"))
+
+
+def _carry_section(tag: str) -> str | None:
+    """Which bullet list a tagged note belongs in, or None to leave it to the
+    narrative. Unknown tags are classified, never dropped."""
+    t = tag.upper()
+    if any(k in t for k in _NARRATIVE_TAGS):
+        return None
+    if any(k in t for k in _ACTIONABLE_TAGS):
+        return "## Unresolved"
+    return "## Worth remembering"
 
 
 def _parse_tagged_notes(notes: list) -> list:
@@ -1717,7 +1765,7 @@ def _carry_through_notes(markdown: str, notes: list) -> str:
     lines = markdown.splitlines()
     counts, order = {}, []
     for i, l in enumerate(lines):
-        if l.strip() in _CARRY_SECTION.values():
+        if l.strip() in ("## Unresolved", "## Worth remembering"):
             order.append((l.strip(), i))
     if not order:
         return markdown
@@ -1732,7 +1780,7 @@ def _carry_through_notes(markdown: str, notes: list) -> str:
 
     added = 0
     for tag, text in tagged:
-        section = _CARRY_SECTION.get(tag)
+        section = _carry_section(tag)
         if not section or counts.get(section, 0) >= CARRY_SECTION_TARGET:
             continue
         if _already_covered(text, "\n".join(lines)):
@@ -2322,6 +2370,7 @@ def main():
         raw_speech if have_speech else "", slack_text,
         _records_index(biz), _context_block(biz),
     ]))
+    markdown = _scrub_contact_info(markdown)
     markdown = _reject_prompt_echoes(markdown, grounding)
     markdown = _reject_training_artifacts(markdown, raw_speech if have_speech else "")
     # Before the stock flagger: otherwise a real catalog name buried inside a

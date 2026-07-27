@@ -396,6 +396,39 @@ check("tags never reach the log",
       bool(P._NOTE_TAG_ANY_RE.search(P._NOTE_TAG_ANY_RE.sub("", out))), False)
 
 
+
+# --- unknown tags and contact info --------------------------------------------
+print("\nunknown tags / contact info")
+
+# Given a closed list of six tags the model invents more. Discarding them threw
+# away exactly what the carry-through exists to rescue.
+WILD = ["""- [SUPPLY] Ordered 2 cases of 5oz gift tins
+- [STORAGE] Matcha is now kept in the fridge, consuming space
+- [SAFETY] Heavy stock shelved too high to take down safely
+- [RHYTHM] Quiet until mid-morning"""]
+out = P._carry_through_notes("# Log\n\nBody.\n\n## Unresolved\n\n## Worth remembering\n", WILD)
+for probe in ("gift tins", "fridge", "shelved too high"):
+    check(f"unknown tag still carried: {probe}", has(out, probe), True)
+check("narrative-ish unknown tag is not a bullet", has(out, "quiet until"), False)
+uns = out.split("## Unresolved")[1].split("## Worth")[0]
+check("actionable unknown tags land in Unresolved", has(uns, "shelved too high"), True)
+
+# The notes pass produced a customer email inside a [PROMISE] bullet, which the
+# carry-through would have inserted verbatim.
+out = P._scrub_contact_info(
+    "- Ticket #3259 from Joy Mack and #3267 from sidhe7@juno.com pending check\n"
+    "- Call the customer back on (505) 555-0142\n")
+check("email scrubbed", has(out, "juno.com"), False)
+check("phone scrubbed", has(out, "555-0142"), False)
+check("...the open item survives", has(out, "#3259"), True)
+check("...and so does the callback", has(out, "call the customer back"), True)
+
+out = P._reject_sold_reorders(
+    "Customer requested two ounces of Sandia spice and one immune support tea, "
+    "neither available.\n", BIZ)
+check("'neither available' without a copula is caught", has(out, "sandia"), False)
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")
