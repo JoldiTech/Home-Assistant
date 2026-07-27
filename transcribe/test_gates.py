@@ -243,6 +243,34 @@ check("emptied paragraph is removed, structure kept",
       has(out, "## Unresolved") and not has(out, "Only one"), True)
 
 
+
+
+# --- overheard speech, name lists, empty sections -----------------------------
+print("\novertalk / name lists / empty sections")
+
+out = P._drop_overheard_quotes(
+    "The customer had difficulty with the register, asking if it was fucking receipt. "
+    "The label printer jammed twice.\n")
+check("verbatim overheard speech dropped", has(out, "fucking"), False)
+check("...neighbouring sentence survives", has(out, "label printer"), True)
+
+BIZ_TEXTS = {"texts": {"messages": [
+    {"time_local": "2026-07-23 10:45", "phone": "1", "direction": "outbound",
+     "body": "Hi Deborah, your order is ready for pickup at NM Tea Co."},
+    {"time_local": "2026-07-23 10:46", "phone": "2", "direction": "outbound",
+     "body": "Hi Ashley, your order is ready for pickup at NM Tea Co."},
+]}}
+NAMED = ("The afternoon brought several pickup notifications sent to Deborah and Ashley. "
+         "Deborah asked us to hold a second tin until Friday.\n")
+out = P._drop_record_name_lists(NAMED, BIZ_TEXTS)
+check("record name list dropped", has(out, "notifications sent to"), False)
+check("one name on a real commitment survives", has(out, "hold a second tin"), True)
+
+out = P._mark_empty_sections("# Log\n\nBody.\n\n## Unresolved\n\n## Worth remembering\n- a\n")
+check("empty section marked", has(out, "_None._"), True)
+check("...populated section untouched", out.count("_None._"), 1)
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")

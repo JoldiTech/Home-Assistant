@@ -806,6 +806,64 @@ def _drop_credentials(markdown: str) -> str:
     return _edit_claims(markdown, reject)
 
 
+# The policy bans verbatim quotes outright, and the tell that one got through is
+# usually profanity: 2026-07-23 regenerated with "asking if it was fucking
+# receipt". Stripping the quotation marks is not enough - the sentence is still
+# somebody's overheard words in a permanent record.
+_PROFANITY_RE = re.compile(
+    r"\b(?:fuck\w*|shit\w*|bitch\w*|cunt\w*|assholes?|bastards?|dick ?head)\b", re.I)
+
+
+def _drop_overheard_quotes(markdown: str) -> str:
+    def reject(text, is_bullet):
+        return "verbatim overheard speech" if _PROFANITY_RE.search(text) else None
+
+    return _edit_claims(markdown, reject)
+
+
+def _drop_record_name_lists(markdown: str, biz: dict) -> str:
+    """Drop claims that recite customer names straight out of the records.
+
+    2026-07-23 regenerated with "The afternoon brought several pickup
+    notifications sent to [six first names]" - every one lifted from the texts
+    table. It is a privacy problem and a restatement at the same time: those
+    names are in the records forever, and naming a customer is only ever
+    justified when it makes a commitment actionable. One name on a promise is
+    the point of the log; a list of six is the records with the useful part
+    removed.
+    """
+    names = set()
+    for m in re.finditer(r'"Hi ([A-Z][a-z]{2,})[,!]', _context_block(biz) or ""):
+        names.add(m.group(1))
+    if len(names) < 2:
+        return markdown
+
+    def reject(text, is_bullet):
+        hit = [n for n in names if re.search(r"\b" + re.escape(n) + r"\b", text)]
+        if len(hit) >= 2:
+            return f"recites {len(hit)} customer names from the records"
+        return None
+
+    return _edit_claims(markdown, reject)
+
+
+def _mark_empty_sections(markdown: str) -> str:
+    """A heading with nothing under it reads as a broken render, not as "there
+    was nothing". Empty beats padded, but say so."""
+    lines = markdown.splitlines()
+    out = []
+    for i, line in enumerate(lines):
+        out.append(line)
+        if not line.strip().startswith("##"):
+            continue
+        rest = lines[i + 1:]
+        nxt = next((l for l in rest if l.strip()), "")
+        if not nxt or nxt.strip().startswith("#"):
+            out.append("")
+            out.append("_None._")
+    return "\n".join(out)
+
+
 def _match_catalog(markdown: str, products: list[dict]):
     """Split the draft's unknown quoted product names into deterministic
     auto-fixes and cases needing judgment.
@@ -2040,10 +2098,15 @@ def main():
     # Last, so the catalog and stock stages still see the quotes they key on.
     markdown = _unquote_unverified(markdown, products)
     markdown = _drop_credentials(markdown)
+    markdown = _drop_overheard_quotes(markdown)
+    markdown = _drop_record_name_lists(markdown, biz)
     markdown = _fix_generic_opener(markdown, biz)
     # Runs BEFORE the stats block is appended: timeclock names belong there,
     # what must not survive is a staff name attached to something they said.
     markdown = _strip_staff_attribution(markdown, _staff_names(biz, slack_names))
+    # Last of the editors: everything above only ever removes, so a section can
+    # end up empty and a bare heading reads as a broken render.
+    markdown = _mark_empty_sections(markdown)
     markdown = markdown.rstrip() + "\n\n" + _business_sections(biz)
 
     # DRY_RUN builds the log and prints it without touching git - the only way
