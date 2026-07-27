@@ -1841,6 +1841,22 @@ CARRY_SECTION_TARGET = int(os.environ.get("CARRY_SECTION_TARGET", "5"))
 # it by ordering alone: with nothing better available, a pickup-notification
 # restatement scoring -5 was still taking the last slot.
 CLAIM_SCORE_FLOOR = int(os.environ.get("CLAIM_SCORE_FLOOR", "0"))
+# The two sections are read differently and should not share a limit.
+#
+# "Unresolved" is tomorrow's to-do list, read in a minute over coffee. A list
+# of fifteen is not a to-do list, so it stays tight and the ranking has to
+# choose. "Worth remembering" is the searchable archive - the prompt's own
+# second reader, "someone months from now searching old logs for when
+# something started". Nobody reads that section top to bottom; they grep it.
+# Length costs nothing there and every dropped line is a question that can
+# never be answered later.
+#
+# Measured on the four audited days: 14-38 candidates survived every gate and
+# five shipped per section. The cap, not recall, was the binding constraint.
+SECTION_CAPS = {
+    "## Unresolved": int(os.environ.get("UNRESOLVED_CAP", "5")),
+    "## Worth remembering": int(os.environ.get("REMEMBER_CAP", "12")),
+}
 
 
 def _carry_section(tag: str) -> str | None:
@@ -1990,7 +2006,7 @@ def _section_bullets(lines: list, heading: str):
 
 
 def _rebuild_bullet_sections(markdown: str, notes: list, products: list,
-                             want: int = 8, keep=None) -> str:
+                             want: int | None = None, keep=None) -> str:
     """Build the bullet sections FROM the slice notes, not from the merge.
 
     The merge is the lossiest stage in the pipeline and always will be: an 8B
@@ -2020,6 +2036,7 @@ def _rebuild_bullet_sections(markdown: str, notes: list, products: list,
     rebuilt = 0
 
     for heading in ("## Unresolved", "## Worth remembering"):
+        limit = want if want is not None else SECTION_CAPS.get(heading, 5)
         found = _section_bullets(lines, heading)
         if not found:
             continue
@@ -2048,7 +2065,7 @@ def _rebuild_bullet_sections(markdown: str, notes: list, products: list,
             if any(_same_claim(text, p) for p, _, _ in picked):
                 continue
             picked.append((text, score, src))
-            if len(picked) >= want:
+            if len(picked) >= limit:
                 break
         if not picked:
             continue
@@ -2062,22 +2079,24 @@ def _rebuild_bullet_sections(markdown: str, notes: list, products: list,
     return "\n".join(lines)
 
 
-def _cap_bullet_lists(markdown: str, cap: int = 6) -> str:
+def _cap_bullet_lists(markdown: str, cap: int | None = None) -> str:
     """Deterministic guard behind the summarizer's 0-5 rule: on POS-heavy days
     the 8B model has produced degenerate drafts listing every SOLD product as a
     'Reorder' bullet (50+ lines), which then truncates the output mid-word.
     Prompts lower the odds; this makes the failure bounded - keep the first
     `cap` bullets of each list section and drop the rest."""
-    out, in_list, kept = [], False, 0
+    out, limit, kept = [], None, 0
     for line in markdown.splitlines():
         if line.startswith("## "):
-            in_list = line.strip() in ("## Unresolved", "## Worth remembering")
+            limit = (cap if cap is not None
+                     else SECTION_CAPS.get(line.strip())) if (
+                         line.strip() in SECTION_CAPS) else None
             kept = 0
-        elif in_list and line.lstrip().startswith("- "):
+        elif limit is not None and line.lstrip().startswith("- "):
             kept += 1
-            if kept > cap:
-                if kept == cap + 1:
-                    _warn(f"capping runaway bullet list at {cap} items")
+            if kept > limit:
+                if kept == limit + 1:
+                    _warn(f"capping runaway bullet list at {limit} items")
                 continue
         out.append(line)
     return "\n".join(out)
@@ -2676,7 +2695,7 @@ def main():
     # Cap last, at the policy's own number: the rebuild deliberately keeps more
     # candidates than will ship so the gates have slack to reject without
     # leaving a section thin.
-    markdown = _cap_bullet_lists(markdown, cap=5)
+    markdown = _cap_bullet_lists(markdown)
     markdown = _fix_generic_opener(markdown, biz)
     # Runs BEFORE the stats block is appended: timeclock names belong there,
     # what must not survive is a staff name attached to something they said.

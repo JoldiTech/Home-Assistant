@@ -631,6 +631,45 @@ check("...and the real findings get the slots", has(tight, "phones at counter"),
 check("...both of them", has(tight, "red basket"), True)
 
 
+
+# --- the two sections are read differently ------------------------------------
+print("\nper-section caps")
+
+# Distinct wording on purpose: seven formulaic "the X is not working" lines
+# share trigrams and correctly collapse to one, which says more about the
+# fixture than the cap.
+MANY = ["""- [PROBLEM] The label printer keeps reverting to settings that misprint
+- [PROBLEM] The fridge door will not shut with the red basket in the way
+- [PROBLEM] Phones at the counter no longer transfer through to the warehouse
+- [PROBLEM] One payment terminal rejects cards until it is unplugged
+- [PROBLEM] Heavy insta-chai boxes are shelved too high to lift down safely
+- [PROBLEM] The remote needs new batteries; lights take four presses
+- [PROBLEM] Exposed wiring behind the wall calendar was flagged as a fire risk
+- [UNMET] A customer asked for saffron, which we don't carry
+- [UNMET] Cinnamon sticks were requested; only chips are stocked
+- [UNMET] Vietnam black tea is out with no restock date to give a regular
+- [UNMET] Someone wanted a fruit tisane containing chamomile; nothing matches
+- [UNMET] Milk oolong was asked for and we had none left
+- [UNMET] A roasted yaupon was requested after a tasting elsewhere
+- [UNMET] Bergamot rooibos came up twice and is not in the range
+- [UNMET] Green hojicha is no longer sourceable from that supplier"""]
+EMPTY = "# Log\n\nBody.\n\n## Unresolved\n\n## Worth remembering\n"
+out = P._rebuild_bullet_sections(EMPTY, MANY, [])
+uns = out.split("## Unresolved")[1].split("## Worth")[0]
+wr = out.split("## Worth remembering")[1]
+check("tomorrow's to-do list stays short",
+      uns.count("- "), P.SECTION_CAPS["## Unresolved"])
+check("the searchable archive is allowed to be long",
+      wr.count("- ") > P.SECTION_CAPS["## Unresolved"], True)
+check("...but still bounded",
+      wr.count("- ") <= P.SECTION_CAPS["## Worth remembering"], True)
+
+# The cap must not resurrect padding: a quiet day still ends up short.
+THIN = ["- [UNMET] A customer asked for saffron, which we don't carry"]
+out = P._rebuild_bullet_sections(EMPTY, THIN, [])
+check("a quiet day stays quiet", out.count("- "), 1)
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")
