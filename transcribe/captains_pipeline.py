@@ -400,7 +400,16 @@ NOTES_SYSTEM = SYSTEM_PROMPT + (
     "or thought - write 'a staff request to reorder [the item]', not '[name] "
     "asked for it'. Nothing in [square brackets] is content; fill those slots "
     "from this slice only. No format headers - just bullets. At most 8 bullets "
-    "per slice."
+    "per slice.\n\nStart EVERY bullet with one tag in square brackets, chosen "
+    "from exactly this list:\n"
+    "[UNMET] a product/size/service asked for and not available\n"
+    "[PROBLEM] something broken, failing, miscounted, mis-priced or unsafe\n"
+    "[PROMISE] something staff committed to - a hold, callback, special order\n"
+    "[FEEDBACK] specific praise or complaint about a named product or the shop\n"
+    "[CAUSE] the stated reason behind something - weather, an event, staffing\n"
+    "[TRAFFIC] the one bullet on how busy the slice felt\n"
+    "The tag is how these survive being merged with a dozen other slices; a "
+    "bullet without one is discarded."
 )
 
 
@@ -1652,6 +1661,97 @@ def _strip_staff_attribution(markdown: str, staff: set) -> str:
     return "\n".join(lines)
 
 
+# The merge is where findings die. On a long day the final call is handed a
+# dozen slices of notes and asked for 2-4 paragraphs plus ten bullets, and an 8B
+# model simply drops most of it - 2026-07-26's staff chat contained a supply
+# order, the phones not reaching the warehouse, a fridge wedged open and a
+# safety warning, and NONE of it survived to the log. Giving Slack its own notes
+# pass did not fix that, because the loss happens downstream of the notes.
+#
+# So the operational items stop depending on the merge. The notes pass tags each
+# bullet by kind; the model still writes the prose, but anything tagged as a
+# problem, an unmet request or a promise is carried into the bullet sections in
+# code if the draft failed to mention it. Every carried line then goes through
+# the same gates as everything else - nothing skips grounding, garble or privacy
+# checks by arriving this way.
+_NOTE_TAG_RE = re.compile(r"^\s*[-*]?\s*\[(UNMET|PROBLEM|PROMISE|FEEDBACK|CAUSE|TRAFFIC)\]\s*",
+                          re.I)
+# The model copies the tags into its prose if left alone; they are scaffolding.
+_NOTE_TAG_ANY_RE = re.compile(r"\[(?:UNMET|PROBLEM|PROMISE|FEEDBACK|CAUSE|TRAFFIC)\]\s*", re.I)
+# Where each kind belongs, and which are worth rescuing at all. CAUSE and
+# TRAFFIC shape the narrative rather than standing alone as bullets.
+_CARRY_SECTION = {"PROBLEM": "## Unresolved", "PROMISE": "## Unresolved",
+                  "UNMET": "## Worth remembering", "FEEDBACK": "## Worth remembering"}
+CARRY_SECTION_TARGET = int(os.environ.get("CARRY_SECTION_TARGET", "5"))
+
+
+def _parse_tagged_notes(notes: list) -> list:
+    """[(tag, text)] for every tagged bullet across all slices, in order."""
+    out = []
+    for block in notes:
+        for line in (block or "").splitlines():
+            m = _NOTE_TAG_RE.match(line)
+            if not m:
+                continue
+            text = line[m.end():].strip(" -*").strip()
+            if len(text.split()) >= 4:
+                out.append((m.group(1).upper(), text))
+    return out
+
+
+def _already_covered(text: str, markdown: str) -> bool:
+    """True when the draft already says this. Compared on content bigrams so a
+    reworded version still counts - the point is to avoid saying it twice, not
+    to demand the model matched our wording."""
+    a = _content_bigrams(text)
+    if not a:
+        return True
+    return len(a & _content_bigrams(markdown)) / len(a) >= 0.5
+
+
+def _carry_through_notes(markdown: str, notes: list) -> str:
+    """Top up the bullet sections from the tagged notes the merge dropped."""
+    tagged = _parse_tagged_notes(notes)
+    if not tagged:
+        return markdown
+    lines = markdown.splitlines()
+    counts, order = {}, []
+    for i, l in enumerate(lines):
+        if l.strip() in _CARRY_SECTION.values():
+            order.append((l.strip(), i))
+    if not order:
+        return markdown
+    for name, i in order:
+        n = 0
+        for l in lines[i + 1:]:
+            if l.startswith("## "):
+                break
+            if l.lstrip().startswith("- "):
+                n += 1
+        counts[name] = n
+
+    added = 0
+    for tag, text in tagged:
+        section = _CARRY_SECTION.get(tag)
+        if not section or counts.get(section, 0) >= CARRY_SECTION_TARGET:
+            continue
+        if _already_covered(text, "\n".join(lines)):
+            continue
+        idx = next(i for s, i in order if s == section)
+        end = idx + 1
+        while end < len(lines) and not lines[end].startswith("## "):
+            end += 1
+        while end > idx + 1 and not lines[end - 1].strip():
+            end -= 1
+        lines.insert(end, f"- {text}")
+        counts[section] += 1
+        added += 1
+        order = [(s, (i + 1 if i >= end else i)) for s, i in order]
+    if added:
+        _warn(f"carried {added} tagged note(s) the merge dropped")
+    return "\n".join(lines)
+
+
 def _cap_bullet_lists(markdown: str, cap: int = 6) -> str:
     """Deterministic guard behind the summarizer's 0-5 rule: on POS-heavy days
     the 8B model has produced degenerate drafts listing every SOLD product as a
@@ -2059,21 +2159,25 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
             weekday=wk, date=ds, first_ts=first_ts, last_ts=last_ts,
             **{body_field: body + slack_block}), 1200)
 
+    # Staff chat and business records always get their own notes pass, on short
+    # days too. It is the only representation of them that survives to the
+    # carry-through below - as raw text at the end of the final prompt they
+    # were reliably ignored.
+    notes = []
+    if slack_block.strip():
+        notes.append(_gen(NOTES_SYSTEM,
+                          SIDE_NOTES_TEMPLATE.format(chunk=slack_block), 500))
+
     if _tok(compact) <= INPUT_BUDGET:
         draft = _final("transcript", compact)
     else:
         # Long day: chunk -> notes per slice -> merge into the log.
         chunks = _chunk_by_tokens(llm, compact, INPUT_BUDGET)
         _warn(f"long day: {len(chunks)} slices -> notes -> final")
-        notes = [
+        notes += [
             _gen(NOTES_SYSTEM, NOTES_TEMPLATE.format(i=i, n=len(chunks), chunk=ch), 500)
             for i, ch in enumerate(chunks, 1)
         ]
-        # Staff chat and records get their own notes pass and go FIRST, so they
-        # are not one raw block competing with ten slices of transcript notes.
-        if slack_block.strip():
-            notes.insert(0, _gen(NOTES_SYSTEM,
-                                 SIDE_NOTES_TEMPLATE.format(chunk=slack_block), 500))
         draft = _final("notes", "\n".join(notes))
 
     # Correlation pass: the draft was written reading chronologically, so a
@@ -2085,6 +2189,12 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
             records = records.rsplit("\n", max(1, records.count("\n") // 4))[0]
         _warn("correlation pass...")
         draft = _gen(CORRELATE_SYSTEM, f"RECORDS:\n{records}\n\nDRAFT:\n{draft}", 1800, temperature=0.1)
+
+    # Carry through what the merge dropped. Runs BEFORE redaction and the
+    # catalog stage on purpose: a carried line is not privileged, it goes
+    # through every check the model's own bullets do.
+    draft = _carry_through_notes(draft, notes)
+    draft = _NOTE_TAG_ANY_RE.sub("", draft)      # tags never reach the log
 
     # Catalog check: quoted product names that don't exist in the real (3dcart)
     # catalog. Clear mishears are corrected HERE, in code - string replacement

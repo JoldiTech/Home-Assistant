@@ -355,6 +355,47 @@ check("...so does a caffeine-free request", has(out, "migraines"), True)
 check("...and unrelated items are untouched", has(out, "label printer"), True)
 
 
+
+# --- carry-through ------------------------------------------------------------
+print("\ncarry-through of dropped notes")
+
+NOTES = ["""- [PROBLEM] Phones are not transferring calls to the warehouse
+- [PROBLEM] The fridge door was being held open by a red basket
+- [UNMET] Cinnamon sticks were asked for; only chips are stocked
+- [TRAFFIC] Quiet until the farmers market let out
+- [CAUSE] The rain brought people in off the street""",
+"""- [PROMISE] Staff said they would call back about the sponsorship request
+- [FEEDBACK] The new Witch's Broom batch tastes lighter than the last"""]
+
+DRAFT = ("# Log\n\nThe rain brought people in off the street.\n\n"
+         "## Unresolved\n- Chase the invoice\n\n## Worth remembering\n- a real thing\n")
+out = P._carry_through_notes(DRAFT, NOTES)
+check("dropped PROBLEM carried into Unresolved", has(out, "not transferring calls"), True)
+check("second PROBLEM carried too", has(out, "red basket"), True)
+check("PROMISE carried into Unresolved", has(out, "sponsorship request"), True)
+check("UNMET carried into Worth remembering", has(out, "cinnamon sticks"), True)
+check("FEEDBACK carried into Worth remembering", has(out, "witch's broom"), True)
+check("TRAFFIC is not carried as a bullet", has(out, "farmers market"), False)
+check("CAUSE already in the draft is not duplicated",
+      out.lower().count("brought people in off the street"), 1)
+check("the model's own bullets are kept", has(out, "chase the invoice"), True)
+
+# Carried lines land in the right sections, not appended at the end.
+uns = out.split("## Unresolved")[1].split("## Worth")[0]
+check("carried problems are under Unresolved", has(uns, "red basket"), True)
+check("...and unmet demand is not", has(uns, "cinnamon sticks"), False)
+
+# A full section is left alone rather than overfilled.
+FULL = ("# Log\n\nBody.\n\n## Unresolved\n- a1\n- a2\n- a3\n- a4\n- a5\n\n"
+        "## Worth remembering\n- b1\n")
+out = P._carry_through_notes(FULL, NOTES)
+check("a full section is not overfilled", has(out, "not transferring calls"), False)
+check("...while the other section still tops up", has(out, "cinnamon sticks"), True)
+
+check("tags never reach the log",
+      bool(P._NOTE_TAG_ANY_RE.search(P._NOTE_TAG_ANY_RE.sub("", out))), False)
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")
