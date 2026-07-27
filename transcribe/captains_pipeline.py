@@ -2241,7 +2241,6 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
     # Carry through what the merge dropped. Runs BEFORE redaction and the
     # catalog stage on purpose: a carried line is not privileged, it goes
     # through every check the model's own bullets do.
-    draft = _carry_through_notes(draft, notes)
     draft = _NOTE_TAG_ANY_RE.sub("", draft)      # tags never reach the log
 
     # Catalog check: quoted product names that don't exist in the real (3dcart)
@@ -2274,7 +2273,7 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
     findings = [l for l in scan.splitlines() if "|" in l]
     if findings:
         draft = _strip_linkage_names(draft, findings)
-    return draft
+    return draft, notes
 
 
 # --- git ----------------------------------------------------------------------
@@ -2348,10 +2347,11 @@ def main():
     # itself as a discrepancy - exactly the failure the gate exists to catch.
     raw_speech = transcript
 
+    notes = []
     if have_speech:
         transcript = _weave_orders(transcript, biz.get("sales"), date_str)
-        markdown = _summarize(transcript, day, slack_text, _records_index(biz),
-                              _context_block(biz), products)
+        markdown, notes = _summarize(transcript, day, slack_text, _records_index(biz),
+                                     _context_block(biz), products)
     else:
         _warn(f"{date_str}: no speech captured - business sections only")
         markdown = (
@@ -2370,24 +2370,39 @@ def main():
         raw_speech if have_speech else "", slack_text,
         _records_index(biz), _context_block(biz),
     ]))
-    markdown = _scrub_contact_info(markdown)
-    markdown = _reject_prompt_echoes(markdown, grounding)
-    markdown = _reject_training_artifacts(markdown, raw_speech if have_speech else "")
-    # Before the stock flagger: otherwise a real catalog name buried inside a
-    # garbled string ("…rye, brunckel, Strawberry Black") gets stock-flagged,
-    # dressing mic noise up as a verified reorder.
-    markdown = _drop_garble_claims(markdown)
-    markdown = _drop_non_events(markdown)
-    markdown = _reject_sold_reorders(markdown, biz)
-    markdown = _reject_unsupported_discrepancies(markdown, raw_speech if have_speech else "")
-    markdown = _flag_stock_contradictions(markdown, products)
-    # Last, so the catalog and stock stages still see the quotes they key on.
-    markdown = _unquote_unverified(markdown, products)
-    markdown = _drop_credentials(markdown)
-    markdown = _drop_overheard_quotes(markdown)
-    markdown = _drop_record_name_lists(markdown, biz)
-    markdown = _drop_vague_bullets(markdown, products)
-    markdown = _drop_personal_health(markdown)
+    def gates(md):
+        md = _scrub_contact_info(md)
+        md = _reject_prompt_echoes(md, grounding)
+        md = _reject_training_artifacts(md, raw_speech if have_speech else "")
+        # Before the stock flagger: otherwise a real catalog name buried inside
+        # a garbled string ("…rye, brunckel, Strawberry Black") gets
+        # stock-flagged, dressing mic noise up as a verified reorder.
+        md = _drop_garble_claims(md)
+        md = _drop_non_events(md)
+        md = _reject_sold_reorders(md, biz)
+        md = _reject_unsupported_discrepancies(md, raw_speech if have_speech else "")
+        md = _flag_stock_contradictions(md, products)
+        # Last, so the catalog and stock stages still see the quotes they key on.
+        md = _unquote_unverified(md, products)
+        md = _drop_credentials(md)
+        md = _drop_overheard_quotes(md)
+        md = _drop_record_name_lists(md, biz)
+        md = _drop_vague_bullets(md, products)
+        md = _drop_personal_health(md)
+        return md
+
+    markdown = gates(markdown)
+    # Carry through AFTER the gates, then gate again.
+    #
+    # Running it before was why nothing was ever carried: the draft still had
+    # full bullet lists at that point, so the top-up correctly declined - and
+    # then the gates deleted several of those bullets, leaving room that
+    # nothing filled. The room only exists once the pruning has happened. The
+    # second gate pass is what keeps a carried line from being privileged; it
+    # faces exactly the checks the model's own bullets did.
+    carried = _carry_through_notes(markdown, notes)
+    if carried != markdown:
+        markdown = gates(carried)
     markdown = _fix_generic_opener(markdown, biz)
     # Runs BEFORE the stats block is appended: timeclock names belong there,
     # what must not survive is a staff name attached to something they said.
