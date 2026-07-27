@@ -847,36 +847,52 @@ def _drop_record_name_lists(markdown: str, biz: dict) -> str:
     return _edit_claims(markdown, reject)
 
 
+# Placeholder language: the bullet's own subject is a blank. "a product",
+# "the exact item is unclear", "expressed dissatisfaction with a product".
+# These are the shapes the policy means by "a VAGUE line answers no future
+# question at any length - cut it".
+_PLACEHOLDER_RE = re.compile(
+    r"\b(?:a|an|the|some|another) (?:product|item|thing|blend|tea)\b|"
+    r"exact (?:item|product|name)[^.]{0,25}(?:unclear|unspecified|not specified)|"
+    r"did ?n[o']?t specify|was ?n[o']?t specified|not specified\b|"
+    r"asked for clarification|expressed (?:dis)?satisfaction with", re.I)
+
+
 def _drop_vague_bullets(markdown: str, products: list) -> str:
-    """Drop bullets that name nothing.
+    """Drop bullets whose subject is a placeholder.
 
-    The policy states the test plainly - "a SPECIFIC fact is searchable
-    forever; a VAGUE line answers no future question at any length - cut it" -
-    and the model writes them anyway: "Specific feedback: customer expressed
-    dissatisfaction with a product", "Feedback on immune support blend: A
-    comment about its texture". A bullet carrying no product, no number and no
-    name cannot be looked up, checked, or acted on, and its presence makes a
-    thin day look covered.
+    Tests for the presence of blank language, NOT for the absence of
+    specificity. The first version of this gate did the latter - no digit, no
+    catalog match, no capitalised word - and on a live run it deleted "A
+    customer asked about saffron, which we don't carry", "Staff flagged that
+    the label printer wasn't working correctly", and the exposed-wiring
+    incident. Every one of those is exactly what the log exists for, and every
+    one fails an absence test for the same reason: equipment, supplies and
+    products we DON'T stock are ordinary lowercase nouns with no catalog entry.
+    An unstocked product having no catalog match is the definition of unmet
+    demand, so keying on it inverted the gate's purpose.
 
-    Bullets only. A narrative sentence can legitimately be connective tissue;
-    an action item or a durable observation cannot.
+    A bullet that names a real product or carries a number is kept regardless -
+    "Feedback on Immune Support: a comment about its texture" is thin, but it
+    is thin about something real, and deleting real product feedback is the
+    more expensive mistake.
+
+    Bullets only. Connective tissue is legitimate in a narrative paragraph; an
+    action item or a durable observation has to stand on its own.
     """
-    known = sorted(({_norm_name(str(p.get("name") or "")) for p in (products or [])}
-                    - {""}), key=len, reverse=True)
+    known = [k for k in ({_norm_name(str(p.get("name") or "")) for p in (products or [])}
+                         - {""}) if len(k) >= 6]
 
     def reject(text, is_bullet):
-        if not is_bullet:
+        if not is_bullet or not _PLACEHOLDER_RE.search(text):
             return None
         body = re.sub(r"^\s*[-*]\s*", "", text)
         if re.search(r"\d", body):
             return None                       # a number is a fact
         nbody = _norm_name(body)
-        if any(k in nbody for k in known if len(k) >= 6):
-            return None                       # names a real product
-        # A capitalised word that is not sentence-initial is a name or a brand.
-        if re.search(r"(?<![.!?]\s)(?<!^)\b[A-Z][a-z]{2,}", body[1:]):
-            return None
-        return "names no product, number or person"
+        if any(k in nbody for k in known):
+            return None                       # thin, but about something real
+        return "its subject is a placeholder"
 
     return _edit_claims(markdown, reject)
 

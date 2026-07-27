@@ -278,14 +278,26 @@ print("\nvagueness gate")
 VP = [{"name": "Immune Support - Organic"}, {"name": "Earl Grey - Organic"}]
 md = ("## Worth remembering\n"
       "- Specific feedback: customer expressed dissatisfaction with a product.\n"
-      "- Feedback on Immune Support: the texture is chalky.\n"
-      "- Staff flagged a discrepancy of 47 cents in the float.\n"
-      "- A customer asked whether we would restock for Diane.\n")
+      "- Unmet demand: a customer asked for clarification on a product but the exact item is unclear.\n"
+      "- Feedback on Immune Support: a comment about a product.\n"
+      "- Staff flagged a discrepancy of 47 cents in an item.\n")
 out = P._drop_vague_bullets(md, VP)
-check("bullet naming nothing is dropped", has(out, "dissatisfaction"), False)
-check("...one naming a product survives", has(out, "immune support"), True)
-check("...one carrying a number survives", has(out, "47 cents"), True)
-check("...one carrying a name survives", has(out, "Diane"), True)
+check("placeholder subject is dropped", has(out, "dissatisfaction"), False)
+check("...so is 'the exact item is unclear'", has(out, "clarification"), False)
+check("...but a placeholder about a real product survives", has(out, "immune support"), True)
+check("...and one carrying a number survives", has(out, "47 cents"), True)
+
+# The regression this gate caused on a live run, now a permanent test. Every
+# one of these fails an absence-of-specificity test; none is vague.
+REAL = ("## Worth remembering\n"
+        "- A customer asked about saffron, which we don't carry\n"
+        "- Staff flagged that the label printer wasn't working correctly\n"
+        "- Review the exposed wiring behind the wall calendar\n"
+        "- Staff want LED strips installed on the shelves\n"
+        "- Cinnamon sticks were asked for; we only stock chips\n")
+kept = P._drop_vague_bullets(REAL, VP)
+for probe in ("saffron", "label printer", "exposed wiring", "led strips", "cinnamon sticks"):
+    check(f"real finding kept: {probe}", has(kept, probe), True)
 
 # A bare whole-dollar figure is weak evidence and must sit ON the line where
 # money is reported wrong. 2026-07-21 regenerated with "$47 in the register".
