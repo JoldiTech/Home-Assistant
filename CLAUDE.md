@@ -620,9 +620,15 @@ Every one of these produced a confident wrong conclusion at least once:
 - **A running process is not a working process.** A backfill was checked with
   `pgrep` ("alive"), produced zero output for 5.5 h, and was silently stuck.
   Verify by output — a non-empty log — never by process existence.
-- **`pkill -f <pattern>` kills your own SSH session** when the pattern appears
-  in the remote command line. Killed the session twice. Resolve the PID first
-  and kill that.
+- **`pgrep -f`/`pkill -f <pattern>` match the command line you are running
+  them from.** `pkill -f` killed the SSH session twice, when the pattern
+  appeared in the remote command line. The same self-match in `pgrep` is
+  quieter and worse: `while pgrep -f "captains_pipeline.py 2026-07-19"; do
+  sleep 15; done` never exits, because the wrapper's own `bash -c` command
+  line contains that string — it waits forever for itself, and looks exactly
+  like a slow job. Resolve the PID first and act on that, or match on the
+  interpreter path (`bin/python captains_pipeline`) which the wrapper does not
+  contain.
 - **The transcript is POS-woven before post-processing.** A gate that asks "was
   this amount said aloud?" must read the RAW speech; against the woven text a
   sale total vouches for itself, which silently no-op'd the discrepancy gate in
