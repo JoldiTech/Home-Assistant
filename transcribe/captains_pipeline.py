@@ -1276,6 +1276,9 @@ _UNAVAILABLE_RE = re.compile(
 # off a training aside where no refund was ever requested. A sentence whose own
 # payload is that nothing happened cannot be worth a permanent record.
 _NON_EVENT_RE = re.compile(
+    r"\bno (?:specific |further |additional )?(?:feedback|details?|content|"
+    r"information|notes?|issues?) (?:noted|provided|recorded|available|given)\b|"
+    r"\bnone (?:noted|provided|recorded|reported)\b|"
     r"but (?:no|nothing) (?:action|further action|steps?|was) [\w ]*?"
     r"(?:taken|done|required|needed)|no action was taken|nothing was done|"
     r"but no action|but nothing came of|but (?:it|this) was not (?:pursued|acted)",
@@ -1692,6 +1695,12 @@ def _strip_staff_attribution(markdown: str, staff: set) -> str:
             # A back office named after whoever sits in it is still a staff
             # name in a permanent record.
             new = re.sub(rf"\b{nm}(?:'s|’s|s)?\s+office\b", "a staff office", new)
+        # The staff set comes from the timeclock and Slack display names, so a
+        # colleague merely MENTIONED in a message body is not in it - "Shawns
+        # office" survived every named pattern on 2026-07-23 because Shawn did
+        # not work that day. A room named after whoever sits in it is a staff
+        # name whether or not we can enumerate them.
+        new = re.sub(r"\b[A-Z][a-z]{2,}(?:'s|’s|s)?\s+office\b", "a staff office", new)
         if new != line:
             new = re.sub(r"(^|[.!?]\s+|^- )a staff", lambda m: m.group(1) + "A staff", new)
             _warn("staff attribution: dropped a staff name from a remark")

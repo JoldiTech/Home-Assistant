@@ -451,6 +451,28 @@ check("a reworded restatement is not carried twice",
       out.lower().count("xl gloves"), 1)
 
 
+
+# --- names we cannot enumerate ------------------------------------------------
+print("\nunenumerated staff names / non-findings")
+
+# Shawn did not work on 2026-07-23, so he was not in the staff set built from
+# the timeclock and Slack display names - and "Shawns office" survived every
+# named pattern.
+out = P._strip_staff_attribution(
+    "- The alarm now beeps in Shawns office instead of disabling\n", {"George"})
+check("a room named after someone not on shift is still generalised",
+      has(out, "shawns office"), False)
+check("...the fact survives", has(out, "alarm now beeps"), True)
+
+out = P._drop_non_events(
+    "- No specific feedback noted from business records\n"
+    "- Voicemail received (32 sec) but no content provided\n"
+    "- Replace the damaged kettle\n")
+check("'no feedback noted' dropped", has(out, "no specific feedback"), False)
+check("'no content provided' dropped", has(out, "voicemail"), False)
+check("...a real item survives", has(out, "damaged kettle"), True)
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")
