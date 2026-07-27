@@ -78,6 +78,9 @@ SUMMARIZER_CTX = int(os.environ.get("SUMMARIZER_CTX", "8192"))
 # Keep the Qwen3 hybrid "/no_think" suffix (see _gen). Set 0 for non-hybrid
 # instruct models, where it is just noise on the end of every system prompt.
 _NOTHINK = os.environ.get("SUMMARIZER_NOTHINK", "1") != "0"
+# Let the model re-order the candidate bullets by consequence. Measured and
+# OFF - see _llm_rank for the numbers and for why it loses.
+SUMMARIZER_RANK = os.environ.get("SUMMARIZER_RANK", "0") != "0"
 
 DEFAULT_REPO = "JoldiTech/Home-Assistant"
 LOG_BRANCH = "captains-log"
@@ -420,7 +423,7 @@ NOTES_SYSTEM = SYSTEM_PROMPT + (
     "content. NEVER put a STAFF member's name on something they said, asked for, "
     "or thought - write 'a staff request to reorder [the item]', not '[name] "
     "asked for it'. Nothing in [square brackets] is content; fill those slots "
-    "from this slice only. No format headers - just bullets. At most 12 bullets "
+    "from this slice only. No format headers - just bullets. At most 8 bullets "
     "per slice.\n\nStart EVERY bullet with one tag in square brackets, chosen "
     "from exactly this list:\n"
     "[UNMET] a product/size/service asked for and not available\n"
@@ -1937,6 +1940,16 @@ SECTION_CAPS = {
     "## Worth remembering": int(os.environ.get("REMEMBER_CAP", "12")),
 }
 
+# How many slots in each section are held for findings that came from staff
+# chat and business records rather than from overheard speech. See
+# _reserve_for_records for why this is a floor and not a score bonus. These
+# are ceilings on the reservation, not quotas: a day with two records
+# findings reserves two, a day with none reserves none.
+RECORDS_FLOOR = {
+    "## Unresolved": int(os.environ.get("UNRESOLVED_RECORDS_FLOOR", "2")),
+    "## Worth remembering": int(os.environ.get("REMEMBER_RECORDS_FLOOR", "4")),
+}
+
 
 def _carry_section(tag: str) -> str | None:
     """Which bullet list a tagged note belongs in, or None to leave it to the
@@ -1949,17 +1962,26 @@ def _carry_section(tag: str) -> str | None:
     return "## Worth remembering"
 
 
-def _parse_tagged_notes(notes: list) -> list:
-    """[(tag, text)] for every tagged bullet across all slices, in order."""
+def _parse_tagged_notes(notes: list, n_side: int = 0) -> list:
+    """[(tag, text, origin)] for every tagged bullet across all slices.
+
+    `origin` is "records" for the first `n_side` blocks - the staff-chat and
+    business-records pass - and "audio" for the transcript slices. Downstream
+    needs to tell them apart because they are not equally trustworthy and,
+    far more importantly, they are not equally NUMEROUS: a long day is ten
+    audio slices against one records block, so records findings are ~8% of
+    the candidate pool no matter how good they are.
+    """
     out = []
-    for block in notes:
+    for n, block in enumerate(notes):
+        origin = "records" if n < n_side else "audio"
         for line in (block or "").splitlines():
             m = _NOTE_TAG_RE.match(line)
             if not m:
                 continue
             text = line[m.end():].strip(" -*").strip()
             if len(text.split()) >= 4:
-                out.append((m.group(1).upper(), text))
+                out.append((m.group(1).upper(), text, origin))
     return out
 
 
@@ -2092,14 +2114,19 @@ def _llm_rank(cands: list, heading: str, k: int, rank) -> list:
     reworded. An unparseable or partial answer costs nothing - whatever it
     does not rank keeps its keyword order behind what it did.
 
-    This exists because keyword scoring cannot tell a real finding from a
-    plausible-looking one. Raising the per-slice notes cap took the candidate
-    pool from 32 to 59 on one day and coverage FELL: more to choose from is
-    only an advantage if the chooser is any good.
+    OFF BY DEFAULT - it was measured and it lost. Set SUMMARIZER_RANK=1 to
+    re-test. On the four audited days, with the score-floor bug fixed so the
+    sections filled properly, it covered 11 of 40 hand-identified findings
+    (27%) against 14 of 40 (35%) for plain keyword order. Reading the logs
+    says why: asked to rank by consequence, the 8B promotes customer product
+    praise. 2026-07-19's "Worth remembering" came back ten-twelfths
+    compliments about tea while the exposed wiring, the mis-set label
+    printer, the saffron request and the missed clock-out all sat unranked
+    below the cut. The keyword scorer is dumber and has no such taste.
     """
-    if not rank or len(cands) <= k:
+    if not rank or not SUMMARIZER_RANK or len(cands) <= k:
         return cands
-    listing = "\n".join(f"{i+1}. {t}" for i, (t, _s, _src) in enumerate(cands))
+    listing = "\n".join(f"{i+1}. {c[0]}" for i, c in enumerate(cands))
     want = min(k, len(cands))
     try:
         reply = rank(f"Section: {heading[3:]}\nPick the {want} most consequential.\n\n"
@@ -2121,8 +2148,42 @@ def _llm_rank(cands: list, heading: str, k: int, rank) -> list:
     return order + rest
 
 
+def _reserve_for_records(cands: list, heading: str) -> list:
+    """Move the best few records-derived candidates to the front of the list.
+
+    Staff chat and business records are the most reliable material in the day
+    - somebody sat down and wrote each line deliberately - and they are the
+    material that keeps going missing. The cause is arithmetic, not merit: a
+    long day is ten audio slices of notes against ONE records block, so even
+    a perfect scorer sees a pool that is ~90% overheard speech and fills the
+    section from it. On 2026-07-19 the log carried twelve "Worth remembering"
+    bullets, ten of them customers complimenting a tea, while the exposed
+    wiring, the mis-set label printer and the uncollected pickup order - all
+    written down by a person - never appeared.
+
+    A score bonus was the obvious fix and is the wrong one: any bonus small
+    enough to be fair is swamped by eighty competitors, and any bonus large
+    enough to win ships thin records notes over strong audio ones. A floor
+    is honest about what it is doing - it buys a FEW guaranteed slots, and
+    everything else still competes on merit. Nothing is added to the pool
+    here and nothing is exempt from the gates; this only reorders.
+    """
+    if not cands:
+        return cands
+    floor = RECORDS_FLOOR.get(heading, 0)
+    if not floor:
+        return cands
+    head = [i for i, c in enumerate(cands) if c[3] == "records"][:floor]
+    if not head or head == list(range(len(head))):
+        return cands                            # already at the front
+    seen = set(head)
+    _warn(f"{heading[3:]}: reserving {len(head)} slot(s) for records-derived notes")
+    return [cands[i] for i in head] + [c for i, c in enumerate(cands) if i not in seen]
+
+
 def _rebuild_bullet_sections(markdown: str, notes: list, products: list,
-                             want: int | None = None, keep=None, rank=None) -> str:
+                             want: int | None = None, keep=None, rank=None,
+                             n_side: int = 0) -> str:
     """Build the bullet sections FROM the slice notes, not from the merge.
 
     The merge is the lossiest stage in the pipeline and always will be: an 8B
@@ -2143,7 +2204,7 @@ def _rebuild_bullet_sections(markdown: str, notes: list, products: list,
     so the gates downstream have slack to reject candidates without leaving a
     section thin.
     """
-    tagged = _parse_tagged_notes(notes)
+    tagged = _parse_tagged_notes(notes, n_side=n_side)
     if not tagged:
         return markdown
     known = [k for k in ({_norm_name(str(p.get("name") or "")) for p in (products or [])}
@@ -2162,11 +2223,11 @@ def _rebuild_bullet_sections(markdown: str, notes: list, products: list,
         # competes on merit: a flat +1 was enough to keep five pickup-text
         # restatements ahead of every real finding on 2026-07-19.
         cands = [(b, _claim_score(b, known) + (2 if _ANNOTATION_RE.search(b) else 0),
-                  "draft") for b in existing]
-        for tag, text in tagged:
+                  "draft", "draft") for b in existing]
+        for tag, text, origin in tagged:
             if _carry_section(tag) != heading:
                 continue
-            cands.append((text, _claim_score(text, known), "note"))
+            cands.append((text, _claim_score(text, known), "note", origin))
         if keep:
             before = len(cands)
             cands = [c for c in cands if keep(c[0])]
@@ -2178,9 +2239,10 @@ def _rebuild_bullet_sections(markdown: str, notes: list, products: list,
         # fallback - then the model reorders the survivors it can see.
         cands = sorted(cands, key=lambda c: -c[1])
         cands = _llm_rank(cands, heading, limit, rank)
+        cands = _reserve_for_records(cands, heading)
 
         picked = []
-        for text, score, src in cands:
+        for text, score, src, _origin in cands:
             if score < CLAIM_SCORE_FLOOR:
                 # NOT `break`. That was correct only while the list was sorted
                 # by keyword score, so everything after really was worse. Once
@@ -2198,6 +2260,7 @@ def _rebuild_bullet_sections(markdown: str, notes: list, products: list,
         if not picked:
             continue
         n_notes = sum(1 for _, _, src in picked if src == "note")
+
         if n_notes:
             rebuilt += n_notes
         lines[i + 1:j] = [""] + [f"- {t}" for t, _, _ in picked] + [""]
@@ -2624,6 +2687,10 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
     if slack_block.strip():
         notes.append(_gen(NOTES_SYSTEM,
                           SIDE_NOTES_TEMPLATE.format(chunk=slack_block), 500))
+    # Everything before this point came from records, everything after from
+    # audio. The boundary is the only thing that lets the rebuild tell a
+    # written-down finding from an overheard one.
+    n_side = len(notes)
 
     if _tok(compact) <= INPUT_BUDGET:
         draft = _final("transcript", compact)
@@ -2685,7 +2752,7 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
     def rank(user: str) -> str:
         return _gen(RANK_SYSTEM, user, 300, temperature=0.1)
 
-    return draft, notes, rank
+    return draft, notes, rank, n_side
 
 
 # --- git ----------------------------------------------------------------------
@@ -2759,12 +2826,12 @@ def main():
     # itself as a discrepancy - exactly the failure the gate exists to catch.
     raw_speech = transcript
 
-    notes, rank = [], None
+    notes, rank, n_side = [], None, 0
     if have_speech:
         transcript = _weave_orders(transcript, biz.get("sales"), date_str)
-        markdown, notes, rank = _summarize(transcript, day, slack_text,
-                                           _records_index(biz),
-                                           _context_block(biz), products)
+        markdown, notes, rank, n_side = _summarize(transcript, day, slack_text,
+                                                   _records_index(biz),
+                                                   _context_block(biz), products)
     else:
         _warn(f"{date_str}: no speech captured - business sections only")
         markdown = (
@@ -2822,7 +2889,7 @@ def main():
 
     markdown = gates(markdown)
     rebuilt = _rebuild_bullet_sections(markdown, notes, products,
-                                       keep=survives, rank=rank)
+                                       keep=survives, rank=rank, n_side=n_side)
     if rebuilt != markdown:
         markdown = gates(rebuilt)
     # Cap last, at the policy's own number: the rebuild deliberately keeps more

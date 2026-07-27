@@ -704,32 +704,110 @@ check("a quiet day stays quiet", out.count("- "), 1)
 
 
 # --- model re-ranking ---------------------------------------------------------
+# The ranker is OFF in production - it was measured against the four audited
+# days and lost to plain keyword order (27% vs 35% of hand-identified findings
+# covered). These tests cover its MECHANICS, which still have to be sound for
+# anyone who re-tests it with SUMMARIZER_RANK=1, so they turn it on explicitly
+# rather than depending on the default.
 print("\nllm re-ranking")
+P.SUMMARIZER_RANK = True
 
-CANDS = [(f"candidate {i}", 0, "note") for i in range(6)]
+CANDS = [(f"candidate {i}", 0, "note", "audio") for i in range(6)]
 
 # The model can only ever return INDICES into a list it was given, so nothing
 # new can enter the log however badly it answers.
 out = P._llm_rank(CANDS, "## Unresolved", 3, lambda u: "4, 2, 6")
-check("model order is honoured", [t for t, _, _ in out[:3]],
+check("model order is honoured", [t for t, *_ in out[:3]],
       ["candidate 3", "candidate 1", "candidate 5"])
 check("unranked candidates keep their place behind", len(out), len(CANDS))
 
 check("out-of-range indices are ignored",
-      [t for t, _, _ in P._llm_rank(CANDS, "## X", 3, lambda u: "99, 1, 0, -4")[:1]],
+      [t for t, *_ in P._llm_rank(CANDS, "## X", 3, lambda u: "99, 1, 0, -4")[:1]],
       ["candidate 0"])
 check("a duplicate index is not repeated",
       len(P._llm_rank(CANDS, "## X", 3, lambda u: "2, 2, 2")), len(CANDS))
 check("garbage reply falls back to keyword order",
-      [t for t, _, _ in P._llm_rank(CANDS, "## X", 3, lambda u: "no idea")],
-      [t for t, _, _ in CANDS])
+      [t for t, *_ in P._llm_rank(CANDS, "## X", 3, lambda u: "no idea")],
+      [t for t, *_ in CANDS])
 def boom(u):
     raise RuntimeError("model died")
 check("a failed rank pass never fails the run",
-      [t for t, _, _ in P._llm_rank(CANDS, "## X", 3, boom)],
-      [t for t, _, _ in CANDS])
+      [t for t, *_ in P._llm_rank(CANDS, "## X", 3, boom)],
+      [t for t, *_ in CANDS])
 check("no ranker at all is fine", P._llm_rank(CANDS, "## X", 3, None), CANDS)
 
+
+
+# --- records get reserved slots -----------------------------------------------
+print("\nrecords reservation")
+
+# A long day is ~10 audio slices of notes against ONE records block, so
+# findings somebody actually wrote down are a few percent of the pool and get
+# buried by volume. 2026-07-19 shipped twelve "Worth remembering" bullets, ten
+# of them customers complimenting a tea, while the exposed wiring and the
+# uncollected pickup order - both written down - never appeared.
+# The fixture has to reproduce BOTH halves of the real burial or it proves
+# nothing. Same tag on both sides, so they compete for one section. Each audio
+# line a DIFFERENT problem, or twenty rephrasings collapse under _same_claim
+# and leave the section roomy. And each audio line has to genuinely OUTSCORE
+# the records one - which is what happens in production, because floor chatter
+# names catalog products and carries amounts while "exposed wiring behind the
+# calendar" names nothing the scorer can see.
+_THINGS = ["kettle", "grinder", "scale", "chalkboard", "awning", "door chime",
+           "sink tap", "shelf bracket", "till drawer", "card reader",
+           "sample tray", "window blind", "step stool", "wall clock",
+           "floor mat", "spice rack", "tea timer", "stock ladder",
+           "back gate", "ceiling fan"]
+_BLENDS = ["Assam Gold", "Dragon Pearl", "Jasmine Silver", "Rooibos Vanilla",
+           "Hibiscus Cooler", "Genmaicha Toast", "Oolong Milk", "Sencha Spring",
+           "Pu-erh Ripe", "Chamomile Dream", "Peppermint Snap", "Lemon Verbena",
+           "Ginger Fire", "Turmeric Glow", "Lavender Fields", "Rose Congou",
+           "Matcha Ceremony", "Barley Roast", "Yerba Clean", "Honeybush Warm"]
+CATALOG_ONE = [{"name": b} for b in _BLENDS]
+# distinct product per line, so they neither collapse under _same_claim nor
+# tie on score - each names a catalog product, an amount and a record id
+CHATTER = [f"- [PROBLEM] The {b} {t} is broken, $85 to replace (order #{400 + i})"
+           for i, (b, t) in enumerate(zip(_BLENDS, _THINGS))]
+RECORD = ["- [PROBLEM] Exposed wiring behind the wall calendar in the back room"]
+BARE = "# Log\n\nBody.\n\n## Unresolved\n\n## Worth remembering\n"
+
+# The reordering itself, tested directly. Going through _rebuild_bullet_sections
+# for this could not be made to fail without the fix, because _same_claim
+# collapses same-shaped audio lines and leaves the section roomy - the existing
+# machinery already protects diversity better than expected. That is worth
+# recording rather than working around: the reservation earns its place on the
+# four-day measurement, not on a fixture rigged until it agrees.
+LOW = ("Exposed wiring behind the wall calendar", 1, "note", "records")
+HIGH = [(f"The {b} display is broken, $85 (order #{400+i})", 10, "note", "audio")
+        for i, b in enumerate(_BLENDS)]
+out = P._reserve_for_records(HIGH + [LOW], "## Unresolved")
+check("a records candidate is pulled to the front", out[0][0], LOW[0])
+check("...and nothing else is lost or duplicated", len(out), len(HIGH) + 1)
+check("...with the rest still in score order", [c[0] for c in out[1:]],
+      [c[0] for c in HIGH])
+
+# Never more than the floor, however many records candidates there are.
+MANY_REC = [(f"Records finding {i}", 1, "note", "records") for i in range(9)]
+out = P._reserve_for_records(HIGH + MANY_REC, "## Unresolved")
+check("the floor is a ceiling on the reservation",
+      [c[3] for c in out[:3]], ["records", "records", "audio"])
+
+# All-audio must be returned untouched - no reordering, no cost.
+allaudio = list(HIGH)
+check("an all-audio list is passed straight through",
+      P._reserve_for_records(allaudio, "## Unresolved"), allaudio)
+
+# The reservation is a ceiling, not a quota: it must never pad a section with
+# records notes that are not there, and never invent a slot.
+out = P._rebuild_bullet_sections(BARE, CHATTER, [], n_side=0)
+check("no records notes reserves nothing", has(out, "is broken"), True)
+
+# Reordering only - a reserved candidate is still subject to every gate,
+# because the reservation happens after `keep` has already filtered.
+out = P._rebuild_bullet_sections(BARE, RECORD + CHATTER, [], n_side=1,
+                                 keep=lambda t: "wiring" not in t.lower())
+check("a reserved candidate is not exempt from the gates",
+      has(out, "exposed wiring"), False)
 
 
 # --- the floor must not terminate a reordered list ----------------------------
