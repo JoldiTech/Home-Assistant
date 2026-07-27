@@ -2182,7 +2182,14 @@ def _rebuild_bullet_sections(markdown: str, notes: list, products: list,
         picked = []
         for text, score, src in cands:
             if score < CLAIM_SCORE_FLOOR:
-                break                           # ranked list: the rest are worse
+                # NOT `break`. That was correct only while the list was sorted
+                # by keyword score, so everything after really was worse. Once
+                # the model reorders the list that assumption dies: on
+                # 2026-07-19 one low-scoring line early in the model's ranking
+                # terminated the loop and shipped an EMPTY Unresolved section
+                # out of 31 surviving candidates. An optimisation that encodes
+                # an invariant has to die with the invariant.
+                continue
             if any(_same_claim(text, p) for p, _, _ in picked):
                 continue
             picked.append((text, score, src))

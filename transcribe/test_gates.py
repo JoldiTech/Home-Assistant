@@ -731,6 +731,25 @@ check("a failed rank pass never fails the run",
 check("no ranker at all is fine", P._llm_rank(CANDS, "## X", 3, None), CANDS)
 
 
+
+# --- the floor must not terminate a reordered list ----------------------------
+print("\nfloor vs reordering")
+
+# A reordered list is not sorted by keyword score, so a low scorer early in it
+# must be SKIPPED, not treated as the end of the queue. 2026-07-19 shipped an
+# empty Unresolved section out of 31 surviving candidates because of this.
+MIXED = ["""- [PROBLEM] Send email details for the pickup order
+- [PROBLEM] The label printer keeps reverting to settings that misprint
+- [PROBLEM] Phones at the counter no longer reach the warehouse"""]
+EMPTY2 = "# Log\n\nBody.\n\n## Unresolved\n\n## Worth remembering\n"
+# put the restatement (scores below the floor) first, as a ranker might
+out = P._rebuild_bullet_sections(EMPTY2, MIXED, [], rank=lambda u: "1, 2, 3")
+check("a below-floor line does not end the queue", has(out, "label printer"), True)
+check("...the second good one survives too", has(out, "phones at the counter"), True)
+check("...and the below-floor line still does not ship",
+      has(out, "send email details"), False)
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")
