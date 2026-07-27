@@ -194,6 +194,34 @@ check("...the real opener promoted", has(out, "phones stopped"), True)
 only = "# Captain's Log — Sunday\n\nA steady flow of customers entered the shop.\n"
 check("never empties the paragraph", has(P._fix_generic_opener(only), "steady flow"), True)
 
+# Cut the generic opener and the model's next move is to open on a sale. Every
+# one of those numbers is in the stats block below and in a database forever.
+BIZ_TOTALS = {"sales": {"orders": [{"total": "55.86", "items": []}]}}
+out = P._fix_generic_opener(
+    "# Captain's Log — Sunday\n\nThe day saw several high-value purchases, "
+    "including a $55.86 order featuring Jasmine Pearls. The label printer was "
+    "on the wrong settings all morning.\n", BIZ_TOTALS)
+check("opener that just restates a register total is cut", has(out, "55.86"), False)
+check("...the real opener promoted again", has(out, "label printer"), True)
+out = P._fix_generic_opener(
+    "# Captain's Log — Sunday\n\nA steady flow of customers. A $55.86 order went "
+    "out. Rain broke the heat.\n", BIZ_TOTALS)
+check("both banned shapes cut in sequence", has(out, "rain broke"), True)
+check("...and neither survives", has(out, "steady flow") or has(out, "55.86"), False)
+
+
+# --- credentials --------------------------------------------------------------
+print("\ncredential gate")
+
+out = P._drop_credentials(
+    "## Unresolved\n- Address the store audio system and password access\n"
+    "- Replace the label printer\n")
+check("credential mention dropped", has(out, "password"), False)
+check("...neighbouring item survives", has(out, "label printer"), True)
+check("narrative credential mention dropped",
+      has(P._drop_credentials("The till PIN code was shared aloud at the counter.\n"),
+          "pin code"), False)
+
 out = P._fix_generic_opener(
     "# Captain's Log — Sunday\n\nRain broke the heat and the morning filled up. "
     "Two ounces of matcha went out at noon.\n")

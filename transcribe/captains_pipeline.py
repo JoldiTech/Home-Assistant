@@ -740,10 +740,37 @@ _GENERIC_OPENER_RE = re.compile(
     r"^it\s+was\s+a\s+(?:busy|slow|steady|quiet)\b", re.I)
 
 
-def _fix_generic_opener(markdown: str) -> str:
-    """Cut a banned generic opener when the paragraph has something better
-    behind it. Never empties the paragraph - if the generic sentence is all
-    there is, it stays, because an empty first paragraph is worse."""
+def _fix_generic_opener(markdown: str, biz: dict | None = None) -> str:
+    """Cut a banned opener when the paragraph has something better behind it.
+
+    Two shapes get cut. The first is generic traffic, which the prompt names as
+    forbidden and the model writes anyway. The second only became visible once
+    the first was fixed: cut the generic sentence and the model's next move is
+    to open on a sale - "The day saw several high-value purchases, including a
+    $55.86 order featuring Jasmine Pearls". Every one of those numbers is in a
+    database forever and the stats block below already carries it; the prompt's
+    own reason for existing is that the narrative must spend itself on what is
+    stored NOWHERE else. An opener whose amount is just a register total is the
+    same non-information as "a steady flow of customers", one layer down.
+
+    Never empties the paragraph - if the banned sentence is all there is, it
+    stays, because an empty first paragraph is worse.
+    """
+    totals = set()
+    for o in ((biz or {}).get("sales") or {}).get("orders") or []:
+        t = str(o.get("total") or "").replace(",", "").strip().lstrip("$")
+        if t:
+            totals.add(t)
+
+    def banned(sentence: str) -> str | None:
+        s = sentence.strip()
+        if _GENERIC_OPENER_RE.search(s):
+            return "generic traffic"
+        for a in _MONEY_RE.findall(s):
+            if a.replace(",", "") in totals:
+                return f"restates a register total (${a})"
+        return None
+
     lines = markdown.splitlines()
     for i, line in enumerate(lines):
         s = line.strip()
@@ -752,11 +779,31 @@ def _fix_generic_opener(markdown: str) -> str:
         if s.startswith(("-", "*")):
             break                              # no narrative paragraph at all
         sentences = _split_sentences(s)
-        if len(sentences) >= 2 and _GENERIC_OPENER_RE.search(sentences[0].strip()):
-            _warn(f"dropped generic opener: {sentences[0][:70]}")
-            lines[i] = " ".join(sentences[1:])
+        while len(sentences) >= 2 and banned(sentences[0]):
+            _warn(f"dropped opener ({banned(sentences[0])}): {sentences[0][:70]}")
+            sentences.pop(0)
+        lines[i] = " ".join(sentences)
         break
     return "\n".join(lines)
+
+
+# A work log pushed to GitHub must never carry a credential, however
+# incidentally. The 2026-07-19 audio contains the shop's spoken password
+# practice - said out loud during register training - and a regenerated log
+# turned it into "Address the issue with the store's audio system and password
+# access". That bullet disclosed nothing on its own, which is exactly why it
+# would survive review: the rule has to be categorical.
+_CREDENTIAL_RE = re.compile(
+    r"\bpass ?words?\b|\bpass ?codes?\b|\bpassphrase|\bpin (?:number|code)\b|"
+    r"\bcredential|\blogin details\b|\bapi keys?\b|\baccess codes?\b", re.I)
+
+
+def _drop_credentials(markdown: str) -> str:
+    """Remove any claim that touches credentials at all."""
+    def reject(text, is_bullet):
+        return "mentions credentials" if _CREDENTIAL_RE.search(text) else None
+
+    return _edit_claims(markdown, reject)
 
 
 def _match_catalog(markdown: str, products: list[dict]):
@@ -1992,7 +2039,8 @@ def main():
     markdown = _flag_stock_contradictions(markdown, products)
     # Last, so the catalog and stock stages still see the quotes they key on.
     markdown = _unquote_unverified(markdown, products)
-    markdown = _fix_generic_opener(markdown)
+    markdown = _drop_credentials(markdown)
+    markdown = _fix_generic_opener(markdown, biz)
     # Runs BEFORE the stats block is appended: timeclock names belong there,
     # what must not survive is a staff name attached to something they said.
     markdown = _strip_staff_attribution(markdown, _staff_names(biz, slack_names))
