@@ -1682,6 +1682,16 @@ def _strip_staff_attribution(markdown: str, staff: set) -> str:
             new = re.sub(rf"\b{nm}(?:'s|’s)\s+({_SAID_NOUNS})\b", r"a staff member's \1", new)
             new = re.sub(rf"\b{nm}\s+({_SAID_VERBS})\b", r"a staff member \1", new)
             new = re.sub(rf"\bper {nm}\b", "per a staff member", new)
+            # "Reorder XL gloves as requested by George" - the carried Slack
+            # notes are full of this shape, and none of the patterns above
+            # touch it. Staff chat is the one source where real names are
+            # allowed to arrive, so it is also the one that most needs this.
+            new = re.sub(
+                rf"\b({_SAID_VERBS}|requested|asked)\s+by\s+{nm}\b",
+                r"\1 by a staff member", new)
+            # A back office named after whoever sits in it is still a staff
+            # name in a permanent record.
+            new = re.sub(rf"\b{nm}(?:'s|’s|s)?\s+office\b", "a staff office", new)
         if new != line:
             new = re.sub(r"(^|[.!?]\s+|^- )a staff", lambda m: m.group(1) + "A staff", new)
             _warn("staff attribution: dropped a staff name from a remark")
@@ -1754,7 +1764,19 @@ def _already_covered(text: str, markdown: str) -> bool:
     a = _content_bigrams(text)
     if not a:
         return True
-    return len(a & _content_bigrams(markdown)) / len(a) >= 0.5
+    b = _content_bigrams(markdown)
+    if len(a & b) / len(a) >= 0.5:
+        return True
+    # A shared content TRIGRAM is a restatement however differently the rest is
+    # worded: "Reorder XL gloves as requested by George" and "A staff member
+    # requested to reorder XL gloves as mediums no longer fit" overlap on only
+    # 22% of bigrams and shipped as two bullets about one request.
+    def trigrams(t):
+        w = [x for x in re.findall(r"[a-z0-9][a-z0-9'\-]*", t.lower())
+             if x not in _STOPWORDS]
+        return {" ".join(w[i:i + 3]) for i in range(len(w) - 2)}
+
+    return bool(trigrams(text) & trigrams(markdown))
 
 
 def _carry_through_notes(markdown: str, notes: list) -> str:

@@ -429,6 +429,28 @@ out = P._reject_sold_reorders(
 check("'neither available' without a copula is caught", has(out, "sandia"), False)
 
 
+
+# --- staff names arriving via carried Slack notes ------------------------------
+print("\nstaff attribution on carried notes")
+
+STAFF = {"George", "George Quintero", "Shawn", "Verity"}
+out = P._strip_staff_attribution(
+    "- Reorder XL gloves as requested by George\n"
+    "- The alarm now beeps in Shawns office instead of disabling\n"
+    "- Restock the tins per George\n", STAFF)
+check("'requested by <name>' de-identified", has(out, "by george"), False)
+check("...the operational fact survives", has(out, "xl gloves"), True)
+check("an office named after someone is generalised", has(out, "shawns office"), False)
+check("...that fact survives too", has(out, "alarm now beeps"), True)
+
+# One request must not arrive twice because the wordings differ.
+DRAFT2 = "# Log\n\nBody.\n\n## Unresolved\n- Reorder XL gloves as requested by a staff member\n\n## Worth remembering\n"
+DUP = ["- [PROBLEM] A staff member requested to reorder XL gloves as mediums no longer fit"]
+out = P._carry_through_notes(DRAFT2, DUP)
+check("a reworded restatement is not carried twice",
+      out.lower().count("xl gloves"), 1)
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")
