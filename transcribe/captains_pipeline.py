@@ -735,7 +735,9 @@ _GENERIC_OPENER_RE = re.compile(
     r"^(?:a|the)\s+(?:steady|slow|busy|brisk|constant|light)\s+"
     r"(?:flow|stream|trickle|pace|day|morning)\b|"
     r"^the\s+day\s+(?:started|began|opened|was)\b|"
-    r"^(?:traffic|the\s+shop|business)\s+(?:started|was|felt|remained|stayed)\b|"
+    r"^(?:traffic|the\s+shop|the\s+store|business)\s+"
+    r"(?:started|was|felt|remained|stayed|experienced|saw|had)\b|"
+    r"^the\s+(?:shop|store|day)\s+(?:experienced|saw|had)\b|"
     r"^customers?\s+(?:inquired|browsed|came|came\s+in|trickled)\b|"
     r"^it\s+was\s+a\s+(?:busy|slow|steady|quiet)\b", re.I)
 
@@ -941,6 +943,20 @@ def _match_catalog(markdown: str, products: list[dict]):
             return 1.0
         return ratio(" ".join(ta), " ".join(tb))
 
+    def shares_a_real_word(qn: str, n: str) -> bool:
+        """A rename needs a substantive word in common, not just a good
+        character-level score. Without this the matcher renamed the phrase
+        "so cool" into "Ray's Cooler | Organic" and put a product nobody
+        mentioned into the log as customer praise - the same
+        noise-promoted-to-product failure the garble gate exists to stop, but
+        arriving through the correction path instead."""
+        a = {w for w in qn.split() if len(w) >= 5}
+        b = {w for w in n.split() if len(w) >= 5}
+        if a & b:
+            return True
+        # Allow a near-miss on a long word ("stainless" vs "stainles").
+        return any(ratio(x, y) >= 0.85 for x in a for y in b)
+
     norm_to_name = _catalog_index(products)
     norms = list(norm_to_name)
     auto_fixes, review = [], []
@@ -952,12 +968,14 @@ def _match_catalog(markdown: str, products: list[dict]):
             (((ratio(qn, n) + head_score(qn, n)) / 2, n) for n in norms),
             reverse=True,
         )[:3]
-        if scored and scored[0][0] >= 0.93:
-            auto_fixes.append((q, norm_to_name[scored[0][1]]))
-            continue
         top = scored[0][0] if scored else 0.0
         second = scored[1][0] if len(scored) > 1 else 0.0
-        if top >= 0.72 and top - second >= 0.10:
+        confident = top >= 0.93 or (top >= 0.72 and top - second >= 0.10)
+        if confident and not shares_a_real_word(qn, scored[0][1]):
+            _warn(f'catalog: refused to rename "{q[:40]}" -> '
+                  f'"{norm_to_name[scored[0][1]]}" (no substantive word in common)')
+            confident = False
+        if confident:
             auto_fixes.append((q, norm_to_name[scored[0][1]]))
         else:
             review.append((q, [(norm_to_name[n], round(s, 2)) for s, n in scored if s >= 0.55]))

@@ -314,6 +314,26 @@ out = P._reject_unsupported_discrepancies(
 check("...but survives on the same line as the report", has(out, "$47"), True)
 
 
+
+# --- catalog rename guard -----------------------------------------------------
+print("\ncatalog rename guard")
+
+CAT = [{"name": "Ray's Cooler | Organic"}, {"name": "Bombilla - Stainless Steel | Bolt"}]
+fixes, _review = P._match_catalog('A customer said the shop was "so cool".\n', CAT)
+check("common phrase is not renamed into a product",
+      any("Ray" in n for _q, n in fixes), False)
+fixes, _review = P._match_catalog(
+    'A customer asked about the "Bombila - Stainles Steel | Bolt".\n', CAT)
+check("a real near-miss still gets corrected",
+      any("Bombilla" in n for _q, n in fixes), True)
+
+out = P._fix_generic_opener(
+    "# Log\n\nThe shop experienced steady traffic today. The phones stopped "
+    "reaching the warehouse.\n")
+check("'the shop experienced steady traffic' is caught too",
+      has(out, "experienced steady"), False)
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")
