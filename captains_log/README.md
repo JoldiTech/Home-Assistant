@@ -63,30 +63,72 @@ raw transcript deleted
   out of stock but the website shows stock, the contradiction itself is
   flagged in code — `⚠ website shows in stock: …` — either the site is
   overselling or the floor missed inventory, and both are worth knowing.
+
+> **Every gate below runs over CLAIMS, not lines.** A claim is a bullet *or one
+> sentence of a narrative paragraph* (`_edit_claims`). They used to inspect only
+> lines starting with `-`, which left the narrative — half the log — ungated: on
+> 2026-07-26 the discrepancy gate correctly dropped
+> `- Reconcile the register shortfall of $23.50` and the identical invented
+> figure shipped in paragraph one anyway.
+
+- **Prompt-echo backstop (`_reject_prompt_echoes`)**: the 8B model treats its
+  own instructions as source material. "Reorder XL gloves" shipped on four
+  consecutive days off a worked example, on two of which the real Slack request
+  had not been made yet; "teas safe during pregnancy" shipped twice with the
+  string nowhere in the input; and 2026-07-26's invented `$23.50` register
+  discrepancy came straight out of the POS **format** example. Every concrete
+  example in every prompt is now a `[bracketed]` slot. This is the backstop if
+  one is ever re-added: it compares content bigrams, so a re-worded echo still
+  matches, skips examples introduced by a negative cue ("never write …"),
+  ignores pairs built only from common log vocabulary, and is self-limiting —
+  a phrase the shop genuinely discussed today is in the grounding text and is
+  never blocked. `transcribe/test_gates.py` asserts the blocklist is empty,
+  which is the healthy state.
 - **Discrepancy gate (`_reject_unsupported_discrepancies`)**: the summarizer
   invents register discrepancies — it fabricated one on three consecutive days,
-  turning a cashier reading a total ("62.15 today") and a $50.31 sale into
-  shortfalls to reconcile. Rewording the prompt didn't stop it; it is matching
-  the Unresolved format rather than reading the day. A discrepancy bullet now
-  has to survive two tests against the day's speech: somebody must have
-  reported money going wrong at all, **and** the amount must have been said
-  aloud — on a day with a genuine till count the model still attached the
-  wrong figure. Either test sinks the bullet. The vocabulary is deliberately
-  narrow: a bare "short" ("short on time") is not a till problem.
+  turning a cashier reading a total and a routine sale into shortfalls to
+  reconcile. Rewording the prompt didn't stop it; it is matching the Unresolved
+  format rather than reading the day. Somebody must have reported money going
+  wrong, **and** the amount must appear within `DISCREPANCY_NEAR_LINES` of them
+  saying so. Presence alone was useless as a test: in a shop *every* sale total
+  is spoken aloud, which is how two POS order totals read to customers became
+  "unexplained shortfalls" hours later. Amounts inside record annotations are
+  excluded, so a correctly annotated real discrepancy can't fail its own gate.
+  The vocabulary is deliberately narrow: a bare "short" ("short on time") is
+  not a till problem.
 - **Sold-today gate (`_reject_sold_reorders`)**: a sale is proof of stock, so a
-  "reorder / restock / confirm availability" bullet naming something the
-  register rang up that day is dropped outright. The prompt says this too, and
-  the model ignored it — asking to reorder Lady Londonderry on a day someone
-  bought 8oz of it. Checked against the register, not the model's judgment.
-  (Distinct from the stock cross-check above: an unsold item the *website*
-  claims to stock is a finding worth keeping, not a bullet to delete.)
-- **Garble gate (`_drop_garble_bullets`)**: action items whose subject is
+  reorder **or unavailability** claim naming something the register rang up
+  that day is dropped. The prompt says this too and the model ignores it — it
+  asked to reorder Lady Londonderry on a day someone bought 8oz, and asserted
+  in prose that a Nilgiri iced tea blend and a Sandia Spice / immune-support
+  pair were unavailable when the woven POS lines proving all three sold were in
+  its own input. The sold product must sit within 60 characters of the trigger:
+  without that window a real finding about gift-card *processing* was deleted
+  because "Gift Card" is also a register line item.
+- **Garble gate (`_drop_garble_claims`)**: claims whose subject is
   mis-transcription — mixed scripts, 7+ word strings, comma-salad — are
   removed, and the catalog matcher refuses to rename garble into a real
   product. Without this the stock cross-check finds a genuine product name
   buried inside noise and promotes the whole string to a verified reorder.
-  Deliberately conservative: real unmet demand is the log's most valuable
-  content, so only unmistakable noise is rejected.
+  Any one garbled quote sinks the claim; a bullet naming one real product and
+  one piece of noise is still unactionable.
+- **Unverified names lose their quotes (`_unquote_unverified`)**: the garble
+  test is deliberately conservative — real unmet demand is the log's most
+  valuable content and looks exactly like a short unknown name. So short
+  mis-hears that survive it ("Cork option paper", "boochoo", "the dealership")
+  are not deleted; they lose their quotation marks. The policy asked for this
+  outright — *a quoted string is treated downstream as a real product name* —
+  and it keeps the event while dropping the false authority.
+- **Training artifacts (`_reject_training_artifacts`)**: register training is
+  speech *about* orders. A trainer's "I want to give you some fake orders"
+  followed by three inventions became a log's opening sentence as genuine unmet
+  demand. A quoted name occurring only inside a training window is dropped; the
+  same name asked for elsewhere in the day survives.
+- **Non-events and generic openers (`_drop_non_events`, `_fix_generic_opener`)**:
+  both are banned in the prompt and both shipped anyway — "…but no action was
+  taken", and "A steady flow of customers entered the shop", the exact phrase
+  the prompt names as forbidden. Now enforced in code. The opener is only cut
+  when the paragraph has a real sentence behind it.
 - **Annotation cap (`_validate_annotations`)**: the correlation prompt allows
   at most 3 record references and forbids attaching them to product mentions;
   neither was enforced, and logs shipped 5+, mostly on products. Excess
@@ -132,7 +174,7 @@ Still dropped entirely, name or no name:
 - Garbled audio presented as fact — a detail that looks mis-transcribed is
   dropped, never guessed at. Register (POS) product names are never garble.
   Action items whose subject is mis-transcription are removed in code
-  (`_drop_garble_bullets`), and the catalog matcher refuses to rename garble
+  (`_drop_garble_claims`), and the catalog matcher refuses to rename garble
   into a real product — noise dressed up as a verified reorder is worse than
   no bullet at all.
 
