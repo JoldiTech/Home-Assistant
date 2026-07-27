@@ -369,7 +369,7 @@ NOTES = ["""- [PROBLEM] Phones are not transferring calls to the warehouse
 
 DRAFT = ("# Log\n\nThe rain brought people in off the street.\n\n"
          "## Unresolved\n- Chase the invoice\n\n## Worth remembering\n- a real thing\n")
-out = P._carry_through_notes(DRAFT, NOTES)
+out = P._rebuild_bullet_sections(DRAFT, NOTES, [])
 check("dropped PROBLEM carried into Unresolved", has(out, "not transferring calls"), True)
 check("second PROBLEM carried too", has(out, "red basket"), True)
 check("PROMISE carried into Unresolved", has(out, "sponsorship request"), True)
@@ -388,9 +388,9 @@ check("...and unmet demand is not", has(uns, "cinnamon sticks"), False)
 # A full section is left alone rather than overfilled.
 FULL = ("# Log\n\nBody.\n\n## Unresolved\n- a1\n- a2\n- a3\n- a4\n- a5\n\n"
         "## Worth remembering\n- b1\n")
-out = P._carry_through_notes(FULL, NOTES)
-check("a full section is not overfilled", has(out, "not transferring calls"), False)
-check("...while the other section still tops up", has(out, "cinnamon sticks"), True)
+out = P._rebuild_bullet_sections(FULL, NOTES, [])
+check("a strong note outranks weak draft bullets", has(out, "not transferring calls"), True)
+check("...and the other section is filled too", has(out, "cinnamon sticks"), True)
 
 check("tags never reach the log",
       bool(P._NOTE_TAG_ANY_RE.search(P._NOTE_TAG_ANY_RE.sub("", out))), False)
@@ -406,7 +406,7 @@ WILD = ["""- [SUPPLY] Ordered 2 cases of 5oz gift tins
 - [STORAGE] Matcha is now kept in the fridge, consuming space
 - [SAFETY] Heavy stock shelved too high to take down safely
 - [RHYTHM] Quiet until mid-morning"""]
-out = P._carry_through_notes("# Log\n\nBody.\n\n## Unresolved\n\n## Worth remembering\n", WILD)
+out = P._rebuild_bullet_sections("# Log\n\nBody.\n\n## Unresolved\n\n## Worth remembering\n", WILD, [])
 for probe in ("gift tins", "fridge", "shelved too high"):
     check(f"unknown tag still carried: {probe}", has(out, probe), True)
 check("narrative-ish unknown tag is not a bullet", has(out, "quiet until"), False)
@@ -446,7 +446,7 @@ check("...that fact survives too", has(out, "alarm now beeps"), True)
 # One request must not arrive twice because the wordings differ.
 DRAFT2 = "# Log\n\nBody.\n\n## Unresolved\n- Reorder XL gloves as requested by a staff member\n\n## Worth remembering\n"
 DUP = ["- [PROBLEM] A staff member requested to reorder XL gloves as mediums no longer fit"]
-out = P._carry_through_notes(DRAFT2, DUP)
+out = P._rebuild_bullet_sections(DRAFT2, DUP, [])
 check("a reworded restatement is not carried twice",
       out.lower().count("xl gloves"), 1)
 
@@ -527,6 +527,28 @@ check("stray section dropped", has(out, "## Annotated"), False)
 check("...its duplicated bullet goes with it", out.count("- a"), 1)
 check("...the real sections survive",
       has(out, "## Unresolved") and has(out, "## Worth remembering"), True)
+
+
+
+# --- ranking is the quality control -------------------------------------------
+print("\nbullet ranking")
+
+RANK_NOTES = ["""- [PROBLEM] The register had a $70 discrepancy, likely an order that did not go through but was charged twice
+- [PROBLEM] A customer reported an issue with Spotify where music stops when it rains
+- [UNMET] A customer asked for saffron, which we don't carry
+- [UNMET] A customer asked for a product but the exact item is unclear
+- [PROBLEM] Something happened
+- [FEEDBACK] Customer praised the Sandia Spice for its warmth"""]
+RANK_PRODUCTS = [{"name": "Sandia Spice"}]
+DRAFTR = "# Log\n\nBody.\n\n## Unresolved\n- Chase it up\n\n## Worth remembering\n- Something nice\n"
+out = P._rebuild_bullet_sections(DRAFTR, RANK_NOTES, RANK_PRODUCTS, want=3)
+uns = out.split("## Unresolved")[1].split("## Worth")[0]
+check("the money finding outranks the noise", has(uns, "$70"), True)
+check("a bullet that names nothing loses its slot", has(uns, "something happened"), False)
+wr = out.split("## Worth remembering")[1]
+check("a real product outranks a placeholder", has(wr, "sandia spice"), True)
+check("...and the placeholder is cut", has(wr, "exact item is unclear"), False)
+check("saffron - a product we do NOT stock - still ranks", has(wr, "saffron"), True)
 
 
 print()

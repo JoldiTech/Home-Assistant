@@ -1871,46 +1871,113 @@ def _already_covered(text: str, markdown: str) -> bool:
     return bool(trigrams(text) & trigrams(markdown))
 
 
-def _carry_through_notes(markdown: str, notes: list) -> str:
-    """Top up the bullet sections from the tagged notes the merge dropped."""
+def _same_claim(a: str, b: str) -> bool:
+    """Two bullets about the same thing, however differently worded."""
+    return _already_covered(a, b)
+
+
+def _claim_score(text: str, known: list) -> int:
+    """How searchable a candidate bullet is a year from now.
+
+    The ranking IS the quality control. Slice notes are a mix of the day's best
+    findings and its worst inventions - the 2026-07-19 notes contained the real
+    $70 drawer overage alongside three phantom shortfalls, a customer's Spotify
+    complaint and construction on 12th Street that never happened. The gates
+    delete what is checkably false; this decides what earns one of five slots
+    among everything that survives.
+    """
+    score = 0
+    nt = _norm_name(text)
+    if any(k in nt for k in known):
+        score += 3                                  # names a real product
+    if re.search(r"#\s?\d", text):
+        score += 2                                  # cites a record
+    if _MONEY_RE.search(text):
+        score += 2
+    elif re.search(r"\d", text):
+        score += 1
+    if _PLACEHOLDER_RE.search(text):
+        score -= 3
+    if any(_is_garble(q) for q in re.findall(r'"([^"]{3,})"', text)):
+        score -= 4
+    words = len(text.split())
+    if words < 6:
+        score -= 2                                  # too thin to act on
+    if words > 40:
+        score -= 1                                  # a paragraph, not a bullet
+    return score
+
+
+def _section_bullets(lines: list, heading: str):
+    """(start, end, [bullet text]) for a section, or None."""
+    try:
+        i = next(k for k, l in enumerate(lines) if l.strip() == heading)
+    except StopIteration:
+        return None
+    j = i + 1
+    while j < len(lines) and not lines[j].startswith("## "):
+        j += 1
+    bullets = [l.strip()[2:].strip() for l in lines[i + 1:j] if l.lstrip().startswith("- ")]
+    return i, j, bullets
+
+
+def _rebuild_bullet_sections(markdown: str, notes: list, products: list,
+                             want: int = 8) -> str:
+    """Build the bullet sections FROM the slice notes, not from the merge.
+
+    The merge is the lossiest stage in the pipeline and always will be: an 8B
+    model handed a dozen slices of notes and asked for two paragraphs plus ten
+    bullets keeps perhaps a third of what it was given. Measured against forty
+    findings identified by hand from the same four days, the log carried 30%.
+
+    The notes do not have that problem - they are written per slice, with the
+    whole slice in context, and they found the things the merge dropped: the
+    $70 drawer overage, the saffron request, the label printer. Topping the
+    sections up from them afterwards was still the merge's list plus scraps.
+    So the notes become the primary source: every tagged note and every bullet
+    the model wrote compete on one ranked list, and the best fill the section.
+
+    Draft bullets carry a small bonus - they have been through the correlation
+    pass and may have earned a record reference the raw note lacks - but they
+    no longer win by default. `want` is deliberately larger than the final cap
+    so the gates downstream have slack to reject candidates without leaving a
+    section thin.
+    """
     tagged = _parse_tagged_notes(notes)
     if not tagged:
         return markdown
+    known = [k for k in ({_norm_name(str(p.get("name") or "")) for p in (products or [])}
+                         - {""}) if len(k) >= 6]
     lines = markdown.splitlines()
-    counts, order = {}, []
-    for i, l in enumerate(lines):
-        if l.strip() in ("## Unresolved", "## Worth remembering"):
-            order.append((l.strip(), i))
-    if not order:
-        return markdown
-    for name, i in order:
-        n = 0
-        for l in lines[i + 1:]:
-            if l.startswith("## "):
-                break
-            if l.lstrip().startswith("- "):
-                n += 1
-        counts[name] = n
+    rebuilt = 0
 
-    added = 0
-    for tag, text in tagged:
-        section = _carry_section(tag)
-        if not section or counts.get(section, 0) >= CARRY_SECTION_TARGET:
+    for heading in ("## Unresolved", "## Worth remembering"):
+        found = _section_bullets(lines, heading)
+        if not found:
             continue
-        if _already_covered(text, "\n".join(lines)):
+        i, j, existing = found
+        cands = [(b, _claim_score(b, known) + 1, "draft") for b in existing]
+        for tag, text in tagged:
+            if _carry_section(tag) != heading:
+                continue
+            cands.append((text, _claim_score(text, known), "note"))
+
+        picked = []
+        for text, score, src in sorted(cands, key=lambda c: -c[1]):
+            if any(_same_claim(text, p) for p, _, _ in picked):
+                continue
+            picked.append((text, score, src))
+            if len(picked) >= want:
+                break
+        if not picked:
             continue
-        idx = next(i for s, i in order if s == section)
-        end = idx + 1
-        while end < len(lines) and not lines[end].startswith("## "):
-            end += 1
-        while end > idx + 1 and not lines[end - 1].strip():
-            end -= 1
-        lines.insert(end, f"- {text}")
-        counts[section] += 1
-        added += 1
-        order = [(s, (i + 1 if i >= end else i)) for s, i in order]
-    if added:
-        _warn(f"carried {added} tagged note(s) the merge dropped")
+        n_notes = sum(1 for _, _, src in picked if src == "note")
+        if n_notes:
+            rebuilt += n_notes
+        lines[i + 1:j] = [""] + [f"- {t}" for t, _, _ in picked] + [""]
+
+    if rebuilt:
+        _warn(f"bullet sections rebuilt from notes: {rebuilt} note-sourced candidate(s)")
     return "\n".join(lines)
 
 
@@ -2507,18 +2574,22 @@ def main():
         md = _drop_stray_sections(md)
         return md
 
-    markdown = gates(markdown)
-    # Carry through AFTER the gates, then gate again.
+    # Gate the draft, rebuild the bullets from the notes, gate again.
     #
-    # Running it before was why nothing was ever carried: the draft still had
-    # full bullet lists at that point, so the top-up correctly declined - and
-    # then the gates deleted several of those bullets, leaving room that
-    # nothing filled. The room only exists once the pruning has happened. The
-    # second gate pass is what keeps a carried line from being privileged; it
-    # faces exactly the checks the model's own bullets did.
-    carried = _carry_through_notes(markdown, notes)
-    if carried != markdown:
-        markdown = gates(carried)
+    # The order matters and cost three attempts to get right. Rebuilding before
+    # the first pass would rank fabrications against real findings; skipping
+    # the second pass would let a note-sourced bullet into the log unchecked.
+    # Gating either side means every bullet faces the same tests no matter
+    # which stage produced it, and the ranking only ever chooses among
+    # survivors.
+    markdown = gates(markdown)
+    rebuilt = _rebuild_bullet_sections(markdown, notes, products)
+    if rebuilt != markdown:
+        markdown = gates(rebuilt)
+    # Cap last, at the policy's own number: the rebuild deliberately keeps more
+    # candidates than will ship so the gates have slack to reject without
+    # leaving a section thin.
+    markdown = _cap_bullet_lists(markdown, cap=5)
     markdown = _fix_generic_opener(markdown, biz)
     # Runs BEFORE the stats block is appended: timeclock names belong there,
     # what must not survive is a staff name attached to something they said.
