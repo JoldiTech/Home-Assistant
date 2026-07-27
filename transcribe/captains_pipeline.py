@@ -1408,7 +1408,15 @@ _DISCREPANCY_CLAIM = re.compile(
 _DISCREPANCY_SPEECH = re.compile(
     r"discrepan|shortfall|came up short|we'?re short|is short|short by|"
     r"does ?n[o']?t match|does not match|did ?n[o']?t balance|out of balance|"
-    r"off by|unaccounted|over by|missing money|drawer is off", re.I)
+    r"off by|unaccounted|over by|missing money|drawer is off|"
+    # A drawer that is OVER is a discrepancy too, and staff say it in plain
+    # words rather than in till vocabulary. 2026-07-19's real event - the
+    # drawer $70 up, with a customer possibly charged twice - reads "we're
+    # over today we charged people $70 more ... the drawer is $70 more than
+    # this". None of the patterns above touch any of that.
+    r"we'?re over|we were over|came up over|drawer is \$?[\d,.]+ more|"
+    r"charged (?:people|someone|her|him|them|the customer)(?: an extra| more)|"
+    r"charged (?:someone |them |her |him )?twice|double.?charg", re.I)
 
 
 _MONEY_RE = re.compile(r"\$ ?([\d,]+(?:\.\d{2})?)")
@@ -1441,7 +1449,11 @@ def _spoken_near_report(amount: str, lines: list[str], flags: list[bool]) -> boo
     # test on an unrelated 47 nearby. Cents are specific enough to trust at a
     # distance; a bare number has to be on the very line where somebody says
     # money is wrong.
-    window = DISCREPANCY_NEAR_LINES if "." in bare else 0
+    # Cents are specific enough to trust at a distance; a bare figure gets a
+    # tight window rather than none. Zero was too strict: on 2026-07-19 "off by
+    # seven" sits three lines above "the drawer is $70 more than this", and
+    # requiring them on ONE line deleted the day's real discrepancy.
+    window = DISCREPANCY_NEAR_LINES if "." in bare else 3
     for i, ln in enumerate(lines):
         if pat.search(ln):
             lo, hi = max(0, i - window), i + window + 1

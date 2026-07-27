@@ -473,6 +473,36 @@ check("'no content provided' dropped", has(out, "voicemail"), False)
 check("...a real item survives", has(out, "damaged kettle"), True)
 
 
+
+# --- a drawer that is OVER ----------------------------------------------------
+print("\nover-the-drawer discrepancies")
+
+# 2026-07-19's real event, in the words staff actually used. The notes pass
+# found it; the gate deleted it, because "over" was not till vocabulary and a
+# bare $70 was required to share a line with the report.
+SPEECH_OVER = "\n".join([
+    "Okay so what is the total?",
+    "Yesterday we were off by seven.",
+    "No idea what happened.",
+    "Like over that we're over today we charged people $70 more so the drawer "
+    "is $70 more than this.",
+    "Maybe we charged someone an extra 700 bucks.",
+    "We have to talk to her about it tomorrow."])
+out = P._reject_unsupported_discrepancies(
+    "## Unresolved\n- Reconcile the $70 the drawer came up over; a card sale may "
+    "have charged a customer twice\n", SPEECH_OVER)
+check("a drawer that is OVER survives", has(out, "$70"), True)
+
+# ...without reopening the hole: an unrelated bare figure far from any report
+# is still rejected.
+SPEECH_FAR = "\n".join(
+    ["That will be 47 today.", "Thanks, have a good one."] + ["Chat."] * 8 +
+    ["Okay the drawer does not match."])
+out = P._reject_unsupported_discrepancies(
+    "## Unresolved\n- Reconcile the discrepancy of $47\n", SPEECH_FAR)
+check("...an unrelated bare figure is still dropped", has(out, "$47"), False)
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")
