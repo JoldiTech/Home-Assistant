@@ -1990,7 +1990,7 @@ def _section_bullets(lines: list, heading: str):
 
 
 def _rebuild_bullet_sections(markdown: str, notes: list, products: list,
-                             want: int = 8) -> str:
+                             want: int = 8, keep=None) -> str:
     """Build the bullet sections FROM the slice notes, not from the merge.
 
     The merge is the lossiest stage in the pipeline and always will be: an 8B
@@ -2034,6 +2034,12 @@ def _rebuild_bullet_sections(markdown: str, notes: list, products: list,
             if _carry_section(tag) != heading:
                 continue
             cands.append((text, _claim_score(text, known), "note"))
+        if keep:
+            before = len(cands)
+            cands = [c for c in cands if keep(c[0])]
+            if before != len(cands):
+                _warn(f"{heading[3:]}: {before - len(cands)} candidate(s) failed the "
+                      f"gates before ranking, {len(cands)} left")
 
         picked = []
         for text, score, src in sorted(cands, key=lambda c: -c[1]):
@@ -2657,8 +2663,14 @@ def main():
     # Gating either side means every bullet faces the same tests no matter
     # which stage produced it, and the ranking only ever chooses among
     # survivors.
+    def survives(text):
+        """Does this candidate survive the gates as a lone bullet?"""
+        doc = f"## Unresolved\n- {text}\n"
+        found = _section_bullets(gates(doc).splitlines(), "## Unresolved")
+        return bool(found and found[2])
+
     markdown = gates(markdown)
-    rebuilt = _rebuild_bullet_sections(markdown, notes, products)
+    rebuilt = _rebuild_bullet_sections(markdown, notes, products, keep=survives)
     if rebuilt != markdown:
         markdown = gates(rebuilt)
     # Cap last, at the policy's own number: the rebuild deliberately keeps more

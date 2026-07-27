@@ -605,6 +605,32 @@ check("an amount-less discrepancy is dropped", has(out, "no cause was identified
 check("...the one with a figure survives", has(out, "$37.66"), True)
 
 
+
+# --- filter before ranking ----------------------------------------------------
+print("\nfilter-before-rank")
+
+# 2026-07-26: six phantom discrepancies scored higher than every real finding
+# (money +2 and the word "register" +3), took the slots, were deleted by the
+# gates afterwards, and the section shipped with two bullets. Coverage DROPPED.
+PHANTOMS = ["""- [PROBLEM] Reconcile the register shortfall of $2.50 at closing
+- [PROBLEM] The register had a $2.14 discrepancy that needs reconciliation
+- [PROBLEM] register discrepancy of $0.75 unaccounted for
+- [PROBLEM] Phones at Counter not working, calls to the warehouse went unanswered
+- [PROBLEM] The fridge door was being held open by a red basket"""]
+DRAFT3 = "# Log\n\nBody.\n\n## Unresolved\n\n## Worth remembering\n"
+
+# Without the filter the fakes crowd out the real findings at rank time.
+loose = P._rebuild_bullet_sections(DRAFT3, PHANTOMS, [], want=3)
+check("unfiltered, the phantoms take the slots", has(loose, "$2.50"), True)
+
+# With the gate applied first, only survivors compete.
+reject_money = lambda t: "$" not in t          # stand-in for the money gates
+tight = P._rebuild_bullet_sections(DRAFT3, PHANTOMS, [], want=3, keep=reject_money)
+check("filtered, the phantoms never compete", has(tight, "$2.50"), False)
+check("...and the real findings get the slots", has(tight, "phones at counter"), True)
+check("...both of them", has(tight, "red basket"), True)
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")
