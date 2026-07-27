@@ -155,11 +155,20 @@ connected observation - never to report totals.
 Your input mixes these materials, all context for ONE story - never say
 where a fact came from (no "per Slack", no "on audio"):
 - AUDIO: shop-floor speech from the camera mic. Lossy, garbled, PRIVATE.
-- POS lines "[14:32] ⟦POS $23.50 — Earl Grey 2oz ×1⟧": register ground
-  truth; amounts/items/times are exact, never garble.
+  The least reliable input you have - a phrase that is not a tea, herb,
+  spice or piece of equipment is mis-transcription, not a discovery.
+- POS lines, of the form "[HH:MM] ⟦POS $[total] — [product] [size] ×[qty]⟧":
+  register ground truth; amounts/items/times are exact, never garble. A
+  product on one of these SOLD - it cannot also have been unavailable.
 - SLACK blocks: staff work chat.
 - BUSINESS RECORDS block: the day's support tickets, customer texts, and
   call notes.
+SLACK and BUSINESS RECORDS are the MOST reliable material in the input and
+the most likely to be missed: unlike the audio, someone wrote each line down
+deliberately. A supply ordered, a system not working, a safety or storage
+problem, an open ticket, a request that arrived off the floor - each is a
+finding on its own and belongs in the log even if nobody on the floor said a
+word about it.
 
 FORMAT:
 1. 2-4 short narrative paragraphs - the story of the day: its rhythm woven
@@ -177,7 +186,7 @@ FORMAT:
    tomorrow ("reconcile the register shortfall", "reorder [the
    out-of-stock product]") - fill the brackets from TODAY'S input only;
    these are format examples, never content. A DISCREPANCY IS NOT A NUMBER
-   YOU HEARD: money spoken at the counter ("62.15 today") is a sale total,
+   YOU HEARD: money spoken at the counter ("[amount] today") is a sale total,
    the most ordinary event in a shop. Write a discrepancy ONLY when the input
    actually says money is missing, short, over, uncounted, or does not match -
    if nobody says that, there is no discrepancy, whatever amounts were said
@@ -205,25 +214,30 @@ cause is "unexplained". Counts too: one mention is "a customer", not
 "several" - only count what you can point to. An invented cause or inflated
 count poisons a permanent record; an honest gap does not.
 
+EXAMPLES IN THESE INSTRUCTIONS ARE NOT SHOP EVENTS. Everything written inside
+[SQUARE BRACKETS] below is a slot to fill from TODAY'S input, never text to
+copy. No product, supply, request, situation, amount or name mentioned in
+these instructions may appear in the log unless it is also in today's input.
+
 PRIVACY - the rule is about LINKAGE, not names:
 - NEVER attribute words to a named STAFF member. Staff requests, opinions,
   observations, complaints and remarks go in the log WITHOUT the name: write
-  "a staff request to restock XL gloves", never "restock XL gloves per
-  George's request"; write "staff flagged the printer jamming", never "Dominic
-  said the printer is jamming". The operational fact is the entire point; who
-  said it is not, and naming them turns a work log into a record of who said
-  what. This holds even when the remark is harmless.
+  "a staff request to restock [the supply]", never "restock [the supply] per
+  [name]'s request"; write "staff flagged [the equipment] failing", never
+  "[name] said [the equipment] is failing". The operational fact is the entire
+  point; who said it is not, and naming them turns a work log into a record of
+  who said what. This holds even when the remark is harmless.
 - CUSTOMER names are fine where they make a commitment actionable: a promise,
   hold, special order, or callback NEEDS the name to be picked up tomorrow.
   Only use names ACTUALLY present in the day's material - never invent one, and
   never copy an example name from these instructions into the log.
 - What must NEVER appear is a named person tied to sensitive or personal
   content: health/medical details, personal-life circumstances, complaints
-  about other people, or "so-and-so said/felt X". Keep the operational fact,
-  break the link - "a customer asked about teas safe during pregnancy" is
-  fine; naming her in that sentence is not. No contact info ever.
+  about other people, or a feeling or opinion attributed to a named person. Keep the operational fact,
+  break the link - "a customer asked about teas suitable for [a health
+  concern]" is fine; naming her in that sentence is not. No contact info ever.
   Generalise the CONDITION as well as the name: record the need, never the
-  diagnosis. "A customer asked about anti-inflammatory blends" is fine; naming
+  diagnosis. Naming the need is fine; naming
   the condition, the medication, or whose it is, is not - in a shop this size a
   specific diagnosis identifies someone even with no name attached. If the whole
   exchange was staff declining to give medical advice, there is no event - drop
@@ -275,6 +289,22 @@ TRANSCRIPT:
 
 NOTES_TEMPLATE = "Notes for time slice {i} of {n} (times are HH:00 markers):\n\n{chunk}"
 
+# On a long day the transcript becomes ten slices of notes and the staff chat
+# stays raw at the end of the final prompt, where it loses. 2026-07-26's Slack
+# was the richest input of any day audited - a supply order placed, the phones
+# not reaching the warehouse, a fridge wedged open, an explicit warning about
+# heavy stock shelved unsafely - and NONE of it reached the log. It gets its own
+# notes pass now so it arrives in the merge as bullets, on equal footing.
+SIDE_NOTES_TEMPLATE = """Notes on today's STAFF CHAT and BUSINESS RECORDS. Unlike \
+the audio these are not overheard - every line is something a person wrote down on \
+purpose, so treat them as the most reliable input of the day, never as background.
+
+Capture every one as a bullet: supplies ordered, equipment or systems not working,
+safety and storage problems, stock moved or missing, open tickets, and customer
+requests or complaints that arrived off the floor.
+
+{chunk}"""
+
 FINAL_FROM_NOTES = """Write the Captain's Log for {weekday} {date} from these \
 notes taken across the day's Tea One audio + POS lines (SLACK blocks may follow). \
 Merge them per policy into ONE log in EXACTLY this format:
@@ -296,8 +326,8 @@ You are given RECORDS (orders, support tickets, calls - each with id, time,
 amount, items) and the DRAFT log. Where a narrative sentence or Unresolved
 bullet clearly refers to one of the records, append a parenthetical
 reference, e.g.:
-  "(likely order #58212, $43.50 at 2:14pm)"
-  "(ticket #91: Jane Miller, 'Missing tin from order')"
+  "(likely order #[id], $[amount] at [time])"
+  "(ticket #[id]: [customer name], '[subject]')"
 Write references in that plain style - never paste raw transcript syntax like
 "⟦POS ...⟧" into the log. Match on time proximity, dollar amounts, and item
 names. Rules:
@@ -307,8 +337,9 @@ names. Rules:
 - Annotate at most 3 places in the whole log. Zero is a fine answer.
 - Use ONLY ids/amounts/names that appear in RECORDS - never invent one.
 - A match needs corroboration (time AND amount, or amount AND item). A
-  mismatched amount is a NON-match: never attach a $175.97 order to a $70
-  discrepancy. If not confident, leave the bullet exactly as it is.
+  mismatched amount is a NON-match: an order's total that differs from the
+  bullet's amount does not belong on that bullet, however close the time.
+  If not confident, leave the bullet exactly as it is.
 - Prefix inferred links with "likely" unless the amount matches exactly.
 - Change NOTHING else: no rewording, no adding or removing bullets.
 Output ONLY the annotated markdown log. /no_think"""
@@ -323,14 +354,18 @@ operational facts stay - naming the customer on a promise, hold, or special
 order is the point of the log (use ONLY names that actually appear in the day's
 material; never carry an example name from these instructions into the output).
 But a STAFF member's name must never sit on something they said, asked for, or
-thought: rewrite "restock XL gloves per George's request" as "restock XL gloves
-(a staff request)", and "Dominic said the printer jams" as "staff reported the
-printer jamming". Keep the fact, drop the staff name. What
-must never survive is a NAMED person
+thought: rewrite "restock [the supply] per [name]'s request" as "restock [the
+supply] (a staff request)", and "[name] said [the equipment] is failing" as
+"staff reported [the equipment] failing". Keep the fact, drop the staff name.
+What must never survive is a NAMED person
 tied to sensitive content: health/medical details, personal-life
-circumstances, or "so-and-so said/felt X". Fix by breaking the link - keep
-the event, drop the name from THAT sentence ("a customer asked about teas
-safe during pregnancy") - not by deleting the whole fact.
+circumstances, or a feeling attributed to a named person. Fix by breaking the link - keep
+the event, drop the name from THAT sentence (record the need, not the
+diagnosis or whose it is) - not by deleting the whole fact.
+
+NOTHING IN [SQUARE BRACKETS] ABOVE IS CONTENT. Those are slots to fill from
+the draft in front of you. Never introduce a product, supply, request or
+situation that is not already in that draft.
 
 REMOVE entirely any sentence or bullet that contains:
 - personal-life content with no operational value (schooling/college, jobs or
@@ -342,7 +377,7 @@ REMOVE entirely any sentence or bullet that contains:
   plain words naming the product or thing at issue, instead of quoting.
 
 KEEP every id / dollar amount / time in parenthetical record references like
-"(likely order #58212, $43.50 at 2:14pm)" - those are business records.
+"(likely order #[id], $[amount] at [time])" - those are business records.
 Fix garbled product names from the lossy mic: if a "product" is not a
 plausible real tea/herb/ingredient/flavor, drop just that mention - register
 (POS/order-reference) product names are never garble.
@@ -362,8 +397,10 @@ NOTES_SYSTEM = SYSTEM_PROMPT + (
     "references them. A CUSTOMER name is fine when it carries an operational fact "
     "(a promise, hold, or order); never pair a name with personal or health "
     "content. NEVER put a STAFF member's name on something they said, asked for, "
-    "or thought - write 'a staff request to reorder X', not 'per George's "
-    "request'. No format headers - just bullets. At most 8 bullets per slice."
+    "or thought - write 'a staff request to reorder [the item]', not '[name] "
+    "asked for it'. Nothing in [square brackets] is content; fill those slots "
+    "from this slice only. No format headers - just bullets. At most 8 bullets "
+    "per slice."
 )
 
 
@@ -511,19 +548,215 @@ def _is_garble(q: str) -> bool:
     return False
 
 
-def _drop_garble_bullets(markdown: str) -> str:
-    """Remove action items whose subject is mis-transcription. A garbled
-    'Reorder "<noise>"' bullet is worse than no bullet: it sends someone
-    looking for a product that was never asked for."""
-    out = []
-    for line in markdown.splitlines():
-        if line.lstrip().startswith(("-", "*")):
-            quoted = re.findall(r'"([^"]{3,})"', line)
-            if quoted and all(_is_garble(q) for q in quoted):
-                _warn(f"dropped garble-based bullet: {line.strip()[:70]}")
+def _drop_garble_claims(markdown: str) -> str:
+    """Remove any claim whose subject is mis-transcription.
+
+    A garbled 'Reorder "<noise>"' bullet is worse than no bullet: it sends
+    someone looking for a product that was never asked for. Three changes from
+    the bullets-only version this replaces, each from an observed failure:
+
+    - runs over narrative sentences too. 2026-07-26 shipped `A customer asked
+      for "the 16 ounces of the Nahili mill jury and cleaner"` in paragraph one
+      (it was a Nilgiri iced tea blend, and it sold).
+    - ANY garbled quote sinks the claim, not only an all-garble one. A bullet
+      naming one real product and one piece of noise is still unactionable.
+    - drops the whole claim rather than the quote. The policy says drop the
+      token not the event, but "A customer asked for but it was unavailable"
+      is not an event - without the name there is nothing left to act on, and
+      printing the noise is what the policy bans outright.
+    """
+    def reject(text, is_bullet):
+        bad = [q for q in re.findall(r'"([^"]{3,})"', text) if _is_garble(q)]
+        return f'garbled quoted name "{bad[0][:40]}"' if bad else None
+
+    return _edit_claims(markdown, reject)
+
+
+# Register training is speech ABOUT orders, not orders. On 2026-07-21 a trainer
+# said "I think what I want to do is give you some fake orders" and read out
+# three inventions; all three became the log's opening sentence, quoted, as
+# genuine unmet demand. Kept deliberately narrow - a bare "training" also
+# matches product names ("Training | Chop Sticks") and ordinary shop talk.
+_TRAINING_RE = re.compile(
+    r"fake order|practice order|example order|for practice|let'?s pretend|"
+    r"pretend (?:to be|you'?re)|some fake|practice (?:ringing|transaction|sale)|"
+    r"i'?ll be the customer|say i'?m a customer", re.I)
+TRAINING_WINDOW_LINES = int(os.environ.get("TRAINING_WINDOW_LINES", "40"))
+
+
+def _reject_training_artifacts(markdown: str, transcript: str) -> str:
+    """Drop claims whose quoted product name occurs ONLY inside a training
+    exercise. If the same name also appears elsewhere in the day it survives -
+    a real request does not become unreal because someone practised nearby."""
+    if not transcript:
+        return markdown
+    lines = transcript.splitlines()
+    training = [False] * len(lines)
+    for i, ln in enumerate(lines):
+        if _TRAINING_RE.search(ln):
+            for j in range(i, min(len(lines), i + TRAINING_WINDOW_LINES + 1)):
+                training[j] = True
+    if not any(training):
+        return markdown
+    lowered = [l.lower() for l in lines]
+
+    def reject(text, is_bullet):
+        for q in re.findall(r'"([^"]{3,})"', text):
+            hits = [i for i, l in enumerate(lowered) if q.lower() in l]
+            if hits and all(training[i] for i in hits):
+                return f'"{q[:40]}" only occurs inside register training'
+        return None
+
+    return _edit_claims(markdown, reject)
+
+
+_STOPWORDS = frozenset("""a an the of for to in on at with and or per is was be from by
+that this it as but during when never write say said not no any all its their his her
+you your we our they them there here into onto about over under than then so if""".split())
+
+# Vocabulary every log is made of. A bigram built only from these carries no
+# identity, so it can never be evidence that the model copied an example -
+# blocking on "customer asked" or "register shortfall" would delete real
+# findings on every future day. Only a pair where BOTH words are outside this
+# set is distinctive enough to accuse ("xl gloves", "safe pregnancy").
+_COMMON_LOG_WORDS = frozenset("""customer customers staff shop store day today morning
+afternoon evening tea teas product products item items order orders sale sales sold
+register drawer till price prices priced amount amounts total totals discrepancy
+shortfall short over unaccounted reconcile request requested requests ask asked asking
+reorder restock stock stocked unavailable available promise promised sample samples
+blend blends log note noted flag flagged report reported name names steady flow stream
+busy slow quiet action taken note bullet unresolved remembering worth demand unmet
+inquired browsed came entered visit visits traffic""".split())
+
+
+def _content_bigrams(text: str) -> set:
+    """Adjacent content-word pairs, lowercased. Comparing these rather than
+    whole strings is what lets the backstop below catch a re-worded echo:
+    the instructions say "restock XL gloves", the log said "Reorder XL gloves",
+    and only the bigram "xl gloves" survives both."""
+    words = [w for w in re.findall(r"[a-z0-9][a-z0-9'\-]*", text.lower())
+             if w not in _STOPWORDS]
+    out = set()
+    for a, b in zip(words, words[1:]):
+        pair = f"{a} {b}"
+        if len(pair) >= 7 and (len(a) >= 4 or len(b) >= 4):
+            out.add(pair)
+    return out
+
+
+# A quote introduced by one of these is an example of what NOT to write. Those
+# must never seed the blocklist: "a steady flow of customers" and "a customer
+# asked about X but no action was taken" are quoted precisely because they are
+# banned, and blocking their wording would delete real sentences every day.
+# Newlines are allowed between cue and quote: these prompts are wrapped prose,
+# so "never" routinely sits on the line above the example it forbids.
+# Over-matching here is the safe direction - it shrinks a backstop, whereas
+# under-matching deletes real findings from every future log.
+_NEGATIVE_CUE_RE = re.compile(
+    r"\b(never|not|no|banned|avoid|cut|drop|rather than|instead of|"
+    r"wrong|bad|forbidden)\b[^.]{0,90}$", re.I)
+
+
+def _prompt_example_phrases() -> set:
+    """Quoted POSITIVE examples in the prompts, which the model treats as
+    material rather than instruction."""
+    phrases = set()
+    for src in (SYSTEM_PROMPT, REDACT_TEMPLATE, CORRELATE_SYSTEM, NOTES_SYSTEM,
+                USER_TEMPLATE, FINAL_FROM_NOTES):
+        for m in re.finditer(r'"([^"\n]{8,80})"', src):
+            s = " ".join(m.group(1).split())
+            # Quotes pair off left to right, so on a line with several the
+            # regex also captures the prose BETWEEN them ("; write", "a
+            # customer"). Real examples are phrases: three or more words,
+            # opening on a letter.
+            if not s[:1].isalpha() or len(s.split()) < 3:
                 continue
-        out.append(line)
-    return "\n".join(out)
+            if s.startswith("#") or "⟦" in s or "<" in s or "[" in s:
+                continue                      # format markers and filled slots
+            if _NEGATIVE_CUE_RE.search(src[max(0, m.start() - 130):m.start()]):
+                continue                      # an example of what not to write
+            phrases.add(s)
+    return phrases
+
+
+def _prompt_echo_blocklist(grounding: str) -> dict:
+    """{distinctive bigram -> the prompt example it came from}, minus anything
+    the day actually discussed. Empty is the healthy state: it means no prompt
+    carries a concrete example the model could mistake for a shop event."""
+    ground = _content_bigrams(grounding)
+    blocked = {}
+    for phrase in _prompt_example_phrases():
+        for bg in _content_bigrams(phrase) - ground:
+            a, b = bg.split(" ", 1)
+            if a in _COMMON_LOG_WORDS or b in _COMMON_LOG_WORDS:
+                continue                      # generic English, not an identity
+            blocked[bg] = phrase
+    return blocked
+
+
+def _reject_prompt_echoes(markdown: str, grounding: str) -> str:
+    """Drop claims that echo an EXAMPLE from the instructions rather than the
+    day.
+
+    The 8B model treats its own instructions as source material. "Reorder XL
+    gloves" shipped on all four days audited; the request exists in exactly one
+    Slack message, inside the 07-23 window, and on two of those days it had not
+    been made yet. "Teas safe during pregnancy" shipped twice and the string
+    appears in none of the four inputs. Both were worked examples in
+    SYSTEM_PROMPT and REDACT_TEMPLATE.
+
+    The examples are placeholders now, so this is the backstop that stops a
+    future concrete one doing the same thing. Self-limiting by construction: a
+    phrase the shop genuinely discussed today is in `grounding`, so its bigrams
+    are never blocked.
+    """
+    if not grounding:
+        return markdown
+    blocked = _prompt_echo_blocklist(grounding)
+    if not blocked:
+        return markdown
+    _warn(f"prompt-echo guard armed on {len(blocked)} phrase(s)")
+
+    def reject(text, is_bullet):
+        for bg in _content_bigrams(text):
+            if bg in blocked:
+                return (f'"{bg}" echoes a prompt example '
+                        f'("{blocked[bg][:40]}") absent from today\'s input')
+        return None
+
+    return _edit_claims(markdown, reject)
+
+
+# The prompt bans opening on generic traffic and the model does it anyway -
+# 2026-07-26 opened "A steady flow of customers entered the shop", which is the
+# exact shape named as banned. Such a sentence is identical every day and
+# answers no future question, so cutting it costs nothing.
+_GENERIC_OPENER_RE = re.compile(
+    r"^(?:a|the)\s+(?:steady|slow|busy|brisk|constant|light)\s+"
+    r"(?:flow|stream|trickle|pace|day|morning)\b|"
+    r"^the\s+day\s+(?:started|began|opened|was)\b|"
+    r"^(?:traffic|the\s+shop|business)\s+(?:started|was|felt|remained|stayed)\b|"
+    r"^customers?\s+(?:inquired|browsed|came|came\s+in|trickled)\b|"
+    r"^it\s+was\s+a\s+(?:busy|slow|steady|quiet)\b", re.I)
+
+
+def _fix_generic_opener(markdown: str) -> str:
+    """Cut a banned generic opener when the paragraph has something better
+    behind it. Never empties the paragraph - if the generic sentence is all
+    there is, it stays, because an empty first paragraph is worse."""
+    lines = markdown.splitlines()
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith(("-", "*")):
+            break                              # no narrative paragraph at all
+        sentences = _split_sentences(s)
+        if len(sentences) >= 2 and _GENERIC_OPENER_RE.search(sentences[0].strip()):
+            _warn(f"dropped generic opener: {sentences[0][:70]}")
+            lines[i] = " ".join(sentences[1:])
+        break
+    return "\n".join(lines)
 
 
 def _match_catalog(markdown: str, products: list[dict]):
@@ -766,15 +999,142 @@ STORE_CLOSE_HOUR = int(os.environ.get("TRANSCRIBE_END_HOUR", "20"))
 
 
 _UNAVAILABLE_RE = re.compile(
-    r"reorder|out of stock|sold out|unavailable|not available|wasn't available|"
-    r"didn't have|don't carry|not carried|ran out|restock", re.IGNORECASE)
+    r"reorder|out of stock|sold out|unavailable|not available|wasn'?t available|"
+    r"didn'?t have|don'?t carry|not carried|ran out|restock|"
+    # 2026-07-26 asserted "but neither were available" of two products the
+    # register shows sold, and slipped through: the phrasing carries no "not".
+    r"(?:neither|none|nothing|not one)\s+(?:of\s+\w+\s+)?(?:were|was)\s+available|"
+    r"weren'?t available|were not available|not in stock|no longer (?:carry|stocked)|"
+    r"could ?n[o']?t find|we(?:'re| are|'ve been| have been) out",
+    re.IGNORECASE)
+
+# The prompt bans non-events outright ("a customer asked about X but no action
+# was taken - cut") and the model writes them anyway; 2026-07-21 shipped "The
+# customer also requested a refund for a $100 purchase but no action was taken"
+# off a training aside where no refund was ever requested. A sentence whose own
+# payload is that nothing happened cannot be worth a permanent record.
+_NON_EVENT_RE = re.compile(
+    r"but (?:no|nothing) (?:action|further action|steps?|was) [\w ]*?"
+    r"(?:taken|done|required|needed)|no action was taken|nothing was done|"
+    r"but no action|but nothing came of|but (?:it|this) was not (?:pursued|acted)",
+    re.IGNORECASE)
+
+
+def _unquote_unverified(markdown: str, products: list) -> str:
+    """Strip the quotation marks from any product name that is not in the
+    catalog.
+
+    The policy says it outright - "never put an unverified phrase in quotation
+    marks; a quoted string is treated downstream as a real product name" - and
+    the model does it constantly with short mis-hears that `_is_garble` is
+    deliberately too conservative to catch: "Cork option paper", "boochoo",
+    "royalts", "Fauna", "the dealership". Deleting those claims would throw
+    away real events (a customer really did ask for something). Removing the
+    quotes keeps the event, drops the false authority, and leaves a reader in
+    no doubt that the wording came off a lossy mic.
+
+    Runs AFTER the catalog stage, so anything it could correct or annotate
+    already has been; what is left is genuinely unverified.
+    """
+    if not products:
+        return markdown
+    known = {_norm_name(str(p.get("name") or "")) for p in products}
+    known |= {n.rsplit(" ", 1)[0] for n in known if " " in n}
+    known.discard("")
+
+    def repl(m):
+        q = m.group(1)
+        if _norm_name(q) in known:
+            return m.group(0)
+        _warn(f'unquoted unverified name: "{q[:50]}"')
+        return q
+
+    return re.sub(r'"([^"\n]{3,80})"', repl, markdown)
+
+
+def _drop_non_events(markdown: str) -> str:
+    """Remove claims that report that nothing happened."""
+    def reject(text, is_bullet):
+        return "reports a non-event" if _NON_EVENT_RE.search(text) else None
+
+    return _edit_claims(markdown, reject)
 
 
 _REORDER_RE = re.compile(
     r"reorder|re-order|restock|re-stock|out of stock|unmet demand|confirm availability", re.I)
 
-# A bullet that claims money went missing...
-_DISCREPANCY_BULLET = re.compile(
+# Register line items that are not products and so prove nothing about stock.
+_GENERIC_SKUS = frozenset({"gift card", "gift cards", "gift certificate",
+                           "general item", "custom item", "shipping", "postage"})
+# How near the unavailability claim the sold product has to sit, in characters.
+_SOLD_NEAR_CHARS = 60
+
+# --- claim-level editing ------------------------------------------------------
+# Every gate below used to inspect ONLY lines starting with "-", which left the
+# narrative paragraphs completely ungated. On 2026-07-26 the discrepancy gate
+# correctly dropped "- Reconcile the register shortfall of $23.50" and the
+# identical invented figure shipped in paragraph one anyway - roughly half the
+# log's surface area was unprotected. A CLAIM is now a bullet line OR one
+# sentence of a narrative paragraph, and every gate runs over both.
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+# Parenthetical record references carry ids and amounts that came from the
+# RECORDS block, not from speech. They must never be fed to the money tests -
+# a correctly annotated real discrepancy would fail its own gate.
+_ANNOTATION_RE = re.compile(r"\([^)]*#\d[^)]*\)")
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Sentence split that survives money and ids: a boundary needs whitespace
+    after the stop, so "$23.50" and "#T-96892" stay intact."""
+    return [s for s in _SENTENCE_SPLIT.split(text.strip()) if s]
+
+
+def _edit_claims(markdown: str, reject) -> str:
+    """Drop every claim `reject(text, is_bullet) -> reason|None` rejects.
+
+    Bullets go whole. A rejected narrative sentence is removed from its
+    paragraph and the paragraph survives on its remaining sentences; a
+    paragraph left with nothing is dropped. Headings and blank lines pass
+    through untouched so the document structure is preserved.
+    """
+    out, para = [], []
+
+    def flush():
+        if not para:
+            return
+        joined = " ".join(l.strip() for l in para)
+        del para[:]
+        kept = []
+        for s in _split_sentences(joined):
+            why = reject(s, False)
+            if why:
+                _warn(f"dropped narrative sentence - {why}: {s[:70]}")
+            else:
+                kept.append(s)
+        if kept:
+            out.append(" ".join(kept))
+
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            flush()
+            out.append(line)
+        elif stripped.startswith(("-", "*")):
+            flush()
+            why = reject(line, True)
+            if why:
+                _warn(f"dropped bullet - {why}: {stripped[:70]}")
+            else:
+                out.append(line)
+        else:
+            para.append(line)
+    flush()
+    return "\n".join(out)
+
+
+# A claim that says money went missing...
+_DISCREPANCY_CLAIM = re.compile(
     r"discrepan|shortfall|short(?:fall)? of|came up short|over-?ring|unaccounted|"
     r"does ?n[o']?t match|reconcile the", re.I)
 # ...must correspond to somebody on the floor actually SAYING so. Deliberately
@@ -786,43 +1146,71 @@ _DISCREPANCY_SPEECH = re.compile(
     r"off by|unaccounted|over by|missing money|drawer is off", re.I)
 
 
+_MONEY_RE = re.compile(r"\$ ?([\d,]+(?:\.\d{2})?)")
+# How close a spoken amount has to sit to somebody reporting money wrong.
+DISCREPANCY_NEAR_LINES = int(os.environ.get("DISCREPANCY_NEAR_LINES", "12"))
+
+
+def _spoken_near_report(amount: str, lines: list[str], flags: list[bool]) -> bool:
+    """True when SOME spoken instance of `amount` sits within
+    DISCREPANCY_NEAR_LINES of somebody saying money is wrong.
+
+    "Was this amount spoken aloud?" is not a usable test on its own: in a shop
+    EVERY sale total is read out loud, so the check is satisfied by definition
+    and the gate is close to a no-op. Both invented shortfalls found in the
+    four-day audit - $37.66 on 07-19, $6.46 on 07-23 - were POS order totals
+    read to a customer hours away from any till talk. Proximity is what
+    separates a counter readout from a drawer that did not balance.
+    """
+    bare = amount.replace(",", "")
+    variants = {bare}
+    if "." not in bare:
+        variants.add(bare + ".00")
+    elif bare.endswith(".00"):
+        variants.add(bare[:-3])
+    pat = re.compile(r"(?<![\d.])(?:" +
+                     "|".join(re.escape(v) for v in sorted(variants)) + r")(?![\d])")
+    for i, ln in enumerate(lines):
+        if pat.search(ln):
+            lo, hi = max(0, i - DISCREPANCY_NEAR_LINES), i + DISCREPANCY_NEAR_LINES + 1
+            if any(flags[lo:hi]):
+                return True
+    return False
+
+
 def _reject_unsupported_discrepancies(markdown: str, transcript: str) -> str:
     """A register discrepancy has to be one someone noticed out loud.
 
     The summarizer invents these from ordinary money talk: "62.15 today" (a
     cashier reading a total) became "confirm the $62.15 register discrepancy",
     and a $50.31 sale became "reconcile the register shortfall of $50.31".
-    Three days running, and rewording the prompt did not stop it - the model
-    is pattern-matching the Unresolved format, not reading the day. So the
-    claim is now checked against the day's speech: no one reporting money
-    wrong means there is no discrepancy to reconcile, whatever amounts were
-    said aloud.
+    Rewording the prompt did not stop it - the model is pattern-matching the
+    Unresolved format, not reading the day. So the claim is checked against the
+    day's speech: no one reporting money wrong means there is no discrepancy,
+    whatever amounts were said aloud.
+
+    Runs over narrative sentences as well as bullets. That is not theoretical:
+    2026-07-26 shipped "A discrepancy in register: $23.50 unaccounted for" in
+    its first paragraph on a day where the string 23.50 appears nowhere in the
+    input, while the bullet carrying the same claim was correctly dropped.
     """
     if not transcript:
         return markdown
-    reported = bool(_DISCREPANCY_SPEECH.search(transcript))
-    out = []
-    for line in markdown.splitlines():
-        if line.lstrip().startswith(("-", "*")) and _DISCREPANCY_BULLET.search(line):
-            # Two independent tests, either of which sinks the bullet. The
-            # day-level one catches a day where nobody mentioned money going
-            # wrong at all. The amount test is needed as well, because on a day
-            # that DID have a real till problem the model still attaches the
-            # wrong figure - it lifted $50.31 from a sale and called it a
-            # shortfall. An amount nobody said aloud was not observed.
-            amounts = re.findall(r"\$ ?([\d,]+\.\d{2})", line)
-            unspoken = [a for a in amounts
-                        if not re.search(r"(?<!\d)" + re.escape(a.replace(",", "")) + r"(?!\d)",
-                                         transcript)]
-            if not reported:
-                _warn(f"dropped discrepancy bullet - no one reported one: {line.strip()[:70]}")
-                continue
-            if unspoken:
-                _warn(f"dropped discrepancy bullet - ${unspoken[0]} never said aloud: "
-                      f"{line.strip()[:60]}")
-                continue
-        out.append(line)
-    return "\n".join(out)
+    lines = transcript.splitlines()
+    flags = [bool(_DISCREPANCY_SPEECH.search(l)) for l in lines]
+    reported = any(flags)
+
+    def reject(text, is_bullet):
+        if not _DISCREPANCY_CLAIM.search(text):
+            return None
+        if not reported:
+            return "no one reported money wrong today"
+        for a in _MONEY_RE.findall(_ANNOTATION_RE.sub("", text)):
+            if not _spoken_near_report(a, lines, flags):
+                return f"${a} was never said near anyone reporting money wrong"
+        return None
+
+    return _edit_claims(markdown, reject)
 
 
 def _reject_sold_reorders(markdown: str, biz: dict) -> str:
@@ -838,26 +1226,39 @@ def _reject_sold_reorders(markdown: str, biz: dict) -> str:
     Deliberately NOT extended to catalog stock: "floor says out, website says in
     stock" is a real finding the log is supposed to surface (see
     _flag_stock_contradictions). Only an actual sale settles it.
+
+    Covers narrative sentences and unavailability claims, not just reorder
+    bullets. 2026-07-26 asserted in prose that a Nilgiri iced tea blend and a
+    Sandia Spice / immune-support pair were unavailable; the woven POS lines
+    proving all three sold were in the model's own input.
     """
     sold = set()
     for o in ((biz.get("sales") or {}).get("orders") or []):
         for it in (o.get("items") or []):
             n = _norm_name(str(it.get("name") or ""))
-            if len(n) >= 6:
+            if len(n) >= 6 and n not in _GENERIC_SKUS:
                 sold.add(n)
     if not sold:
         return markdown
-    out = []
-    for line in markdown.splitlines():
-        if line.lstrip().startswith(("-", "*")) and _REORDER_RE.search(line):
-            nline = _norm_name(line)
+
+    def reject(text, is_bullet):
+        nline = _norm_name(text)
+        for m in re.finditer(_REORDER_RE.pattern + "|" + _UNAVAILABLE_RE.pattern,
+                             nline, re.I):
+            # The sold product has to be what the claim is ABOUT. Without this
+            # window any sentence that merely contains the word "restocking"
+            # somewhere loses to an unrelated SKU elsewhere in it - a real
+            # finding about gift-card processing was deleted because "Gift
+            # Card" is also a line item on the day's register.
+            lo, hi = max(0, m.start() - _SOLD_NEAR_CHARS), m.end() + _SOLD_NEAR_CHARS
+            window = nline[lo:hi]
             hit = next((s for s in sold
-                        if re.search(r"\b" + re.escape(s) + r"\b", nline)), None)
+                        if re.search(r"\b" + re.escape(s) + r"\b", window)), None)
             if hit:
-                _warn(f"dropped reorder bullet - it sold today: {hit}")
-                continue
-        out.append(line)
-    return "\n".join(out)
+                return f'"{hit}" sold today, so it was in stock'
+        return None
+
+    return _edit_claims(markdown, reject)
 
 
 def _flag_stock_contradictions(markdown: str, products: list[dict]) -> str:
@@ -1436,6 +1837,11 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
             _gen(NOTES_SYSTEM, NOTES_TEMPLATE.format(i=i, n=len(chunks), chunk=ch), 500)
             for i, ch in enumerate(chunks, 1)
         ]
+        # Staff chat and records get their own notes pass and go FIRST, so they
+        # are not one raw block competing with ten slices of transcript notes.
+        if slack_block.strip():
+            notes.insert(0, _gen(NOTES_SYSTEM,
+                                 SIDE_NOTES_TEMPLATE.format(chunk=slack_block), 500))
         draft = _final("notes", "\n".join(notes))
 
     # Correlation pass: the draft was written reading chronologically, so a
@@ -1568,13 +1974,25 @@ def main():
     markdown = markdown.replace("⟦", "").replace("⟧", "")
     markdown = _validate_annotations(markdown, biz)
     markdown = _cap_bullet_lists(markdown)
+    # Everything the model was allowed to draw on. The echo gate needs all four
+    # sources: an item is only a prompt echo if it is in NONE of them.
+    grounding = "\n".join(filter(None, [
+        raw_speech if have_speech else "", slack_text,
+        _records_index(biz), _context_block(biz),
+    ]))
+    markdown = _reject_prompt_echoes(markdown, grounding)
+    markdown = _reject_training_artifacts(markdown, raw_speech if have_speech else "")
     # Before the stock flagger: otherwise a real catalog name buried inside a
     # garbled string ("…rye, brunckel, Strawberry Black") gets stock-flagged,
     # dressing mic noise up as a verified reorder.
-    markdown = _drop_garble_bullets(markdown)
+    markdown = _drop_garble_claims(markdown)
+    markdown = _drop_non_events(markdown)
     markdown = _reject_sold_reorders(markdown, biz)
     markdown = _reject_unsupported_discrepancies(markdown, raw_speech if have_speech else "")
     markdown = _flag_stock_contradictions(markdown, products)
+    # Last, so the catalog and stock stages still see the quotes they key on.
+    markdown = _unquote_unverified(markdown, products)
+    markdown = _fix_generic_opener(markdown)
     # Runs BEFORE the stats block is appended: timeclock names belong there,
     # what must not survive is a staff name attached to something they said.
     markdown = _strip_staff_attribution(markdown, _staff_names(biz, slack_names))
