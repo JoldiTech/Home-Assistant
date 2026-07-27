@@ -271,6 +271,37 @@ check("empty section marked", has(out, "_None._"), True)
 check("...populated section untouched", out.count("_None._"), 1)
 
 
+
+# --- vagueness ----------------------------------------------------------------
+print("\nvagueness gate")
+
+VP = [{"name": "Immune Support - Organic"}, {"name": "Earl Grey - Organic"}]
+md = ("## Worth remembering\n"
+      "- Specific feedback: customer expressed dissatisfaction with a product.\n"
+      "- Feedback on Immune Support: the texture is chalky.\n"
+      "- Staff flagged a discrepancy of 47 cents in the float.\n"
+      "- A customer asked whether we would restock for Diane.\n")
+out = P._drop_vague_bullets(md, VP)
+check("bullet naming nothing is dropped", has(out, "dissatisfaction"), False)
+check("...one naming a product survives", has(out, "immune support"), True)
+check("...one carrying a number survives", has(out, "47 cents"), True)
+check("...one carrying a name survives", has(out, "Diane"), True)
+
+# A bare whole-dollar figure is weak evidence and must sit ON the line where
+# money is reported wrong. 2026-07-21 regenerated with "$47 in the register".
+SPEECH_47 = "\n".join(
+    ["That will be 47 today.", "Thanks, have a good one."] + ["Chat."] * 6 +
+    ["Okay the drawer does not match."] + ["Chat."] * 6)
+out = P._reject_unsupported_discrepancies(
+    "## Unresolved\n- Reconcile the unresolved discrepancy of $47 in the register\n",
+    SPEECH_47)
+check("bare dollar amount far from the report is dropped", has(out, "$47"), False)
+SPEECH_47_SAME = "The drawer does not match, we are off by 47 dollars."
+out = P._reject_unsupported_discrepancies(
+    "## Unresolved\n- Reconcile the discrepancy of $47 in the register\n", SPEECH_47_SAME)
+check("...but survives on the same line as the report", has(out, "$47"), True)
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")

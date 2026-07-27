@@ -847,6 +847,40 @@ def _drop_record_name_lists(markdown: str, biz: dict) -> str:
     return _edit_claims(markdown, reject)
 
 
+def _drop_vague_bullets(markdown: str, products: list) -> str:
+    """Drop bullets that name nothing.
+
+    The policy states the test plainly - "a SPECIFIC fact is searchable
+    forever; a VAGUE line answers no future question at any length - cut it" -
+    and the model writes them anyway: "Specific feedback: customer expressed
+    dissatisfaction with a product", "Feedback on immune support blend: A
+    comment about its texture". A bullet carrying no product, no number and no
+    name cannot be looked up, checked, or acted on, and its presence makes a
+    thin day look covered.
+
+    Bullets only. A narrative sentence can legitimately be connective tissue;
+    an action item or a durable observation cannot.
+    """
+    known = sorted(({_norm_name(str(p.get("name") or "")) for p in (products or [])}
+                    - {""}), key=len, reverse=True)
+
+    def reject(text, is_bullet):
+        if not is_bullet:
+            return None
+        body = re.sub(r"^\s*[-*]\s*", "", text)
+        if re.search(r"\d", body):
+            return None                       # a number is a fact
+        nbody = _norm_name(body)
+        if any(k in nbody for k in known if len(k) >= 6):
+            return None                       # names a real product
+        # A capitalised word that is not sentence-initial is a name or a brand.
+        if re.search(r"(?<![.!?]\s)(?<!^)\b[A-Z][a-z]{2,}", body[1:]):
+            return None
+        return "names no product, number or person"
+
+    return _edit_claims(markdown, reject)
+
+
 def _mark_empty_sections(markdown: str) -> str:
     """A heading with nothing under it reads as a broken render, not as "there
     was nothing". Empty beats padded, but say so."""
@@ -1275,9 +1309,16 @@ def _spoken_near_report(amount: str, lines: list[str], flags: list[bool]) -> boo
         variants.add(bare[:-3])
     pat = re.compile(r"(?<![\d.])(?:" +
                      "|".join(re.escape(v) for v in sorted(variants)) + r")(?![\d])")
+    # A whole-dollar figure is weak evidence - "47" is a time, a quantity, a
+    # street number and half a price. 2026-07-21 regenerated with "an
+    # unresolved discrepancy of $47 in the register" and cleared the window
+    # test on an unrelated 47 nearby. Cents are specific enough to trust at a
+    # distance; a bare number has to be on the very line where somebody says
+    # money is wrong.
+    window = DISCREPANCY_NEAR_LINES if "." in bare else 0
     for i, ln in enumerate(lines):
         if pat.search(ln):
-            lo, hi = max(0, i - DISCREPANCY_NEAR_LINES), i + DISCREPANCY_NEAR_LINES + 1
+            lo, hi = max(0, i - window), i + window + 1
             if any(flags[lo:hi]):
                 return True
     return False
@@ -2100,6 +2141,7 @@ def main():
     markdown = _drop_credentials(markdown)
     markdown = _drop_overheard_quotes(markdown)
     markdown = _drop_record_name_lists(markdown, biz)
+    markdown = _drop_vague_bullets(markdown, products)
     markdown = _fix_generic_opener(markdown, biz)
     # Runs BEFORE the stats block is appended: timeclock names belong there,
     # what must not survive is a staff name attached to something they said.
