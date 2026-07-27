@@ -322,6 +322,12 @@ CAT = [{"name": "Ray's Cooler | Organic"}, {"name": "Bombilla - Stainless Steel 
 fixes, _review = P._match_catalog('A customer said the shop was "so cool".\n', CAT)
 check("common phrase is not renamed into a product",
       any("Ray" in n for _q, n in fixes), False)
+
+# The auto-fix tier pushing it to review is only half the guard: the review
+# tier renamed it anyway on 2026-07-26. Both paths must refuse.
+_fixes2, review2 = P._match_catalog('A customer said the shop was "so cool".\n', CAT)
+annotated, _n = P._annotate_catalog('A customer said the shop was "so cool".\n', review2)
+check("...and the review tier refuses it too", has(annotated, "Ray's Cooler"), False)
 fixes, _review = P._match_catalog(
     'A customer asked about the "Bombila - Stainles Steel | Bolt".\n', CAT)
 check("a real near-miss still gets corrected",

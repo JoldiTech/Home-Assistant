@@ -916,6 +916,26 @@ def _mark_empty_sections(markdown: str) -> str:
     return "\n".join(out)
 
 
+def _shares_substantive_word(qn: str, n: str) -> bool:
+    """A rename needs a substantive word in common, not just a good
+    character-level score.
+
+    Without this the matcher renamed the phrase "so cool" into "Ray's Cooler |
+    Organic" and shipped it as customer praise for a product nobody mentioned -
+    the same noise-promoted-to-product failure the garble gate exists to stop,
+    arriving through the correction path instead. Both correction tiers call
+    this: guarding one of two paths into the same edit is not guarding it.
+    """
+    import difflib
+    a = {w for w in qn.split() if len(w) >= 5}
+    b = {w for w in n.split() if len(w) >= 5}
+    if a & b:
+        return True
+    # Allow a near-miss on a long word ("stainless" vs "stainles").
+    return any(difflib.SequenceMatcher(None, x, y).ratio() >= 0.85
+               for x in a for y in b)
+
+
 def _match_catalog(markdown: str, products: list[dict]):
     """Split the draft's unknown quoted product names into deterministic
     auto-fixes and cases needing judgment.
@@ -943,20 +963,6 @@ def _match_catalog(markdown: str, products: list[dict]):
             return 1.0
         return ratio(" ".join(ta), " ".join(tb))
 
-    def shares_a_real_word(qn: str, n: str) -> bool:
-        """A rename needs a substantive word in common, not just a good
-        character-level score. Without this the matcher renamed the phrase
-        "so cool" into "Ray's Cooler | Organic" and put a product nobody
-        mentioned into the log as customer praise - the same
-        noise-promoted-to-product failure the garble gate exists to stop, but
-        arriving through the correction path instead."""
-        a = {w for w in qn.split() if len(w) >= 5}
-        b = {w for w in n.split() if len(w) >= 5}
-        if a & b:
-            return True
-        # Allow a near-miss on a long word ("stainless" vs "stainles").
-        return any(ratio(x, y) >= 0.85 for x in a for y in b)
-
     norm_to_name = _catalog_index(products)
     norms = list(norm_to_name)
     auto_fixes, review = [], []
@@ -971,7 +977,7 @@ def _match_catalog(markdown: str, products: list[dict]):
         top = scored[0][0] if scored else 0.0
         second = scored[1][0] if len(scored) > 1 else 0.0
         confident = top >= 0.93 or (top >= 0.72 and top - second >= 0.10)
-        if confident and not shares_a_real_word(qn, scored[0][1]):
+        if confident and not _shares_substantive_word(qn, scored[0][1]):
             _warn(f'catalog: refused to rename "{q[:40]}" -> '
                   f'"{norm_to_name[scored[0][1]]}" (no substantive word in common)')
             confident = False
@@ -996,6 +1002,17 @@ def _annotate_catalog(draft: str, review) -> tuple[str, int]:
         # Anise (0.63) don't.
         if _is_garble(q):
             _warn(f"catalog: refused to rename garble \"{q[:50]}\"")
+            continue
+        # Same substantive-word requirement as the auto-fix tier. Without it
+        # this path re-applies exactly what _match_catalog just refused: on
+        # 2026-07-26 "so cool" was pushed to review by the guard there and
+        # then renamed to "Ray's Cooler | Organic" here, shipping as praise
+        # for a product nobody mentioned. A guard on one of two paths into the
+        # same edit is not a guard.
+        if cands and not _shares_substantive_word(_norm_name(q),
+                                                  _norm_name(cands[0][0])):
+            _warn(f"catalog: refused to rename \"{q[:40]}\" -> "
+                  f"\"{cands[0][0]}\" (no substantive word in common)")
             continue
         if len(q) >= 5 and cands and cands[0][1] >= 0.65:
             _warn(f"catalog correction: \"{q}\" -> \"{cands[0][0]}\"")
