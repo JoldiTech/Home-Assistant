@@ -2232,7 +2232,18 @@ def _rebuild_bullet_sections(markdown: str, notes: list, products: list,
         limit = want if want is not None else SECTION_CAPS.get(heading, 5)
         found = _section_bullets(lines, heading)
         if not found:
-            continue
+            # The merge dropped the heading entirely. Skipping here was the
+            # obvious reading - no section, nothing to rebuild - and it
+            # defeated the whole point of building bullets from the notes:
+            # 2026-07-19 shipped a log with a narrative, a stats block, and
+            # not one bullet, out of 280 notes that were sitting right there.
+            # The merge is the stage least to be trusted, so the sections
+            # cannot be conditional on it having done its job. Create it.
+            _warn(f"{heading[3:]}: heading missing from the draft - creating it")
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines += [heading, ""]
+            found = _section_bullets(lines, heading)
         i, j, existing = found
         # A draft bullet is only privileged when the correlation pass gave
         # it a record reference the raw note cannot have. Otherwise it
@@ -2719,7 +2730,22 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
     slack_block = f"\n\nSLACK (staff work chat, real names OK per policy):\n{slack_text}" if slack_text else ""
     if context_text:
         slack_block += f"\n\n{context_text}"
-    INPUT_BUDGET = SUMMARIZER_CTX - 2600 - _tok(slack_block)  # room for system + template + output
+    # Room for the system prompt, the template around the body, and the
+    # generated log. This used to be a flat 2600 and was quietly too small:
+    # nothing noticed while the notes came to ~1700 tokens and never
+    # approached the budget, but the moment smaller slices filled it, a real
+    # day died on "Requested tokens (8195) exceed context window of 8192".
+    # Measure the reserve instead of guessing it - the system prompt is a long
+    # policy document and grows every time a rule is added to it.
+    _FINAL_MAX = 1200
+    _reserve = (max(_tok(SYSTEM_PROMPT), _tok(NOTES_SYSTEM))
+                + max(_tok(USER_TEMPLATE), _tok(FINAL_FROM_NOTES))
+                + _FINAL_MAX + 256)                 # 256: chat-template framing
+    INPUT_BUDGET = SUMMARIZER_CTX - _reserve - _tok(slack_block)
+    if INPUT_BUDGET < 500:
+        _warn(f"context {SUMMARIZER_CTX} leaves only {INPUT_BUDGET} tokens for "
+              f"input after a {_reserve}-token reserve - raise SUMMARIZER_CTX")
+        INPUT_BUDGET = 500
 
     def _gen(system, user, max_tokens, temperature=0.3):
         # "/no_think" is a Qwen3 HYBRID control token. Non-hybrid instruct models

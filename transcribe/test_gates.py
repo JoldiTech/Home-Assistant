@@ -738,6 +738,24 @@ check("no ranker at all is fine", P._llm_rank(CANDS, "## X", 3, None), CANDS)
 
 
 
+# --- the rebuild must not depend on the merge ---------------------------------
+print("\nrebuild when the merge drops a heading")
+
+# An overloaded merge prompt made the 8B emit a narrative and nothing else.
+# The rebuild skipped both sections because neither heading was there, and
+# 2026-07-19 shipped with zero bullets out of 280 notes. The merge is the
+# stage least to be trusted; the sections cannot be conditional on it.
+NARRATIVE_ONLY = "# Captain's Log — Sunday 2026-07-19\n\nThe day was busy.\n"
+FINDINGS = ["""- [PROBLEM] The label printer keeps reverting to settings that misprint
+- [UNMET] A customer asked for saffron, which we don't carry"""]
+out = P._rebuild_bullet_sections(NARRATIVE_ONLY, FINDINGS, [])
+check("a missing Unresolved heading is created", has(out, "## Unresolved"), True)
+check("a missing Worth remembering heading is created",
+      has(out, "## Worth remembering"), True)
+check("...and the notes reach it", has(out, "label printer"), True)
+check("...without disturbing the narrative", has(out, "the day was busy"), True)
+
+
 # --- notes must fit the merge prompt ------------------------------------------
 print("\nnotes trimming for the merge")
 
