@@ -1462,6 +1462,77 @@ def _spoken_near_report(amount: str, lines: list[str], flags: list[bool]) -> boo
     return False
 
 
+_OVER_SPEECH = re.compile(
+    r"we'?re over|we were over|came up over|over by|"
+    r"drawer is \$?[\d,.]+ more|charged (?:people|someone|her|him|them|the customer)"
+    r"(?: an extra| more)|charged (?:someone |them |her |him )?twice|double.?charg", re.I)
+_SHORT_SPEECH = re.compile(
+    r"came up short|we'?re short|is short|short by|shortfall|missing money", re.I)
+_SHORT_WORDING = re.compile(r"\bshort(?:fall)?\b|\bcame up short\b|\bmissing\b", re.I)
+
+
+def _fix_discrepancy_direction(markdown: str, transcript: str) -> str:
+    """Say which way the drawer was wrong.
+
+    2026-07-19's drawer was $70 OVER, with a card sale that looked declined
+    possibly charging a customer twice. The log called it "an unexplained
+    register shortfall of $70" - the opposite, and not a wording quibble:
+    short means money is missing, over means somebody was overcharged, and
+    tomorrow's investigation starts in a different place.
+
+    Direction comes from the speech near the amount, never from the model.
+    """
+    if not transcript:
+        return markdown
+    lines = transcript.splitlines()
+    over = [bool(_OVER_SPEECH.search(l)) for l in lines]
+    short = [bool(_SHORT_SPEECH.search(l)) for l in lines]
+
+    def direction(amount: str) -> str | None:
+        bare = amount.replace(",", "")
+        pat = re.compile(r"(?<![\d.])" + re.escape(bare) + r"(?![\d])")
+        near_over = near_short = False
+        for i, ln in enumerate(lines):
+            if not pat.search(ln):
+                continue
+            lo, hi = max(0, i - DISCREPANCY_NEAR_LINES), i + DISCREPANCY_NEAR_LINES + 1
+            near_over = near_over or any(over[lo:hi])
+            near_short = near_short or any(short[lo:hi])
+        if near_over and not near_short:
+            return "over"
+        return None
+
+    out = []
+    for line in markdown.splitlines():
+        if _DISCREPANCY_CLAIM.search(line) and _SHORT_WORDING.search(line):
+            amounts = _MONEY_RE.findall(_ANNOTATION_RE.sub("", line))
+            if any(direction(a) == "over" for a in amounts):
+                fixed = re.sub(r"\bshortfall\b", "overage", line, flags=re.I)
+                fixed = re.sub(r"\bcame up short\b", "came up over", fixed, flags=re.I)
+                fixed = re.sub(r"\bshort\b", "over", fixed, flags=re.I)
+                if fixed != line:
+                    _warn(f"discrepancy direction corrected to OVER: {fixed.strip()[:60]}")
+                line = fixed
+        out.append(line)
+    return "\n".join(out)
+
+
+def _drop_stray_sections(markdown: str) -> str:
+    """The format has exactly two bullet sections. The model invents others -
+    2026-07-19 emitted a third, "## Annotated", duplicating a bullet already in
+    Unresolved. An unknown heading and everything under it is dropped."""
+    keep = ("## unresolved", "## worth remembering")
+    out, skipping = [], False
+    for line in markdown.splitlines():
+        if line.startswith("## "):
+            skipping = line.strip().lower() not in keep
+            if skipping:
+                _warn(f"dropped stray section: {line.strip()[:40]}")
+        if not skipping:
+            out.append(line)
+    return "\n".join(out)
+
+
 def _reject_unsupported_discrepancies(markdown: str, transcript: str) -> str:
     """A register discrepancy has to be one someone noticed out loud.
 
@@ -2432,6 +2503,8 @@ def main():
         md = _drop_record_name_lists(md, biz)
         md = _drop_vague_bullets(md, products)
         md = _drop_personal_health(md)
+        md = _fix_discrepancy_direction(md, raw_speech if have_speech else "")
+        md = _drop_stray_sections(md)
         return md
 
     markdown = gates(markdown)

@@ -503,6 +503,32 @@ out = P._reject_unsupported_discrepancies(
 check("...an unrelated bare figure is still dropped", has(out, "$47"), False)
 
 
+
+# --- which way was the drawer wrong -------------------------------------------
+print("\ndiscrepancy direction / stray sections")
+
+out = P._fix_discrepancy_direction(
+    "- Investigate unexplained register shortfall of $70\n", SPEECH_OVER)
+check("an OVER drawer is not called a shortfall", has(out, "shortfall"), False)
+check("...it is called an overage", has(out, "overage"), True)
+check("...and the amount is untouched", has(out, "$70"), True)
+
+# A genuine shortfall keeps its wording.
+SPEECH_SHORT = "\n".join([
+    "Let us count it again.", "We came up short by $70 today.", "No idea why."])
+out = P._fix_discrepancy_direction(
+    "- Investigate unexplained register shortfall of $70\n", SPEECH_SHORT)
+check("a real shortfall is left alone", has(out, "shortfall"), True)
+
+out = P._drop_stray_sections(
+    "# Log\n\nBody.\n\n## Unresolved\n- a\n\n## Annotated\n- a\n\n"
+    "## Worth remembering\n- b\n")
+check("stray section dropped", has(out, "## Annotated"), False)
+check("...its duplicated bullet goes with it", out.count("- a"), 1)
+check("...the real sections survive",
+      has(out, "## Unresolved") and has(out, "## Worth remembering"), True)
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")
