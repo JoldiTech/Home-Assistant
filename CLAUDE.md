@@ -554,6 +554,59 @@ called** — the summarizer simply collided with Chloe instead of asking her to
 release the card. It is wired in now; Chloe's `/api/release-gpu` works and is
 loopback-only.
 
+#### The prompts are an input, and the 8B model treats them as content
+
+Established by writing four logs by hand from the pipeline's exact input
+(2026-07-19/21/23/26) and diffing them against what shipped — see
+`captains_log/EVALUATION-4-day-blind-rewrite.md`, and the hand-written controls
+in `captains_log/evaluation/`. **Any concrete noun in a prompt WILL appear in a
+log**, on days it has nothing to do with:
+
+- `"restock XL gloves"` was a privacy example. "Reorder XL gloves" shipped on
+  all four days; the real Slack request exists once, in the 07-23 window, and
+  on two of those days it had not been made yet.
+- `"a customer asked about teas safe during pregnancy"` was a linkage example.
+  It shipped twice; `pregnan` appears in none of the four inputs.
+- The POS **format** example was `"[14:32] ⟦POS $23.50 — Earl Grey 2oz ×1⟧"`.
+  2026-07-26 shipped "A discrepancy in register: $23.50 unaccounted for". Not a
+  hallucination — a copy.
+
+Everything concrete in every prompt is now a `[bracketed]` slot, with
+`_reject_prompt_echoes` as a backstop and a test asserting the blocklist is
+empty. **Do not put a real product, supply, amount or situation in a prompt,
+even as an illustration.** If you must illustrate, bracket it.
+
+#### Three more things that were only true of bullets
+
+- **Gates ran on lines starting with `-` only.** The narrative — half the log —
+  was ungated for months. 07-26's run log shows the discrepancy gate correctly
+  dropping the `$23.50` bullet while the identical claim shipped in paragraph
+  one. `_edit_claims` now treats a narrative *sentence* as a claim too.
+- **"Was the amount spoken aloud?" cannot discriminate.** Every sale total in a
+  shop is read out loud, so the test is satisfied by definition. Both invented
+  shortfalls ($37.66, $6.46) were POS order totals read to a customer. The test
+  is now proximity to somebody actually reporting money wrong.
+- **A sale is proof of stock — in prose as well.** 07-26 asserted two products
+  were unavailable that the woven POS lines in its own input show sold minutes
+  earlier.
+
+#### Not all speech about products is a customer request
+
+2026-07-21 was a register-training day. A trainer said *"I want to give you some
+fake orders"* and read out three inventions; all three became the log's opening
+sentence, quoted, as genuine unmet demand. `_reject_training_artifacts` drops a
+quoted name that occurs only inside a training window. Watch for the same shape
+elsewhere: staff rehearsing, reading a catalog aloud, or quoting a customer from
+another day are all speech *about* orders, not orders.
+
+#### ⚠ The raw transcripts contain a credential
+
+The 2026-07-19 transcript records the shop's **password practice**, said aloud
+during POS training. It did not reach the log — but transcripts are retained on
+the AI box (`~/captains_transcripts/`) in plain text. Treat that directory as
+secret-bearing: never paste one into a PR, an issue, or a chat log, and delete
+transcripts once the debugging window closes.
+
 #### Verification traps that cost real time here
 
 Every one of these produced a confident wrong conclusion at least once:
