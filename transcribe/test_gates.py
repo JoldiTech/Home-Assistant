@@ -738,6 +738,34 @@ check("no ranker at all is fine", P._llm_rank(CANDS, "## X", 3, None), CANDS)
 
 
 
+# --- notes must fit the merge prompt ------------------------------------------
+print("\nnotes trimming for the merge")
+
+# Smaller notes slices mean more note blocks, and the merge prompt has a budget
+# the notes pass does not. Trimming is fine; trimming the RECORDS block is the
+# exact failure this area keeps having, so it is never the one dropped.
+tok = lambda s: len(s.split())                    # words stand in for tokens
+SIDE = ["records block " * 10]
+AUDIO = [f"audio block {i} " * 10 for i in range(9)]
+
+check("notes that fit are passed through whole",
+      P._fit_notes(tok, SIDE + AUDIO, 1, 10_000), "\n".join(SIDE + AUDIO))
+
+out = P._fit_notes(tok, SIDE + AUDIO, 1, 60)
+check("over budget, the result fits", tok(out) <= 60, True)
+check("...the records block survives the trim", has(out, "records block"), True)
+check("...and it is the LATEST audio that goes", has(out, "audio block 8"), False)
+check("...while the earliest audio stays", has(out, "audio block 0"), True)
+
+# A budget too small for even the records block must not loop forever or
+# return nothing - one block is the floor.
+out = P._fit_notes(tok, SIDE + AUDIO, 1, 1)
+check("an impossible budget still returns the records block", out, SIDE[0])
+check("no records block means no special case",
+      P._fit_notes(tok, AUDIO, 0, 1), AUDIO[0])
+check("empty notes are fine", P._fit_notes(tok, [], 0, 10), "")
+
+
 # --- records get reserved slots -----------------------------------------------
 print("\nrecords reservation")
 

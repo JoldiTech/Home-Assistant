@@ -81,6 +81,9 @@ _NOTHINK = os.environ.get("SUMMARIZER_NOTHINK", "1") != "0"
 # Let the model re-order the candidate bullets by consequence. Measured and
 # OFF - see _llm_rank for the numbers and for why it loses.
 SUMMARIZER_RANK = os.environ.get("SUMMARIZER_RANK", "0") != "0"
+# How much transcript the notes pass reads at once. Smaller than the context
+# window on purpose - see the chunking call in _summarize for the measurement.
+NOTES_SLICE_TOKENS = int(os.environ.get("NOTES_SLICE_TOKENS", "2200"))
 
 DEFAULT_REPO = "JoldiTech/Home-Assistant"
 LOG_BRANCH = "captains-log"
@@ -424,16 +427,19 @@ NOTES_SYSTEM = SYSTEM_PROMPT + (
     "or thought - write 'a staff request to reorder [the item]', not '[name] "
     "asked for it'. Nothing in [square brackets] is content; fill those slots "
     "from this slice only. No format headers - just bullets. At most 8 bullets "
-    "per slice.\n\nStart EVERY bullet with one tag in square brackets, chosen "
-    "from exactly this list:\n"
+    "per slice.\n\nStart EVERY bullet with one tag in square brackets. These "
+    "are the usual ones:\n"
     "[UNMET] a product/size/service asked for and not available\n"
     "[PROBLEM] something broken, failing, miscounted, mis-priced or unsafe\n"
     "[PROMISE] something staff committed to - a hold, callback, special order\n"
     "[FEEDBACK] specific praise or complaint about a named product or the shop\n"
     "[CAUSE] the stated reason behind something - weather, an event, staffing\n"
     "[TRAFFIC] the one bullet on how busy the slice felt\n"
-    "The tag is how these survive being merged with a dozen other slices; a "
-    "bullet without one is discarded."
+    "If a real finding fits NONE of them, invent a tag for it rather than "
+    "dropping it - [SAFETY], [STORAGE], [SUPPLY] and the like are all fine. "
+    "Never discard something worth recording because no tag on this list fit "
+    "it. The tag is only how these survive being merged with a dozen other "
+    "slices; a bullet without one is discarded."
 )
 
 
@@ -2596,6 +2602,29 @@ def _chunk_by_tokens(llm, text: str, budget: int) -> list[str]:
     return chunks
 
 
+def _fit_notes(tok, notes: list, n_side: int, budget: int) -> str:
+    """Join the note blocks for the merge prompt, dropping from the END if they
+    do not fit.
+
+    Records notes are the first `n_side` blocks and are never the ones dropped:
+    they are one block against a dozen, they are the material somebody actually
+    wrote down, and losing them is the failure this whole area keeps having.
+    Audio blocks are dropped latest-first so the day still reads in order.
+    """
+    if not notes:
+        return ""
+    total = tok("\n".join(notes))
+    if total <= budget:
+        return "\n".join(notes)
+    keep = list(notes)
+    while len(keep) > max(n_side, 1) and tok("\n".join(keep)) > budget:
+        keep.pop()
+    _warn(f"notes {total} tokens over the {budget} merge budget: "
+          f"merging {len(keep)} of {len(notes)} blocks "
+          f"(the rest still reach the bullet sections)")
+    return "\n".join(keep)
+
+
 def _strip_think(text: str) -> str:
     """Qwen3 emits <think>...</think> reasoning by default. Even with /no_think we
     strip it defensively so raw reasoning tokens never reach the log."""
@@ -2696,13 +2725,32 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
         draft = _final("transcript", compact)
     else:
         # Long day: chunk -> notes per slice -> merge into the log.
-        chunks = _chunk_by_tokens(llm, compact, INPUT_BUDGET)
+        #
+        # The notes slice is deliberately SMALLER than the prompt would allow.
+        # Sizing it to the context window is the obvious thing and it starves
+        # the log: handed ~5k tokens of conversation the model writes about
+        # five bullets and stops, well under its own cap of eight, so raising
+        # the cap changes nothing (measured - 12 did not beat 8). What it
+        # leaves out is not the trivia. On 2026-07-19 six of the day's nine
+        # findings never made it into the notes at all, and five of those six
+        # were sitting in the audio it had just read: the exposed wiring, the
+        # dying remote batteries, the missed clock-out, the register training,
+        # the dissolved pickup order. Nothing downstream can recover a finding
+        # that was never written down, which makes this stage - not the
+        # ranking, not the gates - the ceiling on the whole log.
+        chunks = _chunk_by_tokens(llm, compact,
+                                  min(INPUT_BUDGET, NOTES_SLICE_TOKENS))
         _warn(f"long day: {len(chunks)} slices -> notes -> final")
         notes += [
             _gen(NOTES_SYSTEM, NOTES_TEMPLATE.format(i=i, n=len(chunks), chunk=ch), 500)
             for i, ch in enumerate(chunks, 1)
         ]
-        draft = _final("notes", "\n".join(notes))
+        # More slices mean more notes, and the merge prompt has a budget the
+        # notes pass does not. Trim for the MERGE only - `notes` goes to the
+        # section rebuild whole, so a note dropped here can still reach the
+        # log as a bullet; it just doesn't get to shape the narrative.
+        merged = _fit_notes(_tok, notes, n_side, INPUT_BUDGET)
+        draft = _final("notes", merged)
 
     # Correlation pass: the draft was written reading chronologically, so a
     # late-day conversation can't cite the earlier order it concerns. Re-read
