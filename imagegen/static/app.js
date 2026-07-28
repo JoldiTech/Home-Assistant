@@ -208,6 +208,16 @@ async function renderSettings() {
     <textarea id="img-prefix" rows="3"></textarea>
     <button id="save-prompts">save prompts</button>
     <p id="prompts-status"></p>
+    <h3 style="margin-top:2rem">group chat (personas)</h3>
+    <p style="color:#888;font-size:.85rem">when enabled, every persona replies each turn, one after another
+      (each one sees the previous reply and can respond to it). address a persona by name and they answer first.</p>
+    <label><input type="checkbox" id="group-mode"> enable group chat</label>
+    <label>your name (what the assistants call you)</label>
+    <input id="user-name" placeholder="You" autocomplete="off">
+    <div id="personas-list"></div>
+    <button id="add-persona" type="button">+ add persona</button>
+    <button id="save-group">save group settings</button>
+    <p id="group-status"></p>
     <h3 style="margin-top:2rem">change password</h3>
     <p style="color:#888;font-size:.85rem">this password unlocks the app AND is the encryption key.
       changing it re-encrypts saved prompts and logs everyone out.</p>
@@ -218,12 +228,75 @@ async function renderSettings() {
   $("back").addEventListener("click", (e) => { e.preventDefault(); showModePicker(); });
   $("save-prompts").addEventListener("click", onSavePrompts);
   $("change-pass").addEventListener("click", onChangePassword);
+  $("add-persona").addEventListener("click", () => addPersonaCard());
+  $("save-group").addEventListener("click", onSaveGroup);
   try {
     const p = await apiCall("/api/get-prompts", {});
     $("sys-prompt").value = p.system_prompt || "";
     $("img-prefix").value = p.image_prompt_prefix || "";
+    $("group-mode").checked = !!p.group_mode;
+    $("user-name").value = p.user_name || "";
+    renderPersonaCards(p.personas || []);
   } catch (err) {
     $("prompts-status").textContent = "couldn't load current prompts";
+  }
+}
+
+// --- group-chat persona editor ------------------------------------------------
+
+function personaCardEl(p) {
+  const wrap = document.createElement("div");
+  wrap.className = "persona-card";
+  wrap.style.cssText = "border:1px solid #333;border-radius:6px;padding:.6rem;margin:.5rem 0";
+  const name = document.createElement("input");
+  name.placeholder = "name (e.g. Ada)"; name.className = "persona-name";
+  name.value = (p && p.name) || "";
+  const per = document.createElement("textarea");
+  per.placeholder = "personality / instructions for this assistant";
+  per.rows = 3; per.className = "persona-personality";
+  per.value = (p && p.personality) || "";
+  const rm = document.createElement("button");
+  rm.type = "button"; rm.textContent = "remove";
+  rm.addEventListener("click", () => wrap.remove());
+  wrap.append(name, per, rm);
+  return wrap;
+}
+
+function renderPersonaCards(list) {
+  const box = $("personas-list");
+  box.innerHTML = "";
+  (list || []).forEach((p) => box.appendChild(personaCardEl(p)));
+}
+
+function addPersonaCard() {
+  $("personas-list").appendChild(personaCardEl(null));
+}
+
+function collectPersonas() {
+  return [...document.querySelectorAll("#personas-list .persona-card")].map((c) => ({
+    name: c.querySelector(".persona-name").value.trim(),
+    personality: c.querySelector(".persona-personality").value.trim(),
+  })).filter((p) => p.name);
+}
+
+async function onSaveGroup() {
+  const btn = $("save-group");
+  btn.disabled = true;
+  $("group-status").textContent = "saving...";
+  try {
+    // set-prompts requires the two base prompts too, so include them from the form.
+    const res = await apiCall("/api/set-prompts", {
+      system_prompt: $("sys-prompt").value,
+      image_prompt_prefix: $("img-prefix").value,
+      group_mode: $("group-mode").checked,
+      user_name: $("user-name").value,
+      personas: collectPersonas(),
+    });
+    $("group-status").textContent = res.error ? res.error : "saved (encrypted at rest)";
+  } catch (err) {
+    $("group-status").textContent = "save failed";
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -474,6 +547,7 @@ function renderChat() {
         <form id="chat-form">
           <textarea id="chat-message" rows="2" placeholder="say something..." autofocus required></textarea>
           <button type="submit" id="send-btn">send</button>
+          <button type="button" id="skip-btn" style="display:none" title="let the assistants talk to each other for one round, without you">skip my turn &rarr;</button>
           <button type="button" id="stop-btn" style="display:none">stop</button>
           ${imgControls}
         </form>
@@ -490,6 +564,7 @@ function renderChat() {
   });
   $("chat-form").addEventListener("submit", onChatSubmit);
   $("stop-btn").addEventListener("click", onChatStop);
+  if ($("skip-btn")) $("skip-btn").addEventListener("click", onSkipTurn);
   if ($("get-image-btn")) $("get-image-btn").addEventListener("click", onGetImage);
 }
 
@@ -522,11 +597,11 @@ function openLightbox(b64png) {
   box.classList.add("open");
 }
 
-function appendMessage(role, text) {
+function appendMessage(role, text, speaker) {
   const div = document.createElement("div");
-  div.className = "msg " + role;
+  div.className = "msg " + role + (speaker ? " persona" : "");
   const label = document.createElement("b");
-  label.textContent = role === "user" ? "you: " : "assistant: ";
+  label.textContent = speaker ? (speaker + ": ") : (role === "user" ? "you: " : "assistant: ");
   div.appendChild(label);
   const span = document.createElement("span");
   span.textContent = text;
@@ -548,12 +623,12 @@ function appendGalleryImage(b64png) {
 // server-side history, so edits/deletes target the exact message the model
 // conditions on. Editing an assistant reply rewrites what the model "said" for
 // every future turn - the way out of a stuck merge-model register.
-function makeBubble(index, role, content) {
+function makeBubble(index, role, content, name) {
   const div = document.createElement("div");
-  div.className = "msg " + role;
+  div.className = "msg " + role + (name ? " persona" : "");
   div.dataset.index = String(index);
   const label = document.createElement("b");
-  label.textContent = role === "user" ? "you: " : "assistant: ";
+  label.textContent = name ? (name + ": ") : (role === "user" ? "you: " : "assistant: ");
   div.appendChild(label);
   const span = document.createElement("span");
   span.className = "msg-text";
@@ -578,7 +653,7 @@ function makeBubble(index, role, content) {
 function renderTranscript(history) {
   const t = $("transcript");
   t.innerHTML = "";
-  (history || []).forEach((m, i) => t.appendChild(makeBubble(i, m.role, m.content)));
+  (history || []).forEach((m, i) => t.appendChild(makeBubble(i, m.role, m.content, m.name)));
   if (t.lastElementChild) t.lastElementChild.scrollIntoView({ block: "end" });
 }
 
@@ -640,35 +715,42 @@ async function refreshTranscript() {
 
 async function loadState(mode) {
   try {
-    const { history, gallery } = await apiCall("/api/state", { mode });
+    const { history, gallery, group_mode } = await apiCall("/api/state", { mode });
     renderTranscript(history || []);
     if (gallery) for (const img of gallery) appendGalleryImage(img);
+    if (group_mode && $("skip-btn")) $("skip-btn").style.display = "";
   } catch (err) {
     // fresh conversation, nothing to load
   }
 }
 
-async function onChatSubmit(e) {
-  e.preventDefault();
-  const message = $("chat-message").value.trim();
-  if (!message) return;
-  $("chat-message").value = "";
-  appendMessage("user", message);
+// Shared streaming turn. bodyObj is {message} for a normal turn or
+// {advance:true} to "skip my turn" (personas continue talking to each other,
+// no user message). The reply streams as newline-delimited encrypted envelopes:
+// single-Chloe mode emits {delta}/{replace}/{done} for one bubble; group mode
+// tags events with {speaker} and brackets each persona with {start}/{end}, so
+// we open a fresh bubble per persona - each types to completion, in turn.
+async function streamTurn(bodyObj) {
   const btn = $("send-btn");
+  const skipBtn = $("skip-btn");
   btn.disabled = true;
+  if (skipBtn) skipBtn.disabled = true;
   const stopBtn = $("stop-btn");
   stopBtn.style.display = "";
   stopBtn.disabled = false;
   $("chat-status").textContent = "thinking...";
-  const span = appendMessage("assistant", "");
+  let curSpan = null, curSpeaker = null, text = "";
+  const ensureBubble = (speaker) => {
+    if (curSpan && curSpeaker === (speaker || null)) return;
+    curSpeaker = speaker || null;
+    curSpan = appendMessage("assistant", "", speaker || undefined);
+    text = "";
+  };
   try {
-    // The reply streams as newline-delimited encrypted envelopes: each line
-    // decrypts to {delta} to append, {replace} to retract-and-rewrite (the
-    // server's live channel-token filter), {error}, or {done}.
     const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(await encryptEnvelope({ message })),
+      body: JSON.stringify(await encryptEnvelope(bodyObj)),
     });
     if (res.status === 401) {
       showLogin("session expired - enter password again");
@@ -680,7 +762,7 @@ async function onChatSubmit(e) {
     }
     const reader = res.body.getReader();
     const dec = new TextDecoder();
-    let buf = "", text = "";
+    let buf = "";
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -691,22 +773,41 @@ async function onChatSubmit(e) {
         buf = buf.slice(nl + 1);
         if (!line) continue;
         const obj = await decryptEnvelope(JSON.parse(line));
-        if (obj.delta) { text += obj.delta; span.textContent = text; }
-        else if (obj.replace !== undefined) { text = obj.replace; span.textContent = text; }
-        else if (obj.error) throw new Error(obj.error);
+        if (obj.error) throw new Error(obj.error);
+        if (obj.done || obj.start) continue;          // start is advisory; bubble opens on first text
+        if (obj.end) { curSpan = null; curSpeaker = null; continue; }
+        const sp = obj.speaker;                       // undefined => single-Chloe reply
+        if (obj.delta) { ensureBubble(sp); text += obj.delta; curSpan.textContent = text; }
+        else if (obj.replace !== undefined) { ensureBubble(sp); text = obj.replace; curSpan.textContent = text; }
       }
-      span.parentElement.scrollIntoView({ block: "end" });
+      if (curSpan) curSpan.parentElement.scrollIntoView({ block: "end" });
     }
-    if (!text) span.parentElement.remove();
+    if (curSpan && !text) curSpan.parentElement.remove();
     $("chat-status").textContent = "";
   } catch (err) {
-    if (!span.textContent) span.parentElement.remove();
+    if (curSpan && !curSpan.textContent) curSpan.parentElement.remove();
     $("chat-status").textContent = err.message || "failed to get a reply";
   } finally {
     btn.disabled = false;
+    if (skipBtn) skipBtn.disabled = false;
     if ($("stop-btn")) $("stop-btn").style.display = "none";
     await refreshTranscript();   // replace live bubbles with indexed, editable ones
   }
+}
+
+async function onChatSubmit(e) {
+  e.preventDefault();
+  const message = $("chat-message").value.trim();
+  if (!message) return;
+  $("chat-message").value = "";
+  appendMessage("user", message);
+  await streamTurn({ message });
+}
+
+// "Skip my turn": one round where every persona replies with no input from you,
+// so they respond to each other. Push again for another round.
+async function onSkipTurn() {
+  await streamTurn({ advance: true });
 }
 
 function appendPlaceholder() {
