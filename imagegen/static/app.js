@@ -104,6 +104,14 @@ async function decryptEnvelope(envelope) {
   return JSON.parse(new TextDecoder().decode(plaintext));
 }
 
+async function readJson(res) {
+  // Not every error body is JSON: an unhandled server error or a proxy 502
+  // arrives as plain text, and parsing that throws a SyntaxError whose message
+  // ("Unexpected token 'I'") hides the actual status from the user.
+  const text = await res.text();
+  try { return JSON.parse(text); } catch { return null; }
+}
+
 async function apiCall(path, payload) {
   const body = payload === undefined ? "{}" : JSON.stringify(await encryptEnvelope(payload));
   const res = await fetch(path, {
@@ -115,12 +123,13 @@ async function apiCall(path, payload) {
     showLogin("session expired - enter password again");
     throw new Error("session expired");
   }
-  const raw = await res.json();
+  const raw = await readJson(res);
   if (!res.ok) {
     // Error bodies (503 GPU-busy, 500) are plain JSON, not envelopes -
     // surface the server's actual reason instead of a generic failure.
-    throw new Error(raw.error || `request failed (${res.status})`);
+    throw new Error((raw && raw.error) || `request failed (${res.status})`);
   }
+  if (!raw) throw new Error("unreadable response from server");
   return decryptEnvelope(raw);
 }
 
@@ -153,7 +162,14 @@ async function onLoginSubmit(e) {
   try {
     const { authBytes, encBytes } = await deriveKeys(password);
     const chRes = await fetch("/api/challenge", { method: "POST" });
-    const { nonce, server_pub } = await chRes.json();
+    const challenge = chRes.ok ? await readJson(chRes) : null;
+    if (!challenge) {
+      // Distinguish "server is unhappy" from "wrong password" - otherwise a
+      // restarting service reads as a rejected login.
+      showLogin("server is not responding - try again in a moment");
+      return;
+    }
+    const { nonce, server_pub } = challenge;
     const nonceBytes = b64d(nonce);
     const proof = await hmacProof(authBytes, nonceBytes);
     const { sessKey, clientPubB64 } = await deriveSessionKey(authBytes, nonceBytes, server_pub);
@@ -659,8 +675,8 @@ async function onChatSubmit(e) {
       throw new Error("session expired");
     }
     if (!res.ok) {
-      const raw = await res.json();
-      throw new Error(raw.error || `request failed (${res.status})`);
+      const raw = await readJson(res);
+      throw new Error((raw && raw.error) || `request failed (${res.status})`);
     }
     const reader = res.body.getReader();
     const dec = new TextDecoder();

@@ -31,6 +31,7 @@ Design constraints (deliberate, do not "fix"):
 """
 import asyncio
 import base64
+import binascii
 import concurrent.futures
 import contextvars
 import ctypes
@@ -57,6 +58,7 @@ import warnings
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
@@ -421,11 +423,33 @@ def _encrypt(obj, aesgcm=None) -> dict:
     return {"nonce": base64.b64encode(nonce).decode(), "ciphertext": base64.b64encode(ciphertext).decode()}
 
 
+class StaleSessionKey(Exception):
+    """Envelope didn't decrypt under this session's key.
+
+    Cookies are per-host, not per-tab: after a restart (or a password change)
+    a re-login mints a new session key and overwrites the shared cookie, so an
+    older tab still holding the previous key sends valid-cookie/wrong-key
+    requests. That is an expired client, not a server fault - answer 401 so the
+    browser re-prompts, instead of a 500 the client can't even parse.
+    """
+
+
 def _decrypt(envelope: dict, aesgcm=None):
     aesgcm = aesgcm or _current_aesgcm.get() or _aesgcm
-    nonce = base64.b64decode(envelope["nonce"])
-    ciphertext = base64.b64decode(envelope["ciphertext"])
-    return json.loads(aesgcm.decrypt(nonce, ciphertext, None))
+    try:
+        nonce = base64.b64decode(envelope["nonce"])
+        ciphertext = base64.b64decode(envelope["ciphertext"])
+    except (KeyError, TypeError, ValueError, binascii.Error) as e:
+        raise StaleSessionKey("malformed envelope") from e
+    try:
+        return json.loads(aesgcm.decrypt(nonce, ciphertext, None))
+    except InvalidTag as e:
+        raise StaleSessionKey("session key mismatch") from e
+
+
+@app.exception_handler(StaleSessionKey)
+async def _stale_session_key_handler(request: Request, exc: StaleSessionKey):
+    return JSONResponse({"error": "session expired - please log in again"}, status_code=401)
 
 
 SECURITY_HEADERS = {

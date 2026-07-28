@@ -772,6 +772,17 @@ the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
   (confirmed OOM at 16 GB+) via per-thread CUDA state. Conversation-with-images
   generates the image in the background (client polls `/api/image-status`),
   keeping any single request under Cloudflare's ~100 s origin timeout.
+- **`Unexpected token 'I', "Internal S"... is not valid JSON` in the browser
+  means a STALE SESSION KEY, not a broken server.** Session cookies are
+  per-host, not per-tab: after a restart (or a password change) a re-login mints
+  a new session key and overwrites the shared cookie, so any still-open older
+  tab sends a valid cookie with the *previous* key. `_decrypt` raised
+  `InvalidTag`, FastAPI returned a plain-text 500, and the client's `res.json()`
+  choked on the "I" of "Internal Server Error" — burying the real cause. Fixed
+  2026-07-26: `_decrypt` raises `StaleSessionKey` → an exception handler answers
+  **401**, which the client already treats as "session expired" and re-prompts;
+  the client also never parses a body before checking the response. If these
+  reappear, suspect a *new* unguarded parse, not the crypto.
 - **Manage:** `sudo systemctl {status,restart,stop} imagegen.service`,
   `sudo journalctl -u imagegen.service -f`. Hardened unit (`ProtectSystem=strict`,
   `NoNewPrivileges=yes`); GPU needs `PrivateDevices=no`.
