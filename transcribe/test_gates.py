@@ -738,6 +738,35 @@ check("no ranker at all is fine", P._llm_rank(CANDS, "## X", 3, None), CANDS)
 
 
 
+# --- padding from thin slices -------------------------------------------------
+print("\nabsence-of-record padding")
+
+# Smaller notes slices ask for up to eight bullets from a slice that may hold
+# almost nothing, and the model pads with what it did NOT find - the same way
+# Whisper fills silence. All four of these shipped on 2026-07-19.
+for pad in ["No unmet demand recorded in this time slice",
+            "No mention of storage issues or stock movement in the provided business records",
+            "No direct feedback on products or services received from the ticket or texts",
+            "No specific feedback noted"]:
+    check(f"padding dropped: {pad[:44]}",
+          has(P._drop_non_events(f"## Unresolved\n- {pad}\n"), pad[:20].lower()), False)
+
+# The half that matters: an absence in the WORLD is often the finding itself.
+# A rule keyed on "starts with no" would delete all of these.
+for real in ["No one has picked up the package mailed June 13",
+             "No small bills left in the drawer after the afternoon rush",
+             "Nobody could find the spare key for the back gate",
+             "The Vietnam black tea is out with no restock date from the supplier"]:
+    check(f"real finding kept: {real[:44]}",
+          has(P._drop_non_events(f"## Unresolved\n- {real}\n"), real[:20].lower()), True)
+
+# The log is about the shop, never about its own inputs - whatever the phrasing.
+check("a bullet about the pipeline's input is dropped",
+      has(P._drop_non_events(
+          "## Unresolved\n- Staff discussed restocking in this time slice\n"),
+          "restocking"), False)
+
+
 # --- the rebuild must not depend on the merge ---------------------------------
 print("\nrebuild when the merge drops a heading")
 

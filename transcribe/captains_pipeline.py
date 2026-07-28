@@ -1350,8 +1350,33 @@ _NON_EVENT_RE = re.compile(
     r"\bnone (?:noted|provided|recorded|reported)\b|"
     r"but (?:no|nothing) (?:action|further action|steps?|was) [\w ]*?"
     r"(?:taken|done|required|needed)|no action was taken|nothing was done|"
-    r"but no action|but nothing came of|but (?:it|this) was not (?:pursued|acted)",
+    r"but no action|but nothing came of|but (?:it|this) was not (?:pursued|acted)|"
+    # Absence-of-RECORD, which is different from absence-of-event and was
+    # getting through: "No unmet demand recorded in this time slice", "No
+    # mention of storage issues in the provided business records", "No direct
+    # feedback received from the ticket or texts". Smaller slices produce a
+    # lot of these - a thin slice still gets asked for up to eight bullets, so
+    # the model pads with what it did NOT find, exactly the way Whisper fills
+    # silence. Enumerating nouns and verbs was losing the race; the reliable
+    # tell is that the absence is predicated on the input rather than the shop.
+    r"\bno mentions? of\b|"
+    r"\bno\b[^.]{0,70}?\b(?:recorded|noted|mentioned|documented|reported|"
+    r"provided|received|captured|identified)\b[^.]{0,40}?\b(?:in|from|for)\s+"
+    r"(?:this|the|these|today'?s)\s+(?:time\s+)?(?:slice|records?|transcript|"
+    r"notes?|input|tickets?|texts?|data|business records)\b",
     re.IGNORECASE)
+
+# The log is about the shop, never about its own inputs. A claim that talks
+# about "this time slice" or "the provided business records" is the model
+# narrating the pipeline to itself, and it is never a finding whichever way it
+# is phrased - so this stands apart from the absence rules above rather than
+# being folded into them.
+_META_INPUT_RE = re.compile(
+    r"\b(?:this|the|these|that)\s+(?:time\s+)?slice\b|"
+    r"\b(?:the\s+)?(?:provided|given|supplied|above|following)\s+"
+    r"(?:business\s+records?|records?|transcript|notes?|data|input|tickets?)\b|"
+    r"\bin the (?:transcript|input|provided|given)\b|"
+    r"\bthe (?:ticket|text)s? (?:or|and) texts?\b", re.IGNORECASE)
 
 
 def _unquote_unverified(markdown: str, products: list) -> str:
@@ -1389,6 +1414,8 @@ def _unquote_unverified(markdown: str, products: list) -> str:
 def _drop_non_events(markdown: str) -> str:
     """Remove claims that report that nothing happened."""
     def reject(text, is_bullet):
+        if _META_INPUT_RE.search(text):
+            return "describes the pipeline's own input, not the shop"
         return "reports a non-event" if _NON_EVENT_RE.search(text) else None
 
     return _edit_claims(markdown, reject)
@@ -1529,13 +1556,26 @@ def _spoken_near_report(amount: str, lines: list[str], flags: list[bool]) -> boo
     separates a counter readout from a drawer that did not balance.
     """
     bare = amount.replace(",", "")
-    variants = {bare}
+    # A figure with cents is specific enough to recognise on its own. A whole
+    # dollar figure is NOT, and matching it bare is how this gate quietly
+    # stopped working: "45" occurs 145 times in one day's speech and "15" 508
+    # times, overwhelmingly inside timestamps - and a timestamp is a perfect
+    # false match, because the character before the digits is a colon rather
+    # than the digit or dot the guard excluded. 2026-07-19 shipped invented
+    # shortfalls of $45 and $15 on a day where neither string appears at all.
+    # Same shape as the "50.31" that once matched "10:50:31": a number alone
+    # is not evidence of money.
+    specific, marked = [], []
+    (specific if "." in bare else marked).append(bare)
     if "." not in bare:
-        variants.add(bare + ".00")
+        specific.append(bare + ".00")
     elif bare.endswith(".00"):
-        variants.add(bare[:-3])
-    pat = re.compile(r"(?<![\d.])(?:" +
-                     "|".join(re.escape(v) for v in sorted(variants)) + r")(?![\d])")
+        marked.append(bare[:-3])
+    alts = [r"(?<![\d.:])" + re.escape(v) + r"(?![\d])" for v in sorted(specific)]
+    alts += [r"\$\s?" + re.escape(v) + r"(?![\d.])" for v in sorted(marked)]
+    alts += [r"(?<![\d.:])" + re.escape(v) + r"(?![\d.])\s*(?:dollars?|bucks)\b"
+             for v in sorted(marked)]
+    pat = re.compile("|".join(alts), re.I)
     # A whole-dollar figure is weak evidence - "47" is a time, a quantity, a
     # street number and half a price. 2026-07-21 regenerated with "an
     # unresolved discrepancy of $47 in the register" and cleared the window
