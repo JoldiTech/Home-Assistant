@@ -64,19 +64,35 @@ def _worker_env() -> dict:
     return env
 
 
-def _run_job(job: str, script: Path, date_str: str):
-    """One worker at a time (the single 6GB GPU can't run two). job is 'log'
-    (full pipeline) or 'transcribe' (audio only, leaves the transcript on disk
-    for a later log build)."""
-    if not _run_lock.acquire(blocking=False):
-        print(f"[trigger] busy; ignoring {job} {date_str}", file=sys.stderr, flush=True)
-        return
-    _current.update(job=job, date=date_str)
+def _run_job(script: Path, date_str: str):
+    """Runs with _run_lock already held by the caller, and releases it here."""
     try:
-        subprocess.run([sys.executable, str(script), date_str], env=_worker_env())
+        # The child writes the verbatim transcript to stdout, and an inherited
+        # stdout is journald - which would keep a copy the pipeline's transcript
+        # deletion can never reach. It is already on disk in TRANSCRIPT_DIR.
+        subprocess.run([sys.executable, str(script), date_str], env=_worker_env(),
+                       stdout=subprocess.DEVNULL)
     finally:
         _current.update(job=None, date=None)
         _run_lock.release()
+
+
+def _start_job(job: str, script: Path, date_str: str) -> JSONResponse:
+    """One worker at a time (the single 6GB GPU can't run two). job is 'log'
+    (full pipeline) or 'transcribe' (audio only, leaves the transcript on disk
+    for a later log build). Reserving the lock here rather than in the worker
+    keeps the busy check and the reservation atomic, so a 202 always means a job
+    that will really run."""
+    if not _run_lock.acquire(blocking=False):
+        return JSONResponse({"error": "busy", **_current}, status_code=409)
+    _current.update(job=job, date=date_str)
+    try:
+        threading.Thread(target=_run_job, args=(script, date_str), daemon=True).start()
+    except BaseException:
+        _current.update(job=None, date=None)
+        _run_lock.release()
+        raise
+    return JSONResponse({"status": "started", "job": job, "date": date_str}, status_code=202)
 
 
 def _transcript_dates() -> list[str]:
@@ -119,10 +135,7 @@ async def run(request: Request, x_trigger_token: str = Header(default="")):
         date_str = await _date_from(request)
     except ValueError:
         return JSONResponse({"error": "bad date, want YYYY-MM-DD"}, status_code=400)
-    if _run_lock.locked():
-        return JSONResponse({"error": "busy", **_current}, status_code=409)
-    threading.Thread(target=_run_job, args=("log", PIPELINE, date_str), daemon=True).start()
-    return JSONResponse({"status": "started", "job": "log", "date": date_str}, status_code=202)
+    return _start_job("log", PIPELINE, date_str)
 
 
 @app.post("/transcribe")
@@ -136,10 +149,7 @@ async def transcribe(request: Request, x_trigger_token: str = Header(default="")
         date_str = await _date_from(request)
     except ValueError:
         return JSONResponse({"error": "bad date, want YYYY-MM-DD"}, status_code=400)
-    if _run_lock.locked():
-        return JSONResponse({"error": "busy", **_current}, status_code=409)
-    threading.Thread(target=_run_job, args=("transcribe", TRANSCRIBE_SCRIPT, date_str), daemon=True).start()
-    return JSONResponse({"status": "started", "job": "transcribe", "date": date_str}, status_code=202)
+    return _start_job("transcribe", TRANSCRIBE_SCRIPT, date_str)
 
 
 @app.get("/status")

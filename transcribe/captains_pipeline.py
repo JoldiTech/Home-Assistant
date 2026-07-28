@@ -44,6 +44,7 @@ Secrets from /etc/nmteaco/captains.env (mode 600), never hardcoded:
 The transcription half is delegated to transcribe_day.py (which loads and frees
 large-v3 in its own process, so the GPU is clear before the summarizer loads).
 """
+import base64
 import json
 import os
 import re
@@ -75,6 +76,29 @@ SUMMARIZER_MODEL = os.environ.get(
 # the smaller 7B (which has fewer layers). Env-overridable; 0 forces CPU.
 SUMMARIZER_GPU_LAYERS = int(os.environ.get("SUMMARIZER_GPU_LAYERS", "30"))
 SUMMARIZER_CTX = int(os.environ.get("SUMMARIZER_CTX", "8192"))
+# The passes that enforce privacy (redaction, linkage scan) and the correlation
+# pass are the only thing standing between a named person on sensitive content
+# and a permanent log file, and a decision that changes between rolls is not a
+# policy. They run greedy; the model gets a fixed seed so a rerun of the same
+# transcript - a supported workflow, transcripts are kept - reproduces the log.
+_DEFAULT_SEED = 20260720
+# llama.cpp reads each of these as "pick one at random", so honouring one would
+# silently retire the reproducibility above. Neither a sentinel nor a typo is
+# worth refusing to run over - that would cost the day's log outright, which is
+# the worse of the two failures - so both fall back loudly.
+_RANDOM_SEED_SENTINELS = frozenset({0, -1, 0xFFFFFFFF})
+_seed_env = (os.environ.get("SUMMARIZER_SEED") or "").strip()
+try:
+    SUMMARIZER_SEED = int(_seed_env) if _seed_env else _DEFAULT_SEED
+except ValueError:
+    print(f"[pipeline] SUMMARIZER_SEED={_seed_env!r} is not an integer - using "
+          f"{_DEFAULT_SEED}", file=sys.stderr, flush=True)
+    SUMMARIZER_SEED = _DEFAULT_SEED
+if SUMMARIZER_SEED in _RANDOM_SEED_SENTINELS:
+    print(f"[pipeline] SUMMARIZER_SEED={SUMMARIZER_SEED} is llama.cpp's 'random' "
+          f"sentinel, not a seed - using {_DEFAULT_SEED}",
+          file=sys.stderr, flush=True)
+    SUMMARIZER_SEED = _DEFAULT_SEED
 # Keep the Qwen3 hybrid "/no_think" suffix (see _gen). Set 0 for non-hybrid
 # instruct models, where it is just noise on the end of every system prompt.
 _NOTHINK = os.environ.get("SUMMARIZER_NOTHINK", "1") != "0"
@@ -479,6 +503,16 @@ def _load_env(path="/etc/nmteaco/captains.env"):
 
 def _warn(msg: str):
     print(f"[pipeline] {msg}", file=sys.stderr, flush=True)
+
+
+def _amount(v) -> float:
+    """Order totals arrive from the datalog API as numbers, as formatted
+    strings ("1,234.56", "$43.50") or as null, and a raw float()/:.2f on the
+    wrong one aborts the whole nightly run."""
+    try:
+        return float(str(v).replace(",", "").lstrip("$") or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 # --- business data (dashboard datalog API) ------------------------------------
@@ -1255,7 +1289,7 @@ def _order_pos_line(o: dict) -> str | None:
     if len(t) < 19:
         return None
     items = ", ".join(
-        f"{i['name']} ×{i['qty']:g}" if isinstance(i.get("qty"), (int, float)) and i["qty"] != 1
+        f"{i.get('name', '')} ×{i['qty']:g}" if isinstance(i.get("qty"), (int, float)) and i["qty"] != 1
         else str(i.get("name", ""))
         for i in (o.get("items") or [])[:8]
     ) or "no line items"
@@ -1264,7 +1298,7 @@ def _order_pos_line(o: dict) -> str | None:
         tags += " WHOLESALE"
     if o.get("has_sample"):
         tags += " (sample given)"
-    return f"{t} MT | ⟦POS ${o.get('total', 0):.2f}{tags} — {items}⟧"
+    return f"{t} MT | ⟦POS {_money(o.get('total'))}{tags} — {items}⟧"
 
 
 def _weave_orders(transcript: str, sales: dict | None, date_str: str) -> str:
@@ -1734,6 +1768,12 @@ def _reject_sold_reorders(markdown: str, biz: dict) -> str:
     stock" is a real finding the log is supposed to surface (see
     _flag_stock_contradictions). Only an actual sale settles it.
 
+    Only a REGISTER sale settles it, at that. Online orders ship from the
+    warehouse, so shipping one says nothing about what was on the floor when a
+    customer asked - and treating it as proof deletes exactly the unmet-demand
+    finding this log exists to capture. An order the datalog API left unlabelled
+    is read as online, the same way _weave_orders and _records_index read it.
+
     Covers narrative sentences and unavailability claims, not just reorder
     bullets. 2026-07-26 asserted in prose that a Nilgiri iced tea blend and a
     Sandia Spice / immune-support pair were unavailable; the woven POS lines
@@ -1741,6 +1781,8 @@ def _reject_sold_reorders(markdown: str, biz: dict) -> str:
     """
     sold = set()
     for o in ((biz.get("sales") or {}).get("orders") or []):
+        if o.get("source") != "revel":
+            continue
         for it in (o.get("items") or []):
             n = _norm_name(str(it.get("name") or ""))
             if len(n) >= 6 and n not in _GENERIC_SKUS:
@@ -1836,41 +1878,124 @@ If there are none, output exactly: NONE
 Output nothing else - no commentary, no markdown. /no_think"""
 
 
-def _strip_linkage_names(markdown: str, findings: list[str]) -> str:
+_NEXT_WORD_RE = re.compile(r"[ \t]+([A-Za-z]+)")
+_PREV_WORD_RE = re.compile(r"([A-Za-z]+)[ \t]+$")
+
+
+def _reads_as_product(before: str, tail: str, catalog: set) -> bool:
+    """True when the words AROUND an occurrence continue a product name
+    ("Jasmine Green Tea", "Rose Petal", "crystallized Ginger", "Wild Sage").
+
+    Both sides are checked because the name sits at either end of a product:
+    looking only forward mangles every catalog entry whose last word is also a
+    first name. Evidence must come from the catalog - a bare capitalized word is
+    not enough, or "Maria Lopez" and "Maria Gonzalez" read as products and a
+    flagged full name ships. No catalog therefore means no product can be
+    proven, and the strip proceeds.
+    """
+    if not catalog:
+        return False
+    nxt = _NEXT_WORD_RE.match(tail)
+    if nxt and nxt.group(1).lower() in catalog:
+        return True
+    prev = _PREV_WORD_RE.search(before)
+    return bool(prev and prev.group(1).lower() in catalog)
+
+
+def _strip_linkage_names(markdown: str, findings: list[str],
+                         products: list[dict] | None) -> str:
     """Deterministic surgery for scanned linkage violations: drop the NAME from
     the sentences that pair it with sensitive content, keeping the fact. The
     LLM only detects (which it does reliably); code does the editing (which the
-    LLM repeatedly failed to apply itself)."""
+    LLM repeatedly failed to apply itself).
+
+    Half this shop's catalog is also a first name - Rose, Jasmine, Ginger, Sage,
+    Basil, Hazel, Juniper, Saffron - and matching the bare word turned "a tin of
+    Jasmine Green Tea" into "a tin of a customer Green Tea". An occurrence is
+    spared only where the words after it continue a product name
+    (_reads_as_product); every other position - subject, object, prepositional,
+    appositive, trailing - is the person and goes.
+
+    The scan's quoted fragment is a paraphrase of its own finding, so it often
+    matches nothing. That case fails CLOSED: the strip runs over every
+    non-heading line carrying the name instead. A name the model has explicitly
+    flagged as tied to health or personal life is the one thing this pass exists
+    to keep out of a permanent log.
+    """
+    catalog = {w for p in (products or [])
+               for w in _norm_name(str(p.get("name") or "")).split()
+               if len(w) >= 3 and w not in _STOPWORDS}
     for raw in findings:
         if "|" not in raw:
             continue
         name, fragment = (s.strip().strip('"') for s in raw.split("|", 1))
         if not name or len(name) > 40 or not name[0].isupper():
             continue
-        pat_poss = re.compile(r"\b" + re.escape(name) + r"(?:'s|’s)\b")
-        pat = re.compile(r"\b" + re.escape(name) + r"\b")
-        # Scope the strip to the flagged sentence: an operational mention of
-        # the same name elsewhere ("asked for a hold on two tins") keeps its
-        # name per policy. Loose fragment match (first words, normalized);
-        # if the fragment can't be located, strip everywhere - privacy wins
-        # over precision when in doubt.
-        frag_key = _norm_name(" ".join(fragment.split()[:5]))
-        lines = markdown.splitlines()
-        hits = [i for i, l in enumerate(lines)
-                if pat.search(l) and frag_key and frag_key in _norm_name(l)]
-        targets = set(hits) if hits else {i for i, l in enumerate(lines) if pat.search(l)}
-        for i in targets:
-            line = lines[i]
-            if line.startswith(("#", "**")):
-                continue
-            new = pat_poss.sub("a customer's", line)
-            new = pat.sub("a customer", new)
-            new = re.sub(r"(^|[.!?]\s+|^- )a customer", lambda m: m.group(1) + "A customer", new)
-            if new != line:
-                _warn(f"linkage break: removed name '{name}' from a sentence")
-            lines[i] = new
-        markdown = "\n".join(lines)
+        # The scan and the draft disagree about how much of a name they carry:
+        # a finding may name "Maria Lopez" where the draft says only "Maria",
+        # or name "Maria" where the draft says "Maria Gonzalez". Strip the whole
+        # name and each of its tokens, longest first so the full form wins.
+        variants = [name] + [t for t in name.split()[:3]
+                             if len(t) > 1 and t[0].isupper() and t != name]
+        for variant in sorted(set(variants), key=len, reverse=True):
+            markdown = _strip_one_name(markdown, variant, fragment, catalog)
     return markdown
+
+
+def _strip_one_name(markdown: str, name: str, fragment: str, catalog: set) -> str:
+    # A name ending in punctuation ("A.J.") has no word boundary after it, so a
+    # trailing \b would never match and the name would ship untouched.
+    end_b = r"\b" if re.match(r"\w", name[-1]) else ""
+    # Trailing capitalized words are swallowed so a surname can't outlive the
+    # given name ("a customer Gonzalez ... her divorce" shipped a name onto the
+    # sensitive content this pass exists to unlink). A product continuation is
+    # caught by _reads_as_product below, which inspects the same run.
+    pat = re.compile(rf"\b{re.escape(name)}(?:'s|’s)?{end_b}(?:[ \t]+[A-Z][a-z]+)*")
+
+    def spared(line: str, m: re.Match) -> bool:
+        # The swallowed run is the deciding evidence: "Jasmine Green Tea" is a
+        # product because "Green" is catalog, "Maria Lopez" is a person because
+        # "Lopez" is not. Only then look outward, for a name that ENDS a product
+        # ("crystallized Ginger").
+        if any(w.lower() in catalog for w in m.group(0).split()[1:]):
+            return True
+        return _reads_as_product(line[:m.start()], line[m.end():], catalog)
+
+    def repl(m: re.Match) -> str:
+        if spared(m.string, m):
+            return m.group(0)
+        return "a customer's" if m.group(0).endswith(("'s", "’s")) else "a customer"
+
+    # Scope the strip to the flagged sentence where it can be found: an
+    # operational mention of the same name elsewhere ("asked for a hold on
+    # two tins") keeps its name per policy. Loose fragment match (first
+    # words, normalized).
+    frag_key = _norm_name(" ".join(fragment.split()[:5]))
+    lines = markdown.splitlines()
+    carrying = [i for i, l in enumerate(lines) if pat.search(l)]
+    targets = [i for i in carrying
+               if frag_key and frag_key in _norm_name(lines[i])]
+    if not targets and carrying:
+        _warn(f"linkage scan flagged '{name}' but its sentence was not "
+              f"found - stripping the name from every line carrying it")
+        targets = carrying
+    for i in targets:
+        line = lines[i]
+        if line.startswith(("#", "**")):
+            continue
+        new = pat.sub(repl, line)
+        if new != line:
+            _warn(f"linkage break: removed name '{name}' from a sentence")
+            lines[i] = re.sub(r"(^|[.!?]\s+|^- )a customer",
+                              lambda m: m.group(1) + "A customer", new)
+    # Count only occurrences the strip MISSED. Counting spared product usages
+    # too made the alarm fire on correct behaviour and stay quiet on real leaks.
+    left = sum(1 for i in targets if not lines[i].startswith(("#", "**"))
+               for m in pat.finditer(lines[i]) if not spared(lines[i], m))
+    if left:
+        _warn(f"PRIVACY: linkage scan flagged '{name}' and {left} "
+              f"occurrence(s) survived - the name is still in the log")
+    return "\n".join(lines)
 
 
 # Staff names are KNOWN (timeclock roster + Slack display names), so keeping a
@@ -1887,6 +2012,28 @@ _SAID_NOUNS = (
     "request|suggestion|note|comment|observation|complaint|idea|report|"
     "concern|feedback|question|reminder"
 )
+
+
+# An office is a PERSON's only when the qualifier is possessive - "Shawn's
+# office", or "Shawns" once the transcript drops the apostrophe. A bare
+# qualifier names a place or an institution ("the Post office", "the Denver
+# office"), as does a multi-word proper name with no apostrophe ("Las Cruces
+# office"), and rewriting those changes what the sentence says. Trailing-s
+# department names survive on the allowlist. Any article is inside the match so
+# the rewrite doesn't read "the a staff office".
+_INSTITUTIONAL_OFFICE = {"sales", "customs", "records", "accounts", "claims",
+                         "returns"}
+_OFFICE_RE = re.compile(
+    r"\b(?:(?:the|a|an)\s+)?([A-Z][a-z]+\s+)?([A-Z][a-z]{2,})('s|’s|s)\s+office\b")
+
+
+def _de_office(m: re.Match) -> str:
+    word = m.group(2).lower()
+    if word in _INSTITUTIONAL_OFFICE or f"{word}s" in _INSTITUTIONAL_OFFICE:
+        return m.group(0)
+    if m.group(1) and not m.group(3).startswith(("'", "’")):
+        return m.group(0)
+    return "a staff office"
 
 
 def _staff_names(biz: dict, slack_names: set | None) -> set:
@@ -1941,13 +2088,14 @@ def _strip_staff_attribution(markdown: str, staff: set) -> str:
                 r"\1 by a staff member", new)
             # A back office named after whoever sits in it is still a staff
             # name in a permanent record.
-            new = re.sub(rf"\b{nm}(?:'s|’s|s)?\s+office\b", "a staff office", new)
+            new = re.sub(rf"\b(?:(?:the|a|an)\s+)?{nm}(?:'s|’s|s)?\s+office\b",
+                         "a staff office", new)
         # The staff set comes from the timeclock and Slack display names, so a
         # colleague merely MENTIONED in a message body is not in it - "Shawns
         # office" survived every named pattern on 2026-07-23 because Shawn did
         # not work that day. A room named after whoever sits in it is a staff
         # name whether or not we can enumerate them.
-        new = re.sub(r"\b[A-Z][a-z]{2,}(?:'s|’s|s)?\s+office\b", "a staff office", new)
+        new = _OFFICE_RE.sub(_de_office, new)
         if new != line:
             new = re.sub(r"(^|[.!?]\s+|^- )a staff", lambda m: m.group(1) + "A staff", new)
             _warn("staff attribution: dropped a staff name from a remark")
@@ -2380,7 +2528,7 @@ def _validate_annotations(markdown: str, biz: dict) -> str:
     what the prompt says)."""
     amounts, order_hour = {}, {}
     for o in ((biz.get("sales") or {}).get("orders") or []):
-        amounts[str(o.get("id"))] = float(o.get("total") or 0)
+        amounts[str(o.get("id"))] = _amount(o.get("total"))
         t = str(o.get("time_local") or "")
         if len(t) >= 13 and t[11:13].isdigit():
             order_hour[str(o.get("id"))] = int(t[11:13])
@@ -2447,7 +2595,7 @@ def _records_index(biz: dict) -> str:
         t = (o.get("time_local") or "")[11:16]
         items = ", ".join(str(i.get("name", "")) for i in (o.get("items") or [])[:4])
         kind = "POS" if o.get("source") == "revel" else "online"
-        lines.append(f"order #{o.get('id')} ({kind}) {t} ${o.get('total', 0):.2f} — {items}")
+        lines.append(f"order #{o.get('id')} ({kind}) {t} {_money(o.get('total'))} — {items}")
     support = biz.get("support") or {}
     for tkt in (support.get("created") or []) + (support.get("closed") or []):
         t = (tkt.get("time_local") or "")[11:16]
@@ -2466,10 +2614,7 @@ def _records_index(biz: dict) -> str:
 # --- deterministic business sections ------------------------------------------
 
 def _money(v) -> str:
-    try:
-        return f"${float(v):,.2f}"
-    except (TypeError, ValueError):
-        return "$0.00"
+    return f"${_amount(v):,.2f}"
 
 
 def _business_sections(biz: dict) -> str:
@@ -2590,6 +2735,16 @@ def _ensure_gpu(min_free_mb: int, wait_s: int = 180) -> bool:
 
 # --- transcription ------------------------------------------------------------
 
+# A full day is ~30 min of GPU work, but a wedged export or a stalled model
+# never returns at all, and an unbounded wait means no log is ever written for
+# that day - which is permanent loss once Protect's ~30-day window closes.
+TRANSCRIBE_TIMEOUT_S = int(os.environ.get("TRANSCRIBE_TIMEOUT_S", "5400"))
+
+
+def _transcript_path(date_str: str) -> Path:
+    return Path.home() / "captains_transcripts" / f"tea_one_{date_str}.log"
+
+
 def _transcribe(date_str: str) -> tuple[str, Path]:
     """Run transcribe_day.py in its own process; return (transcript_text, log_path).
 
@@ -2597,7 +2752,7 @@ def _transcribe(date_str: str) -> tuple[str, Path]:
     existing transcript for the date is reused — reruns for prompt/pipeline
     testing only pay for the LLM stages. Set FORCE_RETRANSCRIBE=1 to redo the
     audio (e.g. after a transcription-quality change)."""
-    log_path = Path.home() / "captains_transcripts" / f"tea_one_{date_str}.log"
+    log_path = _transcript_path(date_str)
     if (log_path.exists() and log_path.stat().st_size > 0
             and not os.environ.get("FORCE_RETRANSCRIBE")):
         _warn(f"reusing existing transcript {log_path}")
@@ -2607,7 +2762,7 @@ def _transcribe(date_str: str) -> tuple[str, Path]:
     _warn(f"transcribing {date_str}...")
     proc = subprocess.run(
         [sys.executable, str(TRANSCRIBE_SCRIPT), date_str],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=TRANSCRIBE_TIMEOUT_S,
     )
     if proc.returncode != 0:
         raise RuntimeError(f"transcription failed: {proc.stderr[-2000:]}")
@@ -2764,7 +2919,7 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
     # reference and collecting doesn't help; only a fresh process does.
     try:
         llm = Llama(model_path=SUMMARIZER_MODEL, n_ctx=SUMMARIZER_CTX, n_threads=8,
-                    n_gpu_layers=plan[0], verbose=False)
+                    n_gpu_layers=plan[0], seed=SUMMARIZER_SEED, verbose=False)
     except Exception as e:
         if os.environ.get("SUMMARIZER_GPU_LAYERS") == "0":
             raise RuntimeError(f"summarizer failed to load even on CPU: {e}")
@@ -2799,7 +2954,7 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
               f"input after a {_reserve}-token reserve - raise SUMMARIZER_CTX")
         INPUT_BUDGET = 500
 
-    def _gen(system, user, max_tokens, temperature=0.3):
+    def _gen(system, user, max_tokens, temperature=0.3, repeat_penalty=1.1):
         # "/no_think" is a Qwen3 HYBRID control token. Non-hybrid instruct models
         # (e.g. Qwen3-*-Instruct-2507) don't understand it and just see a stray
         # token at the end of every system prompt. SUMMARIZER_NOTHINK=0 strips it.
@@ -2807,7 +2962,8 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
             system = system.replace(" /no_think", "").replace("/no_think", "")
         out = llm.create_chat_completion(
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            max_tokens=max_tokens, temperature=temperature, top_p=0.9, repeat_penalty=1.1,
+            max_tokens=max_tokens, temperature=temperature, top_p=0.9,
+            repeat_penalty=repeat_penalty,
         )
         return _strip_think(out["choices"][0]["message"]["content"])
 
@@ -2869,7 +3025,12 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
         while _tok(records) > SUMMARIZER_CTX - 3000 and "\n" in records:
             records = records.rsplit("\n", max(1, records.count("\n") // 4))[0]
         _warn("correlation pass...")
-        draft = _gen(CORRELATE_SYSTEM, f"RECORDS:\n{records}\n\nDRAFT:\n{draft}", 1800, temperature=0.1)
+        # This pass and the two below return the draft unchanged apart from
+        # what they add or remove, so a penalty on repeated tokens is pressure
+        # to reword content that is legitimately repeated (a product named in
+        # two bullets, one amount cited twice).
+        draft = _gen(CORRELATE_SYSTEM, f"RECORDS:\n{records}\n\nDRAFT:\n{draft}", 1800,
+                     temperature=0.0, repeat_penalty=1.0)
 
     # Carry through what the merge dropped. Runs BEFORE redaction and the
     # catalog stage on purpose: a carried line is not privileged, it goes
@@ -2895,17 +3056,19 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
     # sensitive-content links and strip personal-life/garble that slipped
     # through. Cheap on GPU (~seconds).
     _warn("redaction pass...")
-    draft = _gen(REDACT_TEMPLATE, f"Draft to clean:\n\n{draft}", 1800, temperature=0.1)
+    draft = _gen(REDACT_TEMPLATE, f"Draft to clean:\n\n{draft}", 1800,
+                 temperature=0.0, repeat_penalty=1.0)
 
     # Linkage guard, detect-then-surgery: whole-document editing is exactly
     # what this 8B keeps failing at (a named person's health interest survived
     # repeated redaction rolls), but LISTING violations is a small structured
     # task it handles. The model detects; code strips the name.
     _warn("linkage scan...")
-    scan = _gen(LINKAGE_SCAN_SYSTEM, f"Log to check:\n\n{draft}", 400, temperature=0.1)
+    scan = _gen(LINKAGE_SCAN_SYSTEM, f"Log to check:\n\n{draft}", 400,
+                temperature=0.0, repeat_penalty=1.0)
     findings = [l for l in scan.splitlines() if "|" in l]
     if findings:
-        draft = _strip_linkage_names(draft, findings)
+        draft = _strip_linkage_names(draft, findings, products)
     def rank(user: str) -> str:
         return _gen(RANK_SYSTEM, user, 300, temperature=0.1)
 
@@ -2914,9 +3077,10 @@ def _summarize(transcript: str, day: datetime, slack_text: str, records: str,
 
 # --- git ----------------------------------------------------------------------
 
-def _git(*args, check=True):
+def _git(*args, check=True, env=None):
     return subprocess.run(["git", "-C", str(REPO_CLONE), *args], check=check,
-                          capture_output=True, text=True)
+                          capture_output=True, text=True,
+                          env={**os.environ, **env} if env else None)
 
 
 def _commit_and_push(date_str: str, markdown: str, env: dict):
@@ -2924,14 +3088,27 @@ def _commit_and_push(date_str: str, markdown: str, env: dict):
     if not token:
         raise RuntimeError("GITHUB_TOKEN not set (in /etc/nmteaco/captains.env)")
     repo = env.get("GITHUB_REPO", DEFAULT_REPO)
-    remote = f"https://x-access-token:{token}@github.com/{repo}.git"
+    remote = f"https://github.com/{repo}.git"
+    # The PAT rides in the environment of the git processes that need it and
+    # nowhere else: in the remote URL it would be written to .git/config on
+    # disk, and as `git -c` it would sit in a command line any local user can
+    # read. GIT_TERMINAL_PROMPT stops a rejected header from hanging the
+    # nightly run on a credential prompt nobody is there to answer.
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    auth = {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "http.extraheader",
+        "GIT_CONFIG_VALUE_0": f"Authorization: Basic {basic}",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
 
     if not (REPO_CLONE / ".git").exists():
         _warn("cloning repo...")
         subprocess.run(["git", "clone", "--branch", LOG_BRANCH, "--single-branch", remote, str(REPO_CLONE)],
-                       check=True, capture_output=True, text=True)
+                       check=True, capture_output=True, text=True,
+                       env={**os.environ, **auth})
     _git("remote", "set-url", "origin", remote)
-    _git("fetch", "origin", LOG_BRANCH)
+    _git("fetch", "origin", LOG_BRANCH, env=auth)
     _git("checkout", LOG_BRANCH)
     _git("reset", "--hard", f"origin/{LOG_BRANCH}")
     # identity (local to this clone; no global config needed)
@@ -2948,11 +3125,12 @@ def _commit_and_push(date_str: str, markdown: str, env: dict):
         return
     _git("commit", "-m", f"Captain's log {date_str}")
     for attempt in range(4):
-        r = _git("push", "origin", LOG_BRANCH, check=False)
+        r = _git("push", "origin", LOG_BRANCH, check=False, env=auth)
         if r.returncode == 0:
             _warn("pushed")
             return
-        _warn(f"push failed (try {attempt + 1}): {r.stderr[-300:]}")
+        err = r.stderr.replace(token, "[redacted]").replace(basic, "[redacted]")
+        _warn(f"push failed (try {attempt + 1}): {err[-300:]}")
     raise RuntimeError("git push failed after retries")
 
 
@@ -2969,7 +3147,15 @@ def main():
     products = _fetch_products(env)
     slack_text, slack_names = _fetch_slack(env, window_start, window_end)
 
-    transcript, log_path = _transcribe(date_str)
+    # The business day is already in hand, and a day with no speech still gets a
+    # real log - so a dead microphone, an unreachable Protect or a wedged model
+    # must not cost the whole day, which cannot be rebuilt once the ~30-day
+    # recording window closes.
+    try:
+        transcript, log_path = _transcribe(date_str)
+    except Exception as e:
+        _warn(f"transcription failed ({e}) - falling back to business data only")
+        transcript, log_path = "", _transcript_path(date_str)
     have_speech = bool(transcript.strip())
     have_data = any(biz.values()) or bool(slack_text)
 

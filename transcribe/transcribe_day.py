@@ -333,9 +333,16 @@ async def _export_hours(client, day: datetime) -> list[tuple[Path, datetime, dat
             continue
         if not mp4.exists() or mp4.stat().st_size == 0:
             continue
-        subprocess.run(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(mp4),
-             "-map", "0:a:0", "-ac", "1", "-ar", "16000", str(wav)], check=True)
+        try:
+            subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(mp4),
+                 "-map", "0:a:0", "-ac", "1", "-ar", "16000", str(wav)], check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"[transcribe_day] chunk {i} has no decodable audio track: {e}",
+                  file=sys.stderr, flush=True)
+            mp4.unlink(missing_ok=True)
+            wav.unlink(missing_ok=True)
+            continue
         mp4.unlink(missing_ok=True)
         out.append((wav, start, end))
         print(f"[transcribe_day] exported {start:%H:%M}-{end:%H:%M} ({time.time()-t0:.0f}s)",
@@ -451,123 +458,134 @@ async def main():
         creds["PROTECT_HOST"], 443, creds["PROTECT_LOCAL_USER"], creds["PROTECT_LOCAL_PASS"],
         verify_ssl=False,
     )
-    await client.update()
-    print(f"[transcribe_day] {date_str}: Protect login OK  (engine={ASR_ENGINE})",
-          file=sys.stderr, flush=True)
+    try:
+        await client.update()
+        print(f"[transcribe_day] {date_str}: Protect login OK  (engine={ASR_ENGINE})",
+              file=sys.stderr, flush=True)
 
-    if ASR_ENGINE in ("dual", "parakeet"):
-        lines, stats = await run_dual(client, day)
-        await client.close_session()
-        with open(part_log, "a") as f:
-            for ln in lines:
-                f.write(ln + "\n")
-        if not lines and out_log.exists() and out_log.stat().st_size:
-            print(f"[transcribe_day] nothing transcribed - keeping existing {out_log}",
+        if ASR_ENGINE in ("dual", "parakeet"):
+            lines, stats = await run_dual(client, day)
+            with open(part_log, "a") as f:
+                for ln in lines:
+                    f.write(ln + "\n")
+            if not lines and out_log.exists() and out_log.stat().st_size:
+                print(f"[transcribe_day] nothing transcribed - keeping existing {out_log}",
+                      file=sys.stderr, flush=True)
+                part_log.unlink(missing_ok=True)
+                sys.stdout.write(out_log.read_text())
+                return
+            part_log.replace(out_log)
+            print(f"[transcribe_day] DONE {date_str}: {len(lines)} lines -> {out_log} "
+                  f"| parakeet={stats.get('parakeet')} whisper_raw={stats.get('whisper_total')} "
+                  f"rescued={stats.get('rescued')} suppressed={stats.get('suppressed')}",
                   file=sys.stderr, flush=True)
+            sys.stdout.write(out_log.read_text())
+            return
+
+        model, plan_i = _load_model()
+
+        total = 0
+        failed_chunks = 0
+        for i, (start, end) in enumerate(_windows(day)):
+            mp4 = TMP / f"chunk_{i}.mp4"
+            wav = TMP / f"chunk_{i}.wav"
+            t0 = time.time()
+            try:
+                await client.get_camera_video(CAM_ID, start, end, channel_index=CHANNEL,
+                                              output_file=mp4)
+            except Exception as e:
+                print(f"[transcribe_day] chunk {i} export failed: {e}",
+                      file=sys.stderr, flush=True)
+                continue
+            if not mp4.exists() or mp4.stat().st_size == 0:
+                continue
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(mp4),
+                     "-map", "0:a:0", "-ac", "1", "-ar", "16000", str(wav)],
+                    check=True,
+                )
+            except subprocess.CalledProcessError as e:
+                print(f"[transcribe_day] chunk {i} has no decodable audio track: {e}",
+                      file=sys.stderr, flush=True)
+                failed_chunks += 1
+                mp4.unlink(missing_ok=True)
+                wav.unlink(missing_ok=True)
+                continue
+            # faster-whisper yields lazily, so OOM surfaces while draining `segs`,
+            # not at the transcribe() call - hence the whole drain is inside the
+            # retry. On a VRAM failure, wait for Chloe to let go, then reload one
+            # step down the plan; one bad hour must not cost the whole day.
+            lines = None
+            for attempt in range(3):
+                try:
+                    segs, _ = model.transcribe(
+                        str(wav), language="en", vad_filter=True, vad_parameters=VAD_PARAMS,
+                        condition_on_previous_text=False, hotwords=HOTWORDS,
+                    )
+                    lines = []
+                    prev, run = None, 0
+                    for s in segs:
+                        text = s.text.strip()
+                        if not text or text.lower() in _NOISE:
+                            continue
+                        if _HALLUCINATION_RE.search(text):
+                            print(f"[transcribe_day] dropped silence-hallucination: {text[:60]}",
+                                  file=sys.stderr, flush=True)
+                            continue
+                        if text == prev:
+                            run += 1
+                            if run > MAX_REPEAT:
+                                continue
+                        else:
+                            prev, run = text, 1
+                        ts = start + timedelta(seconds=s.start)
+                        lines.append(f"{ts.strftime('%Y-%m-%d %H:%M:%S %Z')} | {text}")
+                    break
+                except Exception as e:
+                    if not _is_oom(e) or attempt == 2:
+                        print(f"[transcribe_day] chunk {i} failed: {e}",
+                              file=sys.stderr, flush=True)
+                        break
+                    print(f"[transcribe_day] chunk {i} VRAM failure ({_free_vram_mb()}MB free), "
+                          f"reloading a step down...", file=sys.stderr, flush=True)
+                    del model
+                    time.sleep(20)
+                    model, plan_i = _load_model(min(plan_i + 1, len(_LOAD_PLAN) - 1))
+            if lines is None:
+                failed_chunks += 1
+                mp4.unlink(missing_ok=True)
+                wav.unlink(missing_ok=True)
+                continue
+            with open(part_log, "a") as f:
+                for ln in lines:
+                    f.write(ln + "\n")
+            total += len(lines)
+            print(
+                f"[transcribe_day] {start:%H:%M}-{end:%H:%M} "
+                f"{time.time()-t0:.0f}s -> {len(lines)} lines (total {total})",
+                file=sys.stderr, flush=True,
+            )
+            mp4.unlink(missing_ok=True)
+            wav.unlink(missing_ok=True)
+
+        # Only now does the previous transcript get replaced. If every chunk failed
+        # we keep whatever was already on disk rather than overwriting it with
+        # nothing - a stale complete transcript beats a fresh empty one.
+        if total == 0 and failed_chunks and out_log.exists() and out_log.stat().st_size:
+            print(f"[transcribe_day] {failed_chunks} chunk(s) failed and nothing was "
+                  f"transcribed - keeping the existing {out_log}", file=sys.stderr, flush=True)
             part_log.unlink(missing_ok=True)
             sys.stdout.write(out_log.read_text())
             return
         part_log.replace(out_log)
-        print(f"[transcribe_day] DONE {date_str}: {len(lines)} lines -> {out_log} "
-              f"| parakeet={stats.get('parakeet')} whisper_raw={stats.get('whisper_total')} "
-              f"rescued={stats.get('rescued')} suppressed={stats.get('suppressed')}",
+        note = f" ({failed_chunks} chunk(s) failed)" if failed_chunks else ""
+        print(f"[transcribe_day] DONE {date_str}: {total} lines -> {out_log}{note}",
               file=sys.stderr, flush=True)
+        # transcript to stdout for the caller
         sys.stdout.write(out_log.read_text())
-        return
-
-    model, plan_i = _load_model()
-
-    total = 0
-    failed_chunks = 0
-    for i, (start, end) in enumerate(_windows(day)):
-        mp4 = TMP / f"chunk_{i}.mp4"
-        wav = TMP / f"chunk_{i}.wav"
-        t0 = time.time()
-        try:
-            await client.get_camera_video(CAM_ID, start, end, channel_index=CHANNEL, output_file=mp4)
-        except Exception as e:
-            print(f"[transcribe_day] chunk {i} export failed: {e}", file=sys.stderr, flush=True)
-            continue
-        if not mp4.exists() or mp4.stat().st_size == 0:
-            continue
-        subprocess.run(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(mp4),
-             "-map", "0:a:0", "-ac", "1", "-ar", "16000", str(wav)],
-            check=True,
-        )
-        # faster-whisper yields lazily, so OOM surfaces while draining `segs`,
-        # not at the transcribe() call - hence the whole drain is inside the
-        # retry. On a VRAM failure, wait for Chloe to let go, then reload one
-        # step down the plan; one bad hour must not cost the whole day.
-        lines = None
-        for attempt in range(3):
-            try:
-                segs, _ = model.transcribe(
-                    str(wav), language="en", vad_filter=True, vad_parameters=VAD_PARAMS,
-                    condition_on_previous_text=False, hotwords=HOTWORDS,
-                )
-                lines = []
-                prev, run = None, 0
-                for s in segs:
-                    text = s.text.strip()
-                    if not text or text.lower() in _NOISE:
-                        continue
-                    if _HALLUCINATION_RE.search(text):
-                        print(f"[transcribe_day] dropped silence-hallucination: {text[:60]}",
-                              file=sys.stderr, flush=True)
-                        continue
-                    if text == prev:
-                        run += 1
-                        if run > MAX_REPEAT:
-                            continue
-                    else:
-                        prev, run = text, 1
-                    ts = start + timedelta(seconds=s.start)
-                    lines.append(f"{ts.strftime('%Y-%m-%d %H:%M:%S %Z')} | {text}")
-                break
-            except Exception as e:
-                if not _is_oom(e) or attempt == 2:
-                    print(f"[transcribe_day] chunk {i} failed: {e}", file=sys.stderr, flush=True)
-                    break
-                print(f"[transcribe_day] chunk {i} VRAM failure ({_free_vram_mb()}MB free), "
-                      f"reloading a step down...", file=sys.stderr, flush=True)
-                del model
-                time.sleep(20)
-                model, plan_i = _load_model(min(plan_i + 1, len(_LOAD_PLAN) - 1))
-        if lines is None:
-            failed_chunks += 1
-            mp4.unlink(missing_ok=True)
-            wav.unlink(missing_ok=True)
-            continue
-        with open(part_log, "a") as f:
-            for ln in lines:
-                f.write(ln + "\n")
-        total += len(lines)
-        print(
-            f"[transcribe_day] {start:%H:%M}-{end:%H:%M} "
-            f"{time.time()-t0:.0f}s -> {len(lines)} lines (total {total})",
-            file=sys.stderr, flush=True,
-        )
-        mp4.unlink(missing_ok=True)
-        wav.unlink(missing_ok=True)
-
-    await client.close_session()
-
-    # Only now does the previous transcript get replaced. If every chunk failed
-    # we keep whatever was already on disk rather than overwriting it with
-    # nothing - a stale complete transcript beats a fresh empty one.
-    if total == 0 and failed_chunks and out_log.exists() and out_log.stat().st_size:
-        print(f"[transcribe_day] {failed_chunks} chunk(s) failed and nothing was "
-              f"transcribed - keeping the existing {out_log}", file=sys.stderr, flush=True)
-        part_log.unlink(missing_ok=True)
-        sys.stdout.write(out_log.read_text())
-        return
-    part_log.replace(out_log)
-    note = f" ({failed_chunks} chunk(s) failed)" if failed_chunks else ""
-    print(f"[transcribe_day] DONE {date_str}: {total} lines -> {out_log}{note}",
-          file=sys.stderr, flush=True)
-    # transcript to stdout for the caller
-    sys.stdout.write(out_log.read_text())
+    finally:
+        await client.close_session()
 
 
 if __name__ == "__main__":

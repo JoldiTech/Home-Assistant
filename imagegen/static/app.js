@@ -21,8 +21,13 @@ const PBKDF2_SALT = new TextEncoder().encode("imagegen-e2e-v1");
 let kSess = null;
 let currentMode = null;
 let imagesEnabled = true;   // false in GPU-chat mode (SDXL not loaded)
+let viewGeneration = 0;
 
 const $ = (id) => document.getElementById(id);
+
+// A 401 makes showLogin() replace the whole view mid-request, so any node
+// addressed after an await may already be gone.
+const setStatus = (id, text) => { const el = $(id); if (el) el.textContent = text; };
 
 const CHAT_MODE_LABELS = {
   cpu_images: "CPU chat + images (chat on CPU, GPU runs image generation)",
@@ -138,6 +143,7 @@ async function apiCall(path, payload) {
 function showLogin(error) {
   kSess = null;
   currentMode = null;
+  viewGeneration++;
   $("app").innerHTML = `
     <h2>locked</h2>
     ${error ? `<p class="err">${escapeText(error)}</p>` : ""}
@@ -198,6 +204,7 @@ async function onLoginSubmit(e) {
 
 async function renderSettings() {
   currentMode = null;
+  viewGeneration++;
   $("app").innerHTML = `
     <p><a href="#" id="back">&larr; back</a></p>
     <h2>settings</h2>
@@ -238,7 +245,7 @@ async function renderSettings() {
     $("user-name").value = p.user_name || "";
     renderPersonaCards(p.personas || []);
   } catch (err) {
-    $("prompts-status").textContent = "couldn't load current prompts";
+    setStatus("prompts-status", "couldn't load current prompts");
   }
 }
 
@@ -282,7 +289,7 @@ function collectPersonas() {
 async function onSaveGroup() {
   const btn = $("save-group");
   btn.disabled = true;
-  $("group-status").textContent = "saving...";
+  setStatus("group-status", "saving...");
   try {
     // set-prompts requires the two base prompts too, so include them from the form.
     const res = await apiCall("/api/set-prompts", {
@@ -292,9 +299,9 @@ async function onSaveGroup() {
       user_name: $("user-name").value,
       personas: collectPersonas(),
     });
-    $("group-status").textContent = res.error ? res.error : "saved (encrypted at rest)";
+    setStatus("group-status", res.error ? res.error : "saved (encrypted at rest)");
   } catch (err) {
-    $("group-status").textContent = "save failed";
+    setStatus("group-status", "save failed");
   } finally {
     btn.disabled = false;
   }
@@ -303,15 +310,15 @@ async function onSaveGroup() {
 async function onSavePrompts() {
   const btn = $("save-prompts");
   btn.disabled = true;
-  $("prompts-status").textContent = "saving...";
+  setStatus("prompts-status", "saving...");
   try {
     const res = await apiCall("/api/set-prompts", {
       system_prompt: $("sys-prompt").value,
       image_prompt_prefix: $("img-prefix").value,
     });
-    $("prompts-status").textContent = res.error ? res.error : "saved (encrypted at rest)";
+    setStatus("prompts-status", res.error ? res.error : "saved (encrypted at rest)");
   } catch (err) {
-    $("prompts-status").textContent = "save failed";
+    setStatus("prompts-status", "save failed");
   } finally {
     btn.disabled = false;
   }
@@ -320,11 +327,11 @@ async function onSavePrompts() {
 async function onChangePassword() {
   const p1 = $("new-pass").value;
   const p2 = $("new-pass2").value;
-  if (p1 !== p2) { $("pass-status").textContent = "passwords don't match"; return; }
-  if (p1.length < 8) { $("pass-status").textContent = "password must be at least 8 characters"; return; }
+  if (p1 !== p2) { setStatus("pass-status", "passwords don't match"); return; }
+  if (p1.length < 8) { setStatus("pass-status", "password must be at least 8 characters"); return; }
   const btn = $("change-pass");
   btn.disabled = true;
-  $("pass-status").textContent = "changing...";
+  setStatus("pass-status", "changing...");
   try {
     // The password itself never crosses the network - derive the new key
     // pair here and send those (inside the current session's envelope).
@@ -334,14 +341,14 @@ async function onChangePassword() {
       new_k_enc: b64e(nk.encBytes),
     });
     if (res.error) {
-      $("pass-status").textContent = res.error;
+      setStatus("pass-status", res.error);
       btn.disabled = false;
       return;
     }
     // Success: server wiped all sessions. Force a fresh login under the new key.
     showLogin("password changed - log in with the new password");
   } catch (err) {
-    $("pass-status").textContent = "change failed";
+    setStatus("pass-status", "change failed");
     btn.disabled = false;
   }
 }
@@ -350,6 +357,7 @@ async function onChangePassword() {
 
 function showModePicker() {
   currentMode = null;
+  viewGeneration++;
   $("app").innerHTML = `
     <h2>generate</h2>
     <div id="init-area"></div>
@@ -417,24 +425,62 @@ function fillSelect(sel, values, selected, labelFn) {
   }
 }
 
-async function checkInit() {
-  const st = await apiCall("/api/init-status", {});
+function renderInitError(msg) {
+  const area = $("init-area");
+  if (!area) return;
+  area.innerHTML = `<p class="err">${escapeText(msg)} &mdash; <a href="#" id="init-retry">retry</a></p>`;
+  $("mode-buttons").style.display = "none";
+  $("init-retry").addEventListener("click", (e) => { e.preventDefault(); checkInit(); });
+}
+
+const INIT_POLL_MS = 2000;
+const INIT_RETRY_MS = 3000;
+const INIT_MAX_RETRIES = 5;
+
+async function checkInit(retries = 0) {
+  let st;
+  try {
+    st = await apiCall("/api/init-status", {});
+  } catch (err) {
+    // A 401 already swapped in the login screen; there is nothing left to poll.
+    if (!$("init-area")) return;
+    if (retries < INIT_MAX_RETRIES) {
+      renderInitError(`${err.message || "server unreachable"} - retrying`);
+      setTimeout(() => checkInit(retries + 1), INIT_RETRY_MS);
+    } else {
+      renderInitError(err.message || "server unreachable");
+    }
+    return;
+  }
   renderInitState(st);
-  if (st.status === "loading") setTimeout(checkInit, 2000);
+  if (st.status === "loading") setTimeout(() => checkInit(), INIT_POLL_MS);
 }
 
 async function startInit() {
-  const st = await apiCall("/api/initialize", {
-    chat_model: $("chat-model-sel") ? $("chat-model-sel").value : undefined,
-    image_model: $("image-model-sel") ? $("image-model-sel").value : undefined,
-    chat_mode: $("chat-mode-sel") ? $("chat-mode-sel").value : undefined,
-  });
+  $("init-btn").disabled = true;
+  let st;
+  try {
+    st = await apiCall("/api/initialize", {
+      chat_model: $("chat-model-sel") ? $("chat-model-sel").value : undefined,
+      image_model: $("image-model-sel") ? $("image-model-sel").value : undefined,
+      chat_mode: $("chat-mode-sel") ? $("chat-mode-sel").value : undefined,
+    });
+  } catch (err) {
+    renderInitError(err.message || "couldn't start the models");
+    return;
+  }
   renderInitState(st);
-  if (st.status === "loading") setTimeout(checkInit, 2000);
+  if (st.status === "loading") setTimeout(() => checkInit(), INIT_POLL_MS);
 }
 
 async function doUnload() {
-  const st = await apiCall("/api/unload", {});
+  let st;
+  try {
+    st = await apiCall("/api/unload", {});
+  } catch (err) {
+    setStatus("chat-status", err.message || "shutting the models down failed");
+    return;
+  }
   renderInitState(st);
 }
 
@@ -451,6 +497,7 @@ async function openMode(mode) {
 // --- image-only mode ----------------------------------------------------------
 
 function renderImageOnly() {
+  viewGeneration++;
   $("app").innerHTML = `
     <p><a href="#" id="back">&larr; back</a> &nbsp; <a href="#" id="reset">clear session images</a></p>
     <h2>generate an image</h2>
@@ -521,10 +568,10 @@ async function onImageSubmit(e) {
     }
     const { image, used_prompt } = await apiCall("/api/image", payload);
     appendGalleryImage(image);
-    $("used-prompt").textContent = used_prompt ? `assist used: ${used_prompt}` : "";
-    $("image-status").textContent = "";
+    setStatus("used-prompt", used_prompt ? `assist used: ${used_prompt}` : "");
+    setStatus("image-status", "");
   } catch (err) {
-    $("image-status").textContent = err.message || "generation failed";
+    setStatus("image-status", err.message || "generation failed");
   } finally {
     btn.disabled = false;
   }
@@ -538,6 +585,7 @@ function renderChat() {
     : "";
   const gallery = imagesEnabled
     ? `<div id="gallery-panel"><h3>images this session</h3><div id="gallery"></div></div>` : "";
+  viewGeneration++;
   $("app").innerHTML = `
     <p><a href="#" id="back">&larr; back</a> &nbsp; <a href="#" id="reset">new conversation</a></p>
     <h2>conversation</h2>
@@ -579,10 +627,10 @@ async function onGetImage() {
   $("chat-status").textContent = "picturing the scene... (~45s: the LLM reads the conversation, then the image renders)";
   try {
     const { job_id } = await apiCall("/api/chat-image", {});
-    if (job_id) pollImageJob(job_id, (errMsg) => { $("chat-status").textContent = errMsg || ""; });
-    else $("chat-status").textContent = "";
+    if (job_id) pollImageJob(job_id, (errMsg) => setStatus("chat-status", errMsg || ""));
+    else setStatus("chat-status", "");
   } catch (err) {
-    $("chat-status").textContent = err.message || "image failed";
+    setStatus("chat-status", err.message || "image failed");
   } finally {
     btn.disabled = false;
   }
@@ -679,15 +727,15 @@ function beginEdit(div, index) {
   cancel.addEventListener("click", close);
   save.addEventListener("click", async () => {
     const content = ta.value.trim();
-    if (!content) { $("chat-status").textContent = "empty - use delete instead"; return; }
+    if (!content) { setStatus("chat-status", "empty - use delete instead"); return; }
     save.disabled = true;
     try {
       const { history } = await apiCall("/api/chat-edit", { index, content });
       renderTranscript(history);
-      $("chat-status").textContent = "";
+      setStatus("chat-status", "");
     } catch (err) {
       save.disabled = false;
-      $("chat-status").textContent = err.message || "edit failed";
+      setStatus("chat-status", err.message || "edit failed");
     }
   });
 }
@@ -696,9 +744,9 @@ async function onDeleteMessage(index) {
   try {
     const { history } = await apiCall("/api/chat-delete", { index });
     renderTranscript(history);
-    $("chat-status").textContent = "";
+    setStatus("chat-status", "");
   } catch (err) {
-    $("chat-status").textContent = err.message || "delete failed";
+    setStatus("chat-status", err.message || "delete failed");
   }
 }
 
@@ -783,10 +831,10 @@ async function streamTurn(bodyObj) {
       if (curSpan) curSpan.parentElement.scrollIntoView({ block: "end" });
     }
     if (curSpan && !text) curSpan.parentElement.remove();
-    $("chat-status").textContent = "";
+    setStatus("chat-status", "");
   } catch (err) {
     if (curSpan && !curSpan.textContent) curSpan.parentElement.remove();
-    $("chat-status").textContent = err.message || "failed to get a reply";
+    setStatus("chat-status", err.message || "failed to get a reply");
   } finally {
     btn.disabled = false;
     if (skipBtn) skipBtn.disabled = false;
@@ -818,21 +866,36 @@ function appendPlaceholder() {
   return div;
 }
 
+const IMAGE_POLL_MS = 2000;
+const IMAGE_POLL_MAX_POLLS = 150;
+
 async function pollImageJob(jobId, onDone) {
   const mode = currentMode;
+  // Comparing modes is not enough: leaving a mode and coming back to it rebuilds
+  // #gallery, so the captured placeholder is detached while the mode matches
+  // again - the finished image would land in a subtree nobody can see.
+  const gen = viewGeneration;
   const placeholder = appendPlaceholder();
+  let polls = 0;
   const poll = async () => {
-    if (currentMode !== mode) return; // navigated away, stop polling
+    if (viewGeneration !== gen) return;
     let result;
     try {
       result = await apiCall("/api/image-status", { mode, job_id: jobId });
     } catch (err) {
+      if (viewGeneration !== gen) return;
       placeholder.remove();
       if (onDone) onDone(err.message || "image failed");
       return;
     }
+    if (viewGeneration !== gen) return;
     if (result.status === "pending") {
-      setTimeout(poll, 2000);
+      if (++polls >= IMAGE_POLL_MAX_POLLS) {
+        placeholder.remove();
+        if (onDone) onDone("image is taking too long - giving up on it");
+        return;
+      }
+      setTimeout(poll, IMAGE_POLL_MS);
     } else if (result.status === "done" && result.image) {
       const img = document.createElement("img");
       img.src = "data:image/png;base64," + result.image;
@@ -844,7 +907,7 @@ async function pollImageJob(jobId, onDone) {
       if (onDone) onDone(result.error || "image generation failed");
     }
   };
-  setTimeout(poll, 2000);
+  setTimeout(poll, IMAGE_POLL_MS);
 }
 
 // --- boot -----------------------------------------------------------------

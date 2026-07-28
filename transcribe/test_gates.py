@@ -82,7 +82,7 @@ check("record annotation is not treated as spoken money", has(out, "$37.66"), Tr
 # --- sold today ---------------------------------------------------------------
 print("\nsold-today gate")
 
-BIZ = {"sales": {"orders": [{"items": [
+BIZ = {"sales": {"orders": [{"source": "revel", "items": [
     {"name": "Sandia Spice"}, {"name": "Immune Support - Organic"},
     {"name": "Gift Card"}, {"name": "Mediterranean Mint | Bulk"}]}]}}
 
@@ -108,7 +108,8 @@ check("unrelated SKU far from the trigger is kept",
 # rang up, each name sitting just outside the 60-char window.
 FAR = ("Jason asked for marshmallow root and requested a pound of marshmallow "
        "roux, but it was unavailable\n")
-BIZ2 = {"sales": {"orders": [{"items": [{"name": "Marshmallow Root - Organic"},
+BIZ2 = {"sales": {"orders": [{"source": "revel",
+                              "items": [{"name": "Marshmallow Root - Organic"},
                                         {"name": "Gift Card"}]}]}}
 check("a sold product asserted unavailable is dropped, however far away",
       has(P._reject_sold_reorders(FAR, BIZ2), "marshmallow"), False)
@@ -116,10 +117,29 @@ check("a sold product asserted unavailable is dropped, however far away",
 # ...but a SUBSTITUTE offered after the marker is in stock on purpose. This is
 # what the sentence is telling you, and searching past the marker deleted a
 # genuine unmet-demand finding because the substitute had sold that day.
-BIZ3 = {"sales": {"orders": [{"items": [{"name": "Cinnamon Chips - Organic"}]}]}}
+BIZ3 = {"sales": {"orders": [{"source": "revel",
+                              "items": [{"name": "Cinnamon Chips - Organic"}]}]}}
 SUB = "Customer asked for cinnamon sticks but we only have cinnamon chips\n"
 check("a substitution offer is not an unavailability claim about the substitute",
       has(P._reject_sold_reorders(SUB, BIZ3), "cinnamon sticks"), True)
+
+# Only a REGISTER sale proves what was on the shelf. An online order ships from
+# the warehouse hours later, so reading it as proof of stock deletes exactly the
+# unmet-demand finding the log exists to capture. Unlabelled orders read online.
+UNMET = "## Unresolved\n- Reorder marshmallow root - asked for and unavailable\n"
+ONLINE_SALE = {"sales": {"orders": [
+    {"source": "3dcart", "items": [{"name": "Marshmallow Root - Organic"}]}]}}
+REGISTER_SALE = {"sales": {"orders": [
+    {"source": "revel", "items": [{"name": "Marshmallow Root - Organic"}]}]}}
+check("an online sale does not disprove unmet demand on the floor",
+      has(P._reject_sold_reorders(UNMET, ONLINE_SALE), "marshmallow"), True)
+check("...an unlabelled sale reads as online too",
+      has(P._reject_sold_reorders(
+          UNMET, {"sales": {"orders": [
+              {"items": [{"name": "Marshmallow Root - Organic"}]}]}}),
+          "marshmallow"), True)
+check("...but a register sale does",
+      has(P._reject_sold_reorders(UNMET, REGISTER_SALE), "marshmallow"), False)
 
 
 # --- garble, quotes and non-events --------------------------------------------
@@ -385,6 +405,112 @@ check("condition recorded for its own sake is dropped", has(out, "tooth anxiety"
 check("...a wellness shopping question survives", has(out, "anti-inflammatory"), True)
 check("...so does a caffeine-free request", has(out, "migraines"), True)
 check("...and unrelated items are untouched", has(out, "label printer"), True)
+
+
+
+# --- linkage-name surgery -----------------------------------------------------
+print("\nlinkage name stripping")
+
+# Half this shop's catalog is also a first name, which is the whole difficulty.
+LCAT = [{"name": "Jasmine Green Tea"}, {"name": "Rose Petal"},
+        {"name": "Earl Grey - Organic"}]
+
+check("without a catalog nothing can be proven a product",
+      P._reads_as_product("", " Green Tea", set()), False)
+check("...with a catalog the follower has to be in it",
+      P._reads_as_product("", " Lopez we discontinued it", {"green", "petal"}), False)
+check("...a catalog word still spares the name",
+      P._reads_as_product("", " Petal to a regular", {"green", "petal"}), True)
+check("...and a catalog word BEFORE it spares a name that ends a product",
+      P._reads_as_product("bought crystallized ", " while discussing her nausea",
+                          {"crystallized", "ginger"}), True)
+
+# A capitalized surname read as a product shipped BOTH names off a sentence the
+# scan had already flagged.
+out = P._strip_linkage_names(
+    "- Maria Gonzalez came in about her divorce\n",
+    ["Maria | Maria Gonzalez came in about her divorce"], LCAT)
+check("a surname is not evidence of a product", has(out, "maria"), False)
+check("...and the surname goes with it", has(out, "gonzalez"), False)
+
+# A failed products fetch must not re-open the leak: with no catalog to check
+# against, nothing can be proven a product, so the strip proceeds.
+out = P._strip_linkage_names(
+    "- Maria Gonzalez came in about her divorce\n",
+    ["Maria | Maria Gonzalez came in about her divorce"], [])
+check("no catalog still strips the given name", has(out, "maria"), False)
+check("...and the surname too", has(out, "gonzalez"), False)
+
+# The scan names the full name; the draft carries only the given name.
+out = P._strip_linkage_names(
+    "- Maria came in about her divorce\n",
+    ["Maria Lopez | Maria Lopez came in about her divorce"], LCAT)
+check("a full-name finding still strips a given-name mention", has(out, "maria"), False)
+
+# A name that ends a product name survives when the product word precedes it.
+out = P._strip_linkage_names(
+    "- A customer bought crystallized Ginger while discussing her nausea\n",
+    ["Ginger | A customer bought crystallized Ginger while discussing her nausea"],
+    [{"name": "Crystallized Ginger"}])
+check("a name ending a product is not stripped", has(out, "ginger"), True)
+
+out = P._strip_linkage_names(
+    "- Sold a tin of Rose Petal to a regular who mentioned her migraines\n",
+    ["Rose | Rose Petal to a regular who mentioned her migraines"], LCAT)
+check("a real product of the same name keeps it", has(out, "rose petal"), True)
+
+# The scan paraphrases its own fragment, so the fragment routinely matches
+# nothing - which is exactly when the name it flagged must not ship.
+out = P._strip_linkage_names(
+    "- Deborah mentioned she is going through chemotherapy\n",
+    ["Deborah | Deborah is undergoing cancer treatment"], LCAT)
+check("an unlocatable fragment still strips the name", has(out, "deborah"), False)
+check("...and the event survives", has(out, "chemotherapy"), True)
+
+# ...without widening the strip when the sentence IS found: a name on an
+# operational fact is the point of the log.
+out = P._strip_linkage_names(
+    "- Deborah asked us to hold two tins of Earl Grey until Friday\n"
+    "- Deborah mentioned her chemotherapy while browsing\n",
+    ["Deborah | Deborah mentioned her chemotherapy"], LCAT).splitlines()
+check("the flagged sentence loses the name", has(out[1], "deborah"), False)
+check("...a commitment elsewhere keeps it", has(out[0], "deborah"), True)
+
+# "A.J." ends on a non-word character, so a trailing \b can never match it.
+out = P._strip_linkage_names(
+    "- A.J. came in and talked about his surgery\n",
+    ["A.J. | A.J. talked about his surgery"], LCAT)
+check("a name ending in punctuation is stripped", has(out, "a.j."), False)
+check("...and its event survives", has(out, "surgery"), True)
+
+
+
+# --- summarizer seed ----------------------------------------------------------
+print("\nseed guard")
+
+def _seed_under(value):
+    """The guard runs at import, so re-exec the module to observe it."""
+    old = os.environ.get("SUMMARIZER_SEED")
+    os.environ.pop("SUMMARIZER_SEED", None)
+    if value is not None:
+        os.environ["SUMMARIZER_SEED"] = value
+    try:
+        m = types.ModuleType("seed_probe")
+        m.__dict__["__file__"] = SRC
+        exec(compile(open(SRC).read(), SRC, "exec"), m.__dict__)
+        return m.SUMMARIZER_SEED
+    finally:
+        os.environ.pop("SUMMARIZER_SEED", None)
+        if old is not None:
+            os.environ["SUMMARIZER_SEED"] = old
+
+check("an explicit seed is honoured", _seed_under("12345"), 12345)
+check("unset means the reproducible default", _seed_under(None), P._DEFAULT_SEED)
+for sentinel in ("0", "-1", "4294967295"):
+    check(f"llama.cpp's random sentinel {sentinel} is refused",
+          _seed_under(sentinel), P._DEFAULT_SEED)
+check("a non-numeric seed falls back instead of aborting the night's run",
+      _seed_under("today"), P._DEFAULT_SEED)
 
 
 

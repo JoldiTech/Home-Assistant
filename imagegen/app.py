@@ -33,6 +33,7 @@ import asyncio
 import base64
 import binascii
 import concurrent.futures
+import contextlib
 import contextvars
 import ctypes
 import re
@@ -158,6 +159,11 @@ PORT = int(os.environ.get("PORT", "8189"))
 
 SESSION_IDLE_TIMEOUT = 20 * 60  # session (and its conversation) dies after this much inactivity
 CHALLENGE_TTL = 60  # a login challenge nonce is only valid this long
+# /api/challenge is unauthenticated by construction (it has to be - it precedes
+# login), so anonymous traffic sizes the pending map. Bounded by shedding
+# entries, never by turning a caller away - see _shed_challenges_locked.
+MAX_PENDING_CHALLENGES = 4096
+REAPER_INTERVAL = 60  # how often the background sweep of expired state runs
 LOGIN_MAX_ATTEMPTS = 5
 LOGIN_WINDOW_SECONDS = 15 * 60
 MAX_HISTORY = 40  # messages kept per conversation, oldest dropped past this
@@ -271,11 +277,23 @@ def _load_config():
 
 _load_config()
 
-app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    reaper = asyncio.create_task(_reap_expired())
+    try:
+        yield
+    finally:
+        reaper.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reaper
+
+
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=_lifespan)
 
 # --- in-memory-only state (dies with the process, by design) ----------------
 _sessions: dict[str, dict] = {}
-_challenges: dict[str, float] = {}
+_challenges: dict[str, dict] = {}
 _login_attempts: dict[str, deque] = defaultdict(deque)
 _state_lock = threading.Lock()
 _gpu_lock = threading.Lock()
@@ -374,13 +392,22 @@ def _client_ip(request: Request) -> str:
     return request.headers.get("cf-connecting-ip", request.client.host)
 
 
+def _prune_attempts_locked(ip: str, now: float) -> int:
+    """Drop this IP's out-of-window attempts, and the IP itself once it has
+    none left - otherwise every source address that ever tried to log in owns
+    a permanent map entry."""
+    attempts = _login_attempts[ip]
+    while attempts and now - attempts[0] > LOGIN_WINDOW_SECONDS:
+        attempts.popleft()
+    if not attempts:
+        del _login_attempts[ip]
+    return len(attempts)
+
+
 def _rate_limited(ip: str) -> bool:
     now = time.time()
     with _state_lock:
-        attempts = _login_attempts[ip]
-        while attempts and now - attempts[0] > LOGIN_WINDOW_SECONDS:
-            attempts.popleft()
-        return len(attempts) >= LOGIN_MAX_ATTEMPTS
+        return _prune_attempts_locked(ip, now) >= LOGIN_MAX_ATTEMPTS
 
 
 def _record_failure(ip: str) -> None:
@@ -407,6 +434,54 @@ def _touch_session(token: str) -> dict | None:
             return None
         s["last_seen"] = now
         return s
+
+
+def _sweep_expired_locked(now: float) -> None:
+    for k in [k for k, ch in _challenges.items() if ch["exp"] < now]:
+        del _challenges[k]
+    for tok in [tok for tok, s in _sessions.items() if now - s["last_seen"] > SESSION_IDLE_TIMEOUT]:
+        del _sessions[tok]
+    for ip in list(_login_attempts):
+        _prune_attempts_locked(ip, now)
+
+
+def _shed_challenges_locked() -> None:
+    """Bound the pending-challenge map by dropping entries, never by refusing
+    the incoming request - nothing tells an anonymous flood's challenges apart
+    from the owner's, so shedding the newest would hand any caller on the
+    internet a complete login lockout. Victims are the oldest challenges held
+    by whichever client IPs hold the most, so a flood evicts its own entries
+    instead of the one person trying to log in. Shed a batch at a time so this
+    scan is amortized rather than run under the state lock on every request.
+    """
+    held: dict[str, int] = defaultdict(int)
+    for ch in _challenges.values():
+        held[ch["ip"]] += 1
+
+    def rank(nonce_b64: str) -> tuple[int, float]:
+        ch = _challenges[nonce_b64]
+        return -held[ch["ip"]], ch["exp"]
+
+    for nonce_b64 in sorted(_challenges, key=rank)[: 1 + len(_challenges) // 8]:
+        del _challenges[nonce_b64]
+
+
+async def _reap_expired() -> None:
+    """The 20-minute idle death of a session - and with it its conversation
+    and gallery - is a guarantee, so a timer enforces it instead of leaving it
+    to traffic. A session's own idle check only runs when THAT token is
+    presented again, which for an abandoned tab is never.
+    """
+    while True:
+        try:
+            await asyncio.sleep(REAPER_INTERVAL)
+            with _state_lock:
+                _sweep_expired_locked(time.time())
+        except Exception as e:
+            # This loop is the only thing that expires an abandoned session, so
+            # a failed sweep must not kill it silently. Cancellation is a
+            # BaseException and still propagates, so shutdown stays clean.
+            print(f"session sweep failed: {e}", flush=True)
 
 
 # Envelopes are encrypted under the PER-SESSION key (password + ephemeral
@@ -500,7 +575,8 @@ async def index():
 
 
 @app.post("/api/challenge")
-async def challenge():
+async def challenge(request: Request):
+    ip = _client_ip(request)
     nonce = os.urandom(16)
     nonce_b64 = base64.b64encode(nonce).decode()
     # Fresh ephemeral ECDH pair per challenge - the private half lives only in
@@ -508,18 +584,10 @@ async def challenge():
     # key, it gives every session forward secrecy.
     eph_priv = ec.generate_private_key(ec.SECP256R1())
     server_pub = eph_priv.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
-    now = time.time()
     with _state_lock:
-        # opportunistic sweep of expired challenges and idle sessions - a
-        # session's own idle check only runs when THAT token is reused, so
-        # without this, sessions nobody ever revisits (e.g. every page
-        # reload starts a fresh login here, by design - see app.js) would
-        # sit in memory, galleries and all, until the process restarts.
-        for k in [k for k, ch in _challenges.items() if ch["exp"] < now]:
-            del _challenges[k]
-        for tok in [tok for tok, s in _sessions.items() if now - s["last_seen"] > SESSION_IDLE_TIMEOUT]:
-            del _sessions[tok]
-        _challenges[nonce_b64] = {"exp": now + CHALLENGE_TTL, "priv": eph_priv}
+        if len(_challenges) >= MAX_PENDING_CHALLENGES:
+            _shed_challenges_locked()
+        _challenges[nonce_b64] = {"exp": time.time() + CHALLENGE_TTL, "priv": eph_priv, "ip": ip}
     return {"nonce": nonce_b64, "server_pub": base64.b64encode(server_pub).decode()}
 
 
@@ -917,8 +985,7 @@ def _build_base_pipe():
     adapter, so ordinary images are pristine. DPM++ Karras + TAESD for speed and
     to kill the VAE-decode VRAM spike. Caller holds _gpu_lock."""
     print("loading SDXL checkpoint (GPU, fast path)...", flush=True)
-    p = StableDiffusionXLPipeline.from_single_file(
-        _image_model_path(), torch_dtype=torch.float16, use_safetensors=True)
+    p = _load_sdxl()
     p.scheduler = DPMSolverMultistepScheduler.from_config(
         p.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++")
     p.vae = AutoencoderTiny.from_pretrained("madebyollin/taesdxl", torch_dtype=torch.float16)
@@ -936,8 +1003,7 @@ def _build_ref_pipe():
         if not os.path.exists(os.path.join(IP_ADAPTER_DIR, fn)):
             raise ReferenceUnavailable("the reference-photo model isn't installed on this server")
     print("building FaceID reference pipeline...", flush=True)
-    p = StableDiffusionXLPipeline.from_single_file(
-        _image_model_path(), torch_dtype=torch.float16, use_safetensors=True)
+    p = _load_sdxl()
     p.scheduler = DPMSolverMultistepScheduler.from_config(
         p.scheduler.config, use_karras_sigmas=True, algorithm_type="dpmsolver++")
     p.vae = AutoencoderTiny.from_pretrained("madebyollin/taesdxl", torch_dtype=torch.float16)
