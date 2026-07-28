@@ -81,19 +81,31 @@ _NOTHINK = os.environ.get("SUMMARIZER_NOTHINK", "1") != "0"
 # Let the model re-order the candidate bullets by consequence. Measured and
 # OFF - see _llm_rank for the numbers and for why it loses.
 SUMMARIZER_RANK = os.environ.get("SUMMARIZER_RANK", "0") != "0"
-# How much transcript the notes pass reads at once. Smaller than the context
-# window on purpose - see the chunking call in _summarize for why. Measured on
-# 2026-07-19, one knob changed, same model and audio:
-#   5000 tok/slice ->  9 slices,  71 notes, 5 of 9 findings
+# How much transcript the notes pass reads at once, independent of the prompt
+# budget. Shrinking it demonstrably extracts more - measured on 2026-07-19,
+# one knob changed, everything else held:
+#
+#   5000 tok/slice ->  9 slices,  71 notes, 3 of 9 findings reached the notes
 #   2200 tok/slice -> 19 slices, 150 notes, 4 of 9
 #   1200 tok/slice -> 35 slices, 280 notes, 7 of 9
-# Note volume tracks slice COUNT almost exactly - the model writes about the
-# same number of bullets per read however much it is handed - which is the
-# whole reason this is a separate knob from the prompt budget. Treat the
-# finding counts as noisy (2200 scoring under 5000 is not a real inversion;
-# repeat runs of the same budget have differed by two), so only the 1200 jump
-# is big enough to act on.
-NOTES_SLICE_TOKENS = int(os.environ.get("NOTES_SLICE_TOKENS", "1200"))
+#
+# Note volume tracks slice COUNT almost exactly: the model writes about the
+# same number of bullets per read however much it is handed.
+#
+# And it does NOT reach the log. End to end on the same day, same code, only
+# this knob changed, both runs carried 2 of 9 - the 1200 run simply carried a
+# DIFFERENT two. More than double the extraction bought nothing, because
+# mis-hears multiply at exactly the same rate as findings and land in the same
+# place: "a customer asked for X but it was unavailable" scores the
+# unmet-demand bonus whether X is saffron or "a train to Denver", and a
+# 1200-token run produced a Worth-remembering list that was mostly the latter.
+#
+# So the ceiling is not extraction, and it was not selection either - it is
+# that nothing downstream can tell a real request from a mis-heard one. Until
+# something can, a bigger candidate pool is just a noisier one. Kept as a knob
+# because the extraction result is solid and will matter once that gate
+# exists; defaulted back to the size that was measured, not assumed.
+NOTES_SLICE_TOKENS = int(os.environ.get("NOTES_SLICE_TOKENS", "5000"))
 
 DEFAULT_REPO = "JoldiTech/Home-Assistant"
 LOG_BRANCH = "captains-log"
