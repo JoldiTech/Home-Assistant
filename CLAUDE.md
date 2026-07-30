@@ -658,7 +658,18 @@ Every one of these produced a confident wrong conclusion at least once:
   from the `captains-log` branch via the GitHub API (read PAT in
   `/config/captains_gh.token`) and emits `{"count", "content"}`. The **"Captain's
   Log"** view on the **DowntownControls** dashboard (`dashboard-downtowncontrols`)
-  renders `content` (one collapsible `<details>` per day).
+  renders `content` (one collapsible `<details>` per day). It reads every rendered
+  day in **two GraphQL round trips**; the REST version cost one request per file
+  and was drifting toward the sensor's 15 s `command_timeout` as days accumulated,
+  and a killed process drops the sensor entirely rather than showing the error
+  card. **`/share/` is not in git** — editing `scripts/render_captains_log.py`
+  changes nothing until it is copied to the box.
+- **You cannot test the GitHub API from the Claude sandbox.** Every call returns
+  `403 Forbidden` through the environment's MITM proxy, *including* calls that
+  work perfectly on the boxes. This looks exactly like a bad token or a scope
+  problem and it is neither — it cost a needless rollback of a working script.
+  Test GitHub-facing code by running it **on the AI box** (`ssh aibox`, which has
+  python3 and direct egress), never from the sandbox.
 - **Control panel (on-demand runs):** the trigger service exposes `POST /run`
   (full log, reuses an existing transcript), `POST /transcribe` (audio-only —
   stage the slow ~30 min step, build the log later in seconds), and `GET /status`
@@ -750,15 +761,17 @@ the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
    (session cookie, no Max-Age). No database, no disk writes of content.
 
 - **Persisted state (the only two things on disk):** `/var/lib/imagegen/`
-  (owned by `nmteaco`, mode 700; `ReadWritePaths` hole in the strict sandbox).
-  `password` = current password, plaintext, mode 600 (server is the trusted
-  endpoint and needs it to derive keys — same trust model as `protect.env`).
+  (owned by `nmteaco`, mode 700; a systemd `StateDirectory=imagegen`, not a
+  `ReadWritePaths` hole). `k_auth` = the **auth half** of the password's PBKDF2
+  output, mode 600 — a login verifier only. PBKDF2's halves are computationally
+  independent, so it cannot yield the encryption key; the enc half is never
+  stored, and any legacy plaintext `password` file is deleted at start.
   `prompts.enc` = the editable prompts (assistant system prompt + image-prompt
   prefix), AES-GCM encrypted under the password-derived key, decrypted only at
-  time of use. First-ever start seeds `password` from `IMAGEGEN_PASSWORD` (via
+  time of use. First-ever start seeds `k_auth` from `IMAGEGEN_PASSWORD` (via
   the systemd EnvironmentFile `/etc/nmteaco/imagegen.env`), then the file wins.
 - **Settings (after login):** edit the assistant prompts (persisted encrypted),
-  and **change the password** — which rewrites the password file, re-derives the
+  and **change the password** — which rewrites `k_auth`, re-derives the
   keys, re-encrypts the prompts under the new key, and clears all sessions. The
   password IS the encryption key until changed again.
 - **Network:** binds `127.0.0.1:8189` only. Public hostname → tunnel →
