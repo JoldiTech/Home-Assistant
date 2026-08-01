@@ -1,100 +1,225 @@
 # Captain's Log
 
-A daily, **de-identified** operational summary of the Tea One store audio — a
-"captain's log of the day," not a transcript of everything said in the store.
+A daily operational summary of the shop — shop-floor audio distilled into a
+de-identified narrative, plus the day's hard business numbers (sales, shipping,
+support, calls/texts, staff hours) pulled from the dashboard's datalog API.
+
+## The business day is 6pm–6pm Mountain
+
+The log for date **D** covers **6:00pm on D-1 through 6:00pm on D**. After-hours
+online orders, support emails, and texts are handled at next opening, so they
+belong on the *next* day's log — a ticket that arrives 8pm July 20 shows up in
+the July 21 log. Downtown has no after-hours in-store sales by definition.
+
+The **audio** transcript still covers store hours of calendar day D (the mic
+window, 08:00–20:00). The one place the two windows meet is order-weaving, which
+uses only calendar-day-D register orders so the audio timeline stays coherent.
 
 ## How it works
 
 ```
-Local whisper transcribes each camera's audio  →  /share/<camera>_transcript.log   (transient, on the HA box)
-        │  once a day at 7pm MT
+HA fires the AI-box trigger at 7pm MT (one hour after the business day closes)
+        │
+        ▼  on the AI box (captains_pipeline.py)
+UniFi Protect audio → faster-whisper large-v3 (GPU) → day transcript
+dashboard datalog API → sales / shipping / support / calls / texts / timeclock
+Slack API → staff channel messages (real names)
+        │
         ▼
-Opus reads EVERY camera's transcript at once, writes ONE combined summary  →  captains_log/YYYY-MM-DD.md   (durable, in git)
-        │  only after the summary is committed + pushed
+POS orders woven into the transcript by timestamp
+  "[14:14] ⟦POS $43.50 (sample given) — Earl Grey, Honey Sticks ×3⟧"
+        │
+        ▼  local Qwen3-8B (GPU)
+summary draft → CORRELATION pass → REDACTION pass
+        │
+        ▼  deterministic (no LLM)
++ Business day / Support / Comms / Staff sections rendered straight from JSON
+        │
         ▼
-ALL raw transcripts are deleted.
+committed to captains_log/YYYY-MM-DD.md on the captains-log branch,
+raw transcript deleted
 ```
 
-Cameras are **auto-discovered**: the job globs `/share/*_transcript.log`, so
-pointing a new transcribe add-on at another camera is all it takes — the next
-nightly run includes it with zero code changes.
+- **Weaving** gives the summarizer ground truth: a sample offered on audio and
+  the matching sale minutes later become one connected observation, and garbled
+  product names get corrected against what the register actually rang up.
+- **Correlation pass**: the summarizer reads chronologically, so an end-of-day
+  conversation about an order discrepancy can't cite the morning order it
+  concerns. A second pass re-reads the finished draft against a one-line-per-
+  record digest of the whole day (orders, tickets, calls) and appends references
+  like *"(likely order #58212, $43.50 at 2:14pm)"* — only ever using ids that
+  exist in the records, marking inferred links "likely".
+- **Catalog pass**: quoted product names are cross-checked against the real
+  catalog (the datalog `products` endpoint — 3dcart, the canonical list, with
+  live stock). A deterministic fuzzy matcher finds names that don't exist and
+  their closest real candidates; the LLM then adjudicates each as *misheard*
+  (corrected to the catalog spelling — "Munch's Blend" → "Monk's Blend"),
+  *real but not carried* (kept and tagged — premium unmet-demand signal), or
+  *garble* (dropped). This reaches exactly the names POS weaving can't:
+  out-of-stock requests never ring up, so they have no order line to correct
+  against. Whisper also gets a tea-vocabulary `hotwords` list so "pu-erh"
+  stops arriving as "poire" in the first place.
+- **Stock cross-check (deterministic)**: when a bullet claims something was
+  out of stock but the website shows stock, the contradiction itself is
+  flagged in code — `⚠ website shows in stock: …` — either the site is
+  overselling or the floor missed inventory, and both are worth knowing.
 
-**The split is deliberate:** the *local model* only transcribes (mechanical). The
-*judgment* — what's worth keeping and what must never be written down — is done by
-Opus at summary time. The raw, word-for-word transcript is never kept; only the
-scrubbed daily log survives.
+> **Every gate below runs over CLAIMS, not lines.** A claim is a bullet *or one
+> sentence of a narrative paragraph* (`_edit_claims`). They used to inspect only
+> lines starting with `-`, which left the narrative — half the log — ungated: on
+> 2026-07-26 the discrepancy gate correctly dropped
+> `- Reconcile the register shortfall of $23.50` and the identical invented
+> figure shipped in paragraph one anyway.
 
-## Multi-camera: combining is the summary step
+- **Prompt-echo backstop (`_reject_prompt_echoes`)**: the 8B model treats its
+  own instructions as source material. "Reorder XL gloves" shipped on four
+  consecutive days off a worked example, on two of which the real Slack request
+  had not been made yet; "teas safe during pregnancy" shipped twice with the
+  string nowhere in the input; and 2026-07-26's invented `$23.50` register
+  discrepancy came straight out of the POS **format** example. Every concrete
+  example in every prompt is now a `[bracketed]` slot. This is the backstop if
+  one is ever re-added: it compares content bigrams, so a re-worded echo still
+  matches, skips examples introduced by a negative cue ("never write …"),
+  ignores pairs built only from common log vocabulary, and is self-limiting —
+  a phrase the shop genuinely discussed today is in the grounding text and is
+  never blocked. `transcribe/test_gates.py` asserts the blocklist is empty,
+  which is the healthy state.
+- **Discrepancy gate (`_reject_unsupported_discrepancies`)**: the summarizer
+  invents register discrepancies — it fabricated one on three consecutive days,
+  turning a cashier reading a total and a routine sale into shortfalls to
+  reconcile. Rewording the prompt didn't stop it; it is matching the Unresolved
+  format rather than reading the day. Somebody must have reported money going
+  wrong, **and** the amount must appear within `DISCREPANCY_NEAR_LINES` of them
+  saying so. Presence alone was useless as a test: in a shop *every* sale total
+  is spoken aloud, which is how two POS order totals read to customers became
+  "unexplained shortfalls" hours later. Amounts inside record annotations are
+  excluded, so a correctly annotated real discrepancy can't fail its own gate.
+  The vocabulary is deliberately narrow: a bare "short" ("short on time") is
+  not a till problem.
+- **Sold-today gate (`_reject_sold_reorders`)**: a sale is proof of stock, so a
+  reorder **or unavailability** claim naming something the register rang up
+  that day is dropped. The prompt says this too and the model ignores it — it
+  asked to reorder Lady Londonderry on a day someone bought 8oz, and asserted
+  in prose that a Nilgiri iced tea blend and a Sandia Spice / immune-support
+  pair were unavailable when the woven POS lines proving all three sold were in
+  its own input. The sold product must sit within 60 characters of the trigger:
+  without that window a real finding about gift-card *processing* was deleted
+  because "Gift Card" is also a register line item.
+- **Garble gate (`_drop_garble_claims`)**: claims whose subject is
+  mis-transcription — mixed scripts, 7+ word strings, comma-salad — are
+  removed, and the catalog matcher refuses to rename garble into a real
+  product. Without this the stock cross-check finds a genuine product name
+  buried inside noise and promotes the whole string to a verified reorder.
+  Any one garbled quote sinks the claim; a bullet naming one real product and
+  one piece of noise is still unactionable.
+- **Unverified names lose their quotes (`_unquote_unverified`)**: the garble
+  test is deliberately conservative — real unmet demand is the log's most
+  valuable content and looks exactly like a short unknown name. So short
+  mis-hears that survive it ("Cork option paper", "boochoo", "the dealership")
+  are not deleted; they lose their quotation marks. The policy asked for this
+  outright — *a quoted string is treated downstream as a real product name* —
+  and it keeps the event while dropping the false authority.
+- **Training artifacts (`_reject_training_artifacts`)**: register training is
+  speech *about* orders. A trainer's "I want to give you some fake orders"
+  followed by three inventions became a log's opening sentence as genuine unmet
+  demand. A quoted name occurring only inside a training window is dropped; the
+  same name asked for elsewhere in the day survives.
+- **Non-events and generic openers (`_drop_non_events`, `_fix_generic_opener`)**:
+  both are banned in the prompt and both shipped anyway — "…but no action was
+  taken", and "A steady flow of customers entered the shop", the exact phrase
+  the prompt names as forbidden. Now enforced in code. The opener is only cut
+  when the paragraph has a real sentence behind it.
+- **Annotation cap (`_validate_annotations`)**: the correlation prompt allows
+  at most 3 record references and forbids attaching them to product mentions;
+  neither was enforced, and logs shipped 5+, mostly on products. Excess
+  references are now dropped by priority — action bullets and money-gone-wrong
+  lines keep theirs, narrative product mentions lose theirs. Register/cash
+  lines additionally reject orders placed outside store hours, since money
+  handled at the counter cannot be an overnight online order.
+- **Deterministic sections**: dollar figures, counts, names, and hours never
+  pass through the LLM — they're rendered directly from the datalog JSON after
+  redaction, so they can't be mangled or hallucinated.
+- Every business fetch is **fail-soft**: an unreachable endpoint becomes a
+  "_data unavailable_" line, never a failed run. A day with no captured speech
+  still gets a log with the business sections.
 
-There is **no separate "combine" stage**. Every camera's transcript is just more
-input to the one summary pass — Opus reads them all together (each under a
-`===== CAMERA: <name> =====` header, with timestamps) and, while writing the
-single day's log, naturally:
+## Privacy policy (the summarizer MUST follow this)
 
-- **De-duplicates** — two cameras that overhear the *same* counter conversation
-  (both catch the "instant chai" chat in the same minute) become **one** event in
-  the log, not two.
-- **Cross-reconstructs** — each camera catches slightly different fragments; using
-  them together yields a more complete, higher-confidence read than any one alone
-  (the transcription is lossy, so this genuinely helps).
-- **Locates** — which cameras heard it says roughly *where in the store* it was.
+**The rule is linkage, not names.** A *customer* name attached to an
+operational fact is welcome — "send samples to Nancy Brown", "hold two tins for
+the Duran account" are exactly what makes the log actionable. What must never
+appear is a **named person tied to sensitive content**: health/medical details,
+personal-life circumstances, or attributed remarks ("so-and-so said/felt X").
+The fix is breaking the link, not deleting the fact — "a customer asked about
+teas safe during pregnancy" stays; naming her in that sentence doesn't. The
+*condition* is generalised too, not just the name: record the need, never the
+diagnosis — in a shop this size a specific diagnosis identifies someone even
+with no name on it.
 
-That's it — no clustering pipeline, no per-camera code. Adjacent cameras (e.g.
-Tea One + Emporium Hall) overlap the most and help each other the most.
+**Staff names never sit on something a staff member said.** Requests, opinions,
+observations and remarks go in without the name — "restock XL gloves (a staff
+request)", never "per George's request". The operational fact is the point;
+who said it is not. This is enforced in code (`_strip_staff_attribution`)
+against the day's real roster, not left to the model. The one place staff names
+do appear is the appended **Staff** stats line, which is timeclock data — hours
+worked, not words spoken — and is added after the scrub runs.
 
-## Sanitization policy (the summarizer MUST follow this)
+Still dropped entirely, name or no name:
 
-The goal is an operational log for running the shop — **not** a record of who said
-what.
-
-**Include (de-identified, aggregate):**
-- Store rhythm — active hours, busy vs. quiet stretches, overall traffic feel.
-- Product / topic interest — which teas, categories, and questions came up (as
-  themes/counts, never tied to a person).
-- Operational events worth remembering — possible order/payment issues (e.g. a
-  chargeback), stock/supply mentions, equipment problems, notable large/wholesale
-  or curbside orders (amounts fine, names not).
-- Staff-surfaced business observations (e.g. "staff noted Sundays outperform
-  Mondays").
-- Anything actionable for running the shop.
-
-**Never write:**
-- Names of customers or staff, or anything that identifies a specific person.
-- Contact info (phone, email, address).
-- Health/medical details tied to an individual. (You may note *"a wellness-tea
-  consultation occurred"* in the aggregate — never the person or their specifics.)
-- Personal-life specifics (relationships, travel, family, religion, …).
-- Verbatim quotes that could identify someone.
-- Gossip or staff interpersonal conflict — include only if operationally relevant,
-  and then neutral + de-identified.
-
-**Rules of thumb:**
-- When in doubt, leave it out. A shorter, safer log beats an oversharing one.
-- Transcription is lossy (small model) — flag uncertain items as *"possible"* and
-  never assert shaky specifics as fact.
+- Personal-life chatter with no operational value (school, jobs, hobbies,
+  travel, family, relationships, religion, politics, feelings, small talk).
+- Contact info (phone, email, address) for any individual.
+- Verbatim quotes — attributed or not — and gossip. What was wanted, praised or
+  promised is reported in plain words, always naming the product at issue.
+- Garbled audio presented as fact — a detail that looks mis-transcribed is
+  dropped, never guessed at. Register (POS) product names are never garble.
+  Action items whose subject is mis-transcription are removed in code
+  (`_drop_garble_claims`), and the catalog matcher refuses to rename garble
+  into a real product — noise dressed up as a verified reorder is worse than
+  no bullet at all.
 
 ## Format
 
+The narrative half (`Hours active` / `Traffic` / `Product & topics` /
+`Notable / follow-ups` / `Staff & ops notes`) is written by the summarizer.
+Then the deterministic half is appended:
+
 ```markdown
-# Captain's Log — <Weekday> <YYYY-MM-DD>
+## Business day (6pm–6pm MT)
+**Online:** $512.40 retail (9 orders)
+**In-store:** $1,041.77 retail (33 orders) + $210.00 wholesale (1) · 2 pickup orders ($45.50)
+**Shipped:** 21 orders · 24 labels (1 voided) · postage $187.33 — USPS 18, UPS 3
 
-**Hours active:** …
-**Traffic:** …
+## Support
+3 new · 7 inbound messages · 2 closed · 5 open now
+(counts only — ticket details live in the support system; issues worth acting
+on surface in the narrative/Unresolved instead)
 
-## Product & topics
-- …
+## Comms
+**6 calls (25 min) · texts 4 in / 6 out · 1 text awaiting reply**
 
-## Notable / follow-ups
-- …
-
-## Staff & ops notes
-- …
-
-_Source: Tea One mic → local whisper (tiny.en) → summarized by Opus. Raw transcript discarded after this log was written._
+## Staff
+**15.9 labor hours**
+- Dawn S: 8:58am–5:02pm (7.54h, 32m break) — Downtown
 ```
+
+## Data sources & credentials
+
+All on the AI box in `/etc/nmteaco/captains.env` (mode 600, never committed):
+
+| Key | Purpose |
+| --- | --- |
+| `GITHUB_TOKEN` | push the finished log to the `captains-log` branch |
+| `DATALOG_API_TOKEN` | bearer token for `https://dashboard.nmteaco.com/tools/datalog/*.php` (same value lives in the dashboard's `/home/nmteaco/.env`) |
+| `DASHBOARD_BASE_URL` | optional override, default `https://dashboard.nmteaco.com` (www is bot-challenged) |
+| `SLACK_BOT_TOKEN` | optional; scopes `channels:history` (+`groups:history` for private channels), `users:read` — bot must be invited to the channels |
+| `SLACK_CHANNELS` | optional; comma-separated channel IDs to read |
 
 ## Retention
 
-The raw transcripts are **ephemeral** — every camera's log is deleted each night
-once the day's combined summary is safely in git. These dated summaries are the
-only durable record.
+Raw transcripts live only on the AI box (`~/captains_transcripts/`, never in
+git) and are **kept** so test reruns skip the ~30 min re-transcription — the
+pipeline reuses an existing day-file and only pays for the LLM stages
+(`FORCE_RETRANSCRIBE=1` redoes the audio; `DELETE_TRANSCRIPTS=1` restores
+delete-on-success). GitHub still only ever holds the sanitized dated
+summaries.

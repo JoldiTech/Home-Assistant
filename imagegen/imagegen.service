@@ -12,6 +12,15 @@ Environment=MODEL_PATH=/home/nmteaco/imagegen/models/juggernautXL_ragnarok.safet
 Environment=LLM_MODEL_PATH=/home/nmteaco/imagegen/models/Gemma-4-12B-OBLITERATED.Q4_K_M.gguf
 Environment=PORT=8189
 Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# The huggingface cache only appears on first download, but a ReadWritePaths
+# target that does not exist yet aborts start with 226/NAMESPACE, and
+# ProtectHome=read-only leaves the service no way to create it. '+' runs these
+# outside the sandbox, before the mount namespace is built. .cache itself is
+# chowned too: mkdir -p creates it as root on a fresh box, and a root-owned
+# ~/.cache blocks every other cache this machine's user needs (torch.hub for
+# demucs, pip).
+ExecStartPre=+/usr/bin/mkdir -p /home/nmteaco/.cache/huggingface
+ExecStartPre=+/usr/bin/chown nmteaco:nmteaco /home/nmteaco/.cache /home/nmteaco/.cache/huggingface
 ExecStart=/home/nmteaco/imagegen-env/bin/python /home/nmteaco/imagegen/app.py
 Restart=on-failure
 RestartSec=5
@@ -20,11 +29,16 @@ RestartSec=5
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-# Model + huggingface cache dirs need write access for the cache only -
-# no generated image or conversation content ever lands on disk.
-# /var/lib/imagegen holds the two persisted things: the current password
-# (plaintext, mode 600) and the prompts (encrypted under the derived key).
-ReadWritePaths=/home/nmteaco/.cache/huggingface /var/lib/imagegen
+# The huggingface cache is the only writable path outside the state dir, and
+# it is a cache - no generated image or conversation content ever lands on disk.
+ReadWritePaths=/home/nmteaco/.cache/huggingface
+# /var/lib/imagegen holds the two persisted things: the login verifier (the
+# auth half of the PBKDF2 output) and the prompts, encrypted under a key that
+# is never stored here. StateDirectory rather than ReadWritePaths because
+# systemd creates it before the sandbox exists, so a fresh box starts instead
+# of dying at 226/NAMESPACE.
+StateDirectory=imagegen
+StateDirectoryMode=0700
 PrivateTmp=yes
 PrivateDevices=no
 ProtectKernelTunables=yes

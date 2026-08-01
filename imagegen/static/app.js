@@ -1,21 +1,38 @@
 "use strict";
 /*
- * All crypto happens here, in the browser. The derived key never leaves
- * this tab - not sent to the server, not written to localStorage/
- * sessionStorage/IndexedDB. A page reload wipes it from memory, by design:
- * that's what makes "gone once the browser is closed" true rather than a
- * claim. The server independently derives the same key from its own copy
- * of the password, so nothing needs to cross the network to agree on it.
+ * All crypto happens here, in the browser. No key persists anywhere - not
+ * localStorage/sessionStorage/IndexedDB; a page reload wipes memory, by
+ * design. The server stores ONLY the auth half of the PBKDF2 output (a
+ * login verifier that cannot decrypt anything). Every login runs an
+ * ephemeral ECDH exchange; all traffic rides a session key bound to BOTH
+ * the password and that one-time secret, so once this tab closes, recorded
+ * ciphertext is undecryptable forever - even with the password (forward
+ * secrecy). The prompt-store key crosses only wrapped under the session
+ * key and lives in server RAM only.
  */
 
 const PBKDF2_ITERATIONS = 210000;
 const PBKDF2_SALT = new TextEncoder().encode("imagegen-e2e-v1");
 
-let kAuth = null; // raw bytes, HMAC key for the login proof only
-let kEnc = null; // CryptoKey, AES-GCM key for every request/response after login
+// The only key kept after login: the per-session AES-GCM key, bound to the
+// password AND an ephemeral ECDH exchange. It exists in this variable and the
+// server's session table, nowhere else - when this tab closes, everything
+// either end ever sent is undecryptable forever (forward secrecy).
+let kSess = null;
 let currentMode = null;
+let imagesEnabled = true;   // false in GPU-chat mode (SDXL not loaded)
+let viewGeneration = 0;
 
 const $ = (id) => document.getElementById(id);
+
+// A 401 makes showLogin() replace the whole view mid-request, so any node
+// addressed after an await may already be gone.
+const setStatus = (id, text) => { const el = $(id); if (el) el.textContent = text; };
+
+const CHAT_MODE_LABELS = {
+  cpu_images: "CPU chat + images (chat on CPU, GPU runs image generation)",
+  gpu_chat: "GPU chat, no images (fast chat on the GPU; image generation off)",
+};
 
 async function deriveKeys(password) {
   const passBytes = new TextEncoder().encode(password);
@@ -29,7 +46,34 @@ async function deriveKeys(password) {
   const authBytes = full.slice(0, 32);
   const encBytes = full.slice(32, 64);
   const encKey = await crypto.subtle.importKey("raw", encBytes, "AES-GCM", false, ["encrypt", "decrypt"]);
-  return { authBytes, encKey };
+  return { authBytes, encBytes, encKey };
+}
+
+// Ephemeral ECDH + password-bound session key:
+//   kSess = HMAC(kAuth, "session-v1" || nonce || ECDH_shared)
+// The DH share provides forward secrecy (both ephemeral privates die with
+// the session); mixing kAuth authenticates the exchange, so a relay that
+// doesn't know the password can't man-in-the-middle it.
+async function deriveSessionKey(authBytes, nonceBytes, serverPubB64) {
+  const myPair = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
+  const serverPub = await crypto.subtle.importKey(
+    "raw", b64d(serverPubB64), { name: "ECDH", namedCurve: "P-256" }, false, []);
+  const sharedBits = await crypto.subtle.deriveBits({ name: "ECDH", public: serverPub }, myPair.privateKey, 256);
+  const label = new TextEncoder().encode("session-v1");
+  const shared = new Uint8Array(sharedBits);
+  const input = new Uint8Array(label.length + nonceBytes.length + shared.length);
+  input.set(label); input.set(nonceBytes, label.length); input.set(shared, label.length + nonceBytes.length);
+  const kSessBytes = await hmacProof(authBytes, input);
+  const sessKey = await crypto.subtle.importKey("raw", kSessBytes, "AES-GCM", false, ["encrypt", "decrypt"]);
+  const myPubRaw = new Uint8Array(await crypto.subtle.exportKey("raw", myPair.publicKey));
+  return { sessKey, clientPubB64: b64e(myPubRaw) };
+}
+
+// The prompt-store key travels wrapped under the session key.
+async function wrapEncKey(sessKey, encBytes) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, sessKey, encBytes);
+  return { ek_iv: b64e(iv), ek_ct: b64e(new Uint8Array(ct)) };
 }
 
 async function hmacProof(authBytes, nonceBytes) {
@@ -54,15 +98,23 @@ function b64d(str) {
 async function encryptEnvelope(obj) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const plaintext = new TextEncoder().encode(JSON.stringify(obj));
-  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, kEnc, plaintext);
+  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, kSess, plaintext);
   return { nonce: b64e(iv), ciphertext: b64e(new Uint8Array(ciphertext)) };
 }
 
 async function decryptEnvelope(envelope) {
   const iv = b64d(envelope.nonce);
   const ciphertext = b64d(envelope.ciphertext);
-  const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, kEnc, ciphertext);
+  const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, kSess, ciphertext);
   return JSON.parse(new TextDecoder().decode(plaintext));
+}
+
+async function readJson(res) {
+  // Not every error body is JSON: an unhandled server error or a proxy 502
+  // arrives as plain text, and parsing that throws a SyntaxError whose message
+  // ("Unexpected token 'I'") hides the actual status from the user.
+  const text = await res.text();
+  try { return JSON.parse(text); } catch { return null; }
 }
 
 async function apiCall(path, payload) {
@@ -76,16 +128,22 @@ async function apiCall(path, payload) {
     showLogin("session expired - enter password again");
     throw new Error("session expired");
   }
-  const envelope = await res.json();
-  return decryptEnvelope(envelope);
+  const raw = await readJson(res);
+  if (!res.ok) {
+    // Error bodies (503 GPU-busy, 500) are plain JSON, not envelopes -
+    // surface the server's actual reason instead of a generic failure.
+    throw new Error((raw && raw.error) || `request failed (${res.status})`);
+  }
+  if (!raw) throw new Error("unreadable response from server");
+  return decryptEnvelope(raw);
 }
 
 // --- login ------------------------------------------------------------------
 
 function showLogin(error) {
-  kAuth = null;
-  kEnc = null;
+  kSess = null;
   currentMode = null;
+  viewGeneration++;
   $("app").innerHTML = `
     <h2>locked</h2>
     ${error ? `<p class="err">${escapeText(error)}</p>` : ""}
@@ -108,21 +166,32 @@ async function onLoginSubmit(e) {
   const btn = e.target.querySelector("button");
   btn.disabled = true;
   try {
-    const { authBytes, encKey } = await deriveKeys(password);
+    const { authBytes, encBytes } = await deriveKeys(password);
     const chRes = await fetch("/api/challenge", { method: "POST" });
-    const { nonce } = await chRes.json();
-    const proof = await hmacProof(authBytes, b64d(nonce));
+    const challenge = chRes.ok ? await readJson(chRes) : null;
+    if (!challenge) {
+      // Distinguish "server is unhappy" from "wrong password" - otherwise a
+      // restarting service reads as a rejected login.
+      showLogin("server is not responding - try again in a moment");
+      return;
+    }
+    const { nonce, server_pub } = challenge;
+    const nonceBytes = b64d(nonce);
+    const proof = await hmacProof(authBytes, nonceBytes);
+    const { sessKey, clientPubB64 } = await deriveSessionKey(authBytes, nonceBytes, server_pub);
+    const { ek_iv, ek_ct } = await wrapEncKey(sessKey, encBytes);
     const loginRes = await fetch("/api/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ nonce, proof: b64e(proof) }),
+      body: JSON.stringify({ nonce, proof: b64e(proof), client_pub: clientPubB64, ek_iv, ek_ct }),
     });
     if (!loginRes.ok) {
       showLogin("incorrect password");
       return;
     }
-    kAuth = authBytes;
-    kEnc = encKey;
+    // Only the session key survives past this point - the password-derived
+    // halves are dropped so nothing longer-lived than the session exists here.
+    kSess = sessKey;
     showModePicker();
   } catch (err) {
     showLogin("something went wrong, try again");
@@ -135,6 +204,7 @@ async function onLoginSubmit(e) {
 
 async function renderSettings() {
   currentMode = null;
+  viewGeneration++;
   $("app").innerHTML = `
     <p><a href="#" id="back">&larr; back</a></p>
     <h2>settings</h2>
@@ -145,6 +215,16 @@ async function renderSettings() {
     <textarea id="img-prefix" rows="3"></textarea>
     <button id="save-prompts">save prompts</button>
     <p id="prompts-status"></p>
+    <h3 style="margin-top:2rem">group chat (personas)</h3>
+    <p style="color:#888;font-size:.85rem">when enabled, every persona replies each turn, one after another
+      (each one sees the previous reply and can respond to it). address a persona by name and they answer first.</p>
+    <label><input type="checkbox" id="group-mode"> enable group chat</label>
+    <label>your name (what the assistants call you)</label>
+    <input id="user-name" placeholder="You" autocomplete="off">
+    <div id="personas-list"></div>
+    <button id="add-persona" type="button">+ add persona</button>
+    <button id="save-group">save group settings</button>
+    <p id="group-status"></p>
     <h3 style="margin-top:2rem">change password</h3>
     <p style="color:#888;font-size:.85rem">this password unlocks the app AND is the encryption key.
       changing it re-encrypts saved prompts and logs everyone out.</p>
@@ -155,27 +235,90 @@ async function renderSettings() {
   $("back").addEventListener("click", (e) => { e.preventDefault(); showModePicker(); });
   $("save-prompts").addEventListener("click", onSavePrompts);
   $("change-pass").addEventListener("click", onChangePassword);
+  $("add-persona").addEventListener("click", () => addPersonaCard());
+  $("save-group").addEventListener("click", onSaveGroup);
   try {
     const p = await apiCall("/api/get-prompts", {});
     $("sys-prompt").value = p.system_prompt || "";
     $("img-prefix").value = p.image_prompt_prefix || "";
+    $("group-mode").checked = !!p.group_mode;
+    $("user-name").value = p.user_name || "";
+    renderPersonaCards(p.personas || []);
   } catch (err) {
-    $("prompts-status").textContent = "couldn't load current prompts";
+    setStatus("prompts-status", "couldn't load current prompts");
+  }
+}
+
+// --- group-chat persona editor ------------------------------------------------
+
+function personaCardEl(p) {
+  const wrap = document.createElement("div");
+  wrap.className = "persona-card";
+  wrap.style.cssText = "border:1px solid #333;border-radius:6px;padding:.6rem;margin:.5rem 0";
+  const name = document.createElement("input");
+  name.placeholder = "name (e.g. Ada)"; name.className = "persona-name";
+  name.value = (p && p.name) || "";
+  const per = document.createElement("textarea");
+  per.placeholder = "personality / instructions for this assistant";
+  per.rows = 3; per.className = "persona-personality";
+  per.value = (p && p.personality) || "";
+  const rm = document.createElement("button");
+  rm.type = "button"; rm.textContent = "remove";
+  rm.addEventListener("click", () => wrap.remove());
+  wrap.append(name, per, rm);
+  return wrap;
+}
+
+function renderPersonaCards(list) {
+  const box = $("personas-list");
+  box.innerHTML = "";
+  (list || []).forEach((p) => box.appendChild(personaCardEl(p)));
+}
+
+function addPersonaCard() {
+  $("personas-list").appendChild(personaCardEl(null));
+}
+
+function collectPersonas() {
+  return [...document.querySelectorAll("#personas-list .persona-card")].map((c) => ({
+    name: c.querySelector(".persona-name").value.trim(),
+    personality: c.querySelector(".persona-personality").value.trim(),
+  })).filter((p) => p.name);
+}
+
+async function onSaveGroup() {
+  const btn = $("save-group");
+  btn.disabled = true;
+  setStatus("group-status", "saving...");
+  try {
+    // set-prompts requires the two base prompts too, so include them from the form.
+    const res = await apiCall("/api/set-prompts", {
+      system_prompt: $("sys-prompt").value,
+      image_prompt_prefix: $("img-prefix").value,
+      group_mode: $("group-mode").checked,
+      user_name: $("user-name").value,
+      personas: collectPersonas(),
+    });
+    setStatus("group-status", res.error ? res.error : "saved (encrypted at rest)");
+  } catch (err) {
+    setStatus("group-status", "save failed");
+  } finally {
+    btn.disabled = false;
   }
 }
 
 async function onSavePrompts() {
   const btn = $("save-prompts");
   btn.disabled = true;
-  $("prompts-status").textContent = "saving...";
+  setStatus("prompts-status", "saving...");
   try {
     const res = await apiCall("/api/set-prompts", {
       system_prompt: $("sys-prompt").value,
       image_prompt_prefix: $("img-prefix").value,
     });
-    $("prompts-status").textContent = res.error ? res.error : "saved (encrypted at rest)";
+    setStatus("prompts-status", res.error ? res.error : "saved (encrypted at rest)");
   } catch (err) {
-    $("prompts-status").textContent = "save failed";
+    setStatus("prompts-status", "save failed");
   } finally {
     btn.disabled = false;
   }
@@ -184,22 +327,28 @@ async function onSavePrompts() {
 async function onChangePassword() {
   const p1 = $("new-pass").value;
   const p2 = $("new-pass2").value;
-  if (p1 !== p2) { $("pass-status").textContent = "passwords don't match"; return; }
-  if (p1.length < 8) { $("pass-status").textContent = "password must be at least 8 characters"; return; }
+  if (p1 !== p2) { setStatus("pass-status", "passwords don't match"); return; }
+  if (p1.length < 8) { setStatus("pass-status", "password must be at least 8 characters"); return; }
   const btn = $("change-pass");
   btn.disabled = true;
-  $("pass-status").textContent = "changing...";
+  setStatus("pass-status", "changing...");
   try {
-    const res = await apiCall("/api/change-password", { new_password: p1 });
+    // The password itself never crosses the network - derive the new key
+    // pair here and send those (inside the current session's envelope).
+    const nk = await deriveKeys(p1);
+    const res = await apiCall("/api/change-password", {
+      new_k_auth: b64e(nk.authBytes),
+      new_k_enc: b64e(nk.encBytes),
+    });
     if (res.error) {
-      $("pass-status").textContent = res.error;
+      setStatus("pass-status", res.error);
       btn.disabled = false;
       return;
     }
     // Success: server wiped all sessions. Force a fresh login under the new key.
     showLogin("password changed - log in with the new password");
   } catch (err) {
-    $("pass-status").textContent = "change failed";
+    setStatus("pass-status", "change failed");
     btn.disabled = false;
   }
 }
@@ -208,12 +357,12 @@ async function onChangePassword() {
 
 function showModePicker() {
   currentMode = null;
+  viewGeneration++;
   $("app").innerHTML = `
     <h2>generate</h2>
     <div id="init-area"></div>
     <div class="modes" id="mode-buttons" style="display:none">
       <button data-mode="chat">conversation</button>
-      <button data-mode="chat_images">conversation with images</button>
       <button data-mode="image">image only</button>
     </div>
     <p style="margin-top:2rem"><a href="#" id="settings-link">settings</a></p>`;
@@ -224,33 +373,115 @@ function showModePicker() {
   checkInit();
 }
 
-function renderInitState(status) {
+function renderInitState(st) {
   const area = $("init-area");
   const modeButtons = $("mode-buttons");
-  if (status === "ready") {
-    area.innerHTML = "";
+  if (st.status === "ready") {
+    imagesEnabled = st.images !== false;
+    const modeNote = imagesEnabled ? "CPU chat + images" : "GPU chat (images off)";
+    area.innerHTML = `<p id="chat-status">chat model: ${escapeText(st.chat_model)} — ${modeNote}
+      &mdash; <a href="#" id="unload-btn">shut down models</a>
+      (frees the GPU and RAM; your chats stay until logout)</p>`;
     modeButtons.style.display = "flex";
-  } else if (status === "loading") {
-    area.innerHTML = `<p id="chat-status">initializing models... (~20s)</p>`;
+    // "image only" is meaningless in GPU-chat mode (SDXL isn't loaded).
+    const imgBtn = document.querySelector('[data-mode="image"]');
+    if (imgBtn) imgBtn.style.display = imagesEnabled ? "" : "none";
+    $("unload-btn").addEventListener("click", (e) => { e.preventDefault(); doUnload(); });
+  } else if (st.status === "loading") {
+    area.innerHTML = `<p id="chat-status">initializing models... (~30s)</p>`;
     modeButtons.style.display = "none";
   } else {
-    area.innerHTML = `<button id="init-btn">initialize system</button>
-      <p id="chat-status">models aren't loaded yet - nothing uses memory until you start this</p>`;
+    // cold OR error - both are startable; the server ships the model + mode
+    // lists in both. Build <option>s as DOM nodes (no attribute injection).
     modeButtons.style.display = "none";
+    const errLine = st.status === "error" && st.error
+      ? `<p class="err">last attempt failed: ${escapeText(st.error)} — try again</p>` : "";
+    area.innerHTML = `
+      <label for="chat-model-sel">chat model</label>
+      <select id="chat-model-sel"></select>
+      <label for="image-model-sel">image model (used in CPU chat + images)</label>
+      <select id="image-model-sel"></select>
+      <label for="chat-mode-sel">mode</label>
+      <select id="chat-mode-sel"></select>
+      <button id="init-btn">initialize system</button>
+      ${errLine}
+      <p id="chat-status">models aren't loaded yet - nothing uses memory until you start this</p>`;
+    fillSelect($("chat-model-sel"), st.models || [st.chat_model], st.chat_model, (m) => m);
+    fillSelect($("image-model-sel"), st.image_models || [st.image_model], st.image_model,
+               (m) => m.replace(/\.safetensors$/, ""));
+    fillSelect($("chat-mode-sel"), st.modes || ["cpu_images"], st.mode || "cpu_images",
+               (m) => CHAT_MODE_LABELS[m] || m);
     $("init-btn").addEventListener("click", startInit);
   }
 }
 
-async function checkInit() {
-  const { status } = await apiCall("/api/init-status", {});
-  renderInitState(status);
-  if (status === "loading") setTimeout(checkInit, 2000);
+function fillSelect(sel, values, selected, labelFn) {
+  for (const v of values) {
+    const opt = document.createElement("option");
+    opt.value = v;              // safe: set as a property, never parsed as HTML
+    opt.textContent = labelFn(v);
+    if (v === selected) opt.selected = true;
+    sel.appendChild(opt);
+  }
+}
+
+function renderInitError(msg) {
+  const area = $("init-area");
+  if (!area) return;
+  area.innerHTML = `<p class="err">${escapeText(msg)} &mdash; <a href="#" id="init-retry">retry</a></p>`;
+  $("mode-buttons").style.display = "none";
+  $("init-retry").addEventListener("click", (e) => { e.preventDefault(); checkInit(); });
+}
+
+const INIT_POLL_MS = 2000;
+const INIT_RETRY_MS = 3000;
+const INIT_MAX_RETRIES = 5;
+
+async function checkInit(retries = 0) {
+  let st;
+  try {
+    st = await apiCall("/api/init-status", {});
+  } catch (err) {
+    // A 401 already swapped in the login screen; there is nothing left to poll.
+    if (!$("init-area")) return;
+    if (retries < INIT_MAX_RETRIES) {
+      renderInitError(`${err.message || "server unreachable"} - retrying`);
+      setTimeout(() => checkInit(retries + 1), INIT_RETRY_MS);
+    } else {
+      renderInitError(err.message || "server unreachable");
+    }
+    return;
+  }
+  renderInitState(st);
+  if (st.status === "loading") setTimeout(() => checkInit(), INIT_POLL_MS);
 }
 
 async function startInit() {
-  const { status } = await apiCall("/api/initialize", {});
-  renderInitState(status);
-  if (status === "loading") setTimeout(checkInit, 2000);
+  $("init-btn").disabled = true;
+  let st;
+  try {
+    st = await apiCall("/api/initialize", {
+      chat_model: $("chat-model-sel") ? $("chat-model-sel").value : undefined,
+      image_model: $("image-model-sel") ? $("image-model-sel").value : undefined,
+      chat_mode: $("chat-mode-sel") ? $("chat-mode-sel").value : undefined,
+    });
+  } catch (err) {
+    renderInitError(err.message || "couldn't start the models");
+    return;
+  }
+  renderInitState(st);
+  if (st.status === "loading") setTimeout(() => checkInit(), INIT_POLL_MS);
+}
+
+async function doUnload() {
+  let st;
+  try {
+    st = await apiCall("/api/unload", {});
+  } catch (err) {
+    setStatus("chat-status", err.message || "shutting the models down failed");
+    return;
+  }
+  renderInitState(st);
 }
 
 async function openMode(mode) {
@@ -258,7 +489,7 @@ async function openMode(mode) {
   if (mode === "image") {
     renderImageOnly();
   } else {
-    renderChat(mode === "chat_images");
+    renderChat();
     await loadState(mode);
   }
 }
@@ -266,13 +497,31 @@ async function openMode(mode) {
 // --- image-only mode ----------------------------------------------------------
 
 function renderImageOnly() {
+  viewGeneration++;
   $("app").innerHTML = `
     <p><a href="#" id="back">&larr; back</a> &nbsp; <a href="#" id="reset">clear session images</a></p>
     <h2>generate an image</h2>
     <form id="image-form">
       <textarea id="image-prompt" rows="3" placeholder="describe the image..." autofocus required></textarea>
+      <textarea id="image-negative" rows="2" placeholder="avoid in the image (optional - a sensible default is applied if empty)"></textarea>
+      <label><input type="checkbox" id="image-assist"> prompt assist - the local LLM adds artistic
+        direction (composition, lighting, style) to your idea first (+~15s)</label>
+      <label for="image-refs">reference face - optional. A clear, front-facing headshot puts
+        that person's likeness into the image. Runs slower (~1 min, streams weights to fit
+        the card) and needs a detectable face. Never stored.</label>
+      <input type="file" id="image-refs" accept="image/*">
+      <label for="image-ref-strength">reference strength: <span id="ref-strength-val">0.7</span>
+        (higher = closer likeness, but the prompt steers less)</label>
+      <input type="range" id="image-ref-strength" min="0.1" max="1.0" step="0.05" value="0.7">
+      <label for="image-quality">quality</label>
+      <select id="image-quality">
+        <option value="quick">quick (~15s)</option>
+        <option value="balanced" selected>balanced (~30s)</option>
+        <option value="best">best (~55s)</option>
+      </select>
       <button type="submit">generate</button>
     </form>
+    <div id="used-prompt"></div>
     <div id="image-status"></div>
     <div id="gallery-panel" class="wide"><h3>images this session</h3><div id="gallery"></div></div>`;
   $("back").addEventListener("click", (e) => { e.preventDefault(); showModePicker(); });
@@ -282,7 +531,20 @@ function renderImageOnly() {
     $("gallery").innerHTML = "";
   });
   $("image-form").addEventListener("submit", onImageSubmit);
+  $("image-ref-strength").addEventListener("input", (e) => {
+    $("ref-strength-val").textContent = e.target.value;
+  });
   loadState("image");
+}
+
+function fileToB64(file) {
+  return new Promise((resolve, reject) => {
+    if (file.size > 10 * 1024 * 1024) { reject(new Error("reference image over 10MB")); return; }
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(",")[1]);
+    r.onerror = () => reject(new Error("could not read reference image"));
+    r.readAsDataURL(file);
+  });
 }
 
 async function onImageSubmit(e) {
@@ -291,13 +553,25 @@ async function onImageSubmit(e) {
   if (!prompt) return;
   const btn = e.target.querySelector("button");
   btn.disabled = true;
-  $("image-status").textContent = "generating... (~30s)";
+  const quality = $("image-quality").value;
+  const assist = $("image-assist").checked;
+  const negRaw = $("image-negative").value.trim();
+  const eta = { quick: "~15s", balanced: "~30s", best: "~55s" }[quality] || "";
+  $("image-status").textContent = `generating (${quality}${assist ? " + assist" : ""})... ${eta}`;
   try {
-    const { image } = await apiCall("/api/image", { prompt });
+    const payload = { prompt, quality, assist };
+    if (negRaw) payload.negative = negRaw;
+    const refFiles = Array.from($("image-refs").files || []).slice(0, 1);
+    if (refFiles.length) {
+      payload.refs = await Promise.all(refFiles.map(fileToB64));
+      payload.ref_strength = parseFloat($("image-ref-strength").value);
+    }
+    const { image, used_prompt } = await apiCall("/api/image", payload);
     appendGalleryImage(image);
-    $("image-status").textContent = "";
+    setStatus("used-prompt", used_prompt ? `assist used: ${used_prompt}` : "");
+    setStatus("image-status", "");
   } catch (err) {
-    $("image-status").textContent = "generation failed";
+    setStatus("image-status", err.message || "generation failed");
   } finally {
     btn.disabled = false;
   }
@@ -305,29 +579,61 @@ async function onImageSubmit(e) {
 
 // --- chat / chat+images modes --------------------------------------------------
 
-function renderChat(withImages) {
+function renderChat() {
+  const imgControls = imagesEnabled
+    ? `<button type="button" id="get-image-btn" title="render the current moment of the conversation">get image</button>`
+    : "";
+  const gallery = imagesEnabled
+    ? `<div id="gallery-panel"><h3>images this session</h3><div id="gallery"></div></div>` : "";
+  viewGeneration++;
   $("app").innerHTML = `
     <p><a href="#" id="back">&larr; back</a> &nbsp; <a href="#" id="reset">new conversation</a></p>
-    <h2>${withImages ? "conversation with images" : "conversation"}</h2>
+    <h2>conversation</h2>
     <div class="chat-layout">
       <div class="chat-main">
         <div id="transcript"></div>
         <form id="chat-form">
           <textarea id="chat-message" rows="2" placeholder="say something..." autofocus required></textarea>
-          <button type="submit">send</button>
+          <button type="submit" id="send-btn">send</button>
+          <button type="button" id="skip-btn" style="display:none" title="let the assistants talk to each other for one round, without you">skip my turn &rarr;</button>
+          <button type="button" id="stop-btn" style="display:none">stop</button>
+          ${imgControls}
         </form>
         <div id="chat-status"></div>
       </div>
-      ${withImages ? '<div id="gallery-panel"><h3>images this session</h3><div id="gallery"></div></div>' : ""}
+      ${gallery}
     </div>`;
   $("back").addEventListener("click", (e) => { e.preventDefault(); showModePicker(); });
   $("reset").addEventListener("click", async (e) => {
     e.preventDefault();
     await apiCall("/api/reset", { mode: currentMode });
     $("transcript").innerHTML = "";
-    if (withImages) $("gallery").innerHTML = "";
+    if ($("gallery")) $("gallery").innerHTML = "";
   });
-  $("chat-form").addEventListener("submit", (e) => onChatSubmit(e, withImages));
+  $("chat-form").addEventListener("submit", onChatSubmit);
+  $("stop-btn").addEventListener("click", onChatStop);
+  if ($("skip-btn")) $("skip-btn").addEventListener("click", onSkipTurn);
+  if ($("get-image-btn")) $("get-image-btn").addEventListener("click", onGetImage);
+}
+
+async function onChatStop() {
+  $("stop-btn").disabled = true;
+  try { await apiCall("/api/chat-stop", {}); } catch (e) { /* stream ends on its own */ }
+}
+
+async function onGetImage() {
+  const btn = $("get-image-btn");
+  btn.disabled = true;
+  $("chat-status").textContent = "picturing the scene... (~45s: the LLM reads the conversation, then the image renders)";
+  try {
+    const { job_id } = await apiCall("/api/chat-image", {});
+    if (job_id) pollImageJob(job_id, (errMsg) => setStatus("chat-status", errMsg || ""));
+    else setStatus("chat-status", "");
+  } catch (err) {
+    setStatus("chat-status", err.message || "image failed");
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function openLightbox(b64png) {
@@ -339,11 +645,11 @@ function openLightbox(b64png) {
   box.classList.add("open");
 }
 
-function appendMessage(role, text) {
+function appendMessage(role, text, speaker) {
   const div = document.createElement("div");
-  div.className = "msg " + role;
+  div.className = "msg " + role + (speaker ? " persona" : "");
   const label = document.createElement("b");
-  label.textContent = role === "user" ? "you: " : "assistant: ";
+  label.textContent = speaker ? (speaker + ": ") : (role === "user" ? "you: " : "assistant: ");
   div.appendChild(label);
   const span = document.createElement("span");
   span.textContent = text;
@@ -361,38 +667,195 @@ function appendGalleryImage(b64png) {
   img.scrollIntoView({ block: "end" });
 }
 
+// A finished message, with edit/delete controls. index = position in the
+// server-side history, so edits/deletes target the exact message the model
+// conditions on. Editing an assistant reply rewrites what the model "said" for
+// every future turn - the way out of a stuck merge-model register.
+function makeBubble(index, role, content, name) {
+  const div = document.createElement("div");
+  div.className = "msg " + role + (name ? " persona" : "");
+  div.dataset.index = String(index);
+  const label = document.createElement("b");
+  label.textContent = name ? (name + ": ") : (role === "user" ? "you: " : "assistant: ");
+  div.appendChild(label);
+  const span = document.createElement("span");
+  span.className = "msg-text";
+  span.textContent = content;
+  div.appendChild(span);
+  const actions = document.createElement("span");
+  actions.className = "msg-actions";
+  actions.style.marginLeft = "0.6em";
+  actions.style.fontSize = "0.8em";
+  actions.style.opacity = "0.6";
+  const edit = document.createElement("a");
+  edit.href = "#"; edit.textContent = "edit";
+  edit.addEventListener("click", (e) => { e.preventDefault(); beginEdit(div, index); });
+  const del = document.createElement("a");
+  del.href = "#"; del.textContent = "delete";
+  del.addEventListener("click", (e) => { e.preventDefault(); onDeleteMessage(index); });
+  actions.append(edit, document.createTextNode(" · "), del);
+  div.appendChild(actions);
+  return div;
+}
+
+function renderTranscript(history) {
+  const t = $("transcript");
+  t.innerHTML = "";
+  (history || []).forEach((m, i) => t.appendChild(makeBubble(i, m.role, m.content, m.name)));
+  if (t.lastElementChild) t.lastElementChild.scrollIntoView({ block: "end" });
+}
+
+function beginEdit(div, index) {
+  if (div.querySelector(".msg-editor")) return;      // already editing
+  const span = div.querySelector(".msg-text");
+  const actions = div.querySelector(".msg-actions");
+  const ta = document.createElement("textarea");
+  ta.className = "msg-editor";
+  ta.value = span.textContent;
+  ta.rows = Math.min(12, Math.max(2, span.textContent.split("\n").length + 1));
+  ta.style.width = "100%";
+  span.style.display = "none";
+  if (actions) actions.style.display = "none";
+  const bar = document.createElement("div");
+  const save = document.createElement("button"); save.type = "button"; save.textContent = "save";
+  const cancel = document.createElement("button"); cancel.type = "button"; cancel.textContent = "cancel";
+  cancel.style.marginLeft = "0.4em";
+  bar.append(save, cancel);
+  div.append(ta, bar);
+  ta.focus();
+  const close = () => { ta.remove(); bar.remove(); span.style.display = ""; if (actions) actions.style.display = ""; };
+  cancel.addEventListener("click", close);
+  save.addEventListener("click", async () => {
+    const content = ta.value.trim();
+    if (!content) { setStatus("chat-status", "empty - use delete instead"); return; }
+    save.disabled = true;
+    try {
+      const { history } = await apiCall("/api/chat-edit", { index, content });
+      renderTranscript(history);
+      setStatus("chat-status", "");
+    } catch (err) {
+      save.disabled = false;
+      setStatus("chat-status", err.message || "edit failed");
+    }
+  });
+}
+
+async function onDeleteMessage(index) {
+  try {
+    const { history } = await apiCall("/api/chat-delete", { index });
+    renderTranscript(history);
+    setStatus("chat-status", "");
+  } catch (err) {
+    setStatus("chat-status", err.message || "delete failed");
+  }
+}
+
+// Re-pull authoritative history and re-render, so freshly-streamed messages
+// pick up their real index + edit/delete controls.
+async function refreshTranscript() {
+  try {
+    const { history } = await apiCall("/api/state", { mode: currentMode });
+    renderTranscript(history || []);
+  } catch (err) {
+    // leave the live-streamed bubbles as-is
+  }
+}
+
 async function loadState(mode) {
   try {
-    const { history, gallery } = await apiCall("/api/state", { mode });
-    for (const m of history) appendMessage(m.role, m.content);
+    const { history, gallery, group_mode } = await apiCall("/api/state", { mode });
+    renderTranscript(history || []);
     if (gallery) for (const img of gallery) appendGalleryImage(img);
+    if (group_mode && $("skip-btn")) $("skip-btn").style.display = "";
   } catch (err) {
     // fresh conversation, nothing to load
   }
 }
 
-async function onChatSubmit(e, withImages) {
+// Shared streaming turn. bodyObj is {message} for a normal turn or
+// {advance:true} to "skip my turn" (personas continue talking to each other,
+// no user message). The reply streams as newline-delimited encrypted envelopes:
+// single-Chloe mode emits {delta}/{replace}/{done} for one bubble; group mode
+// tags events with {speaker} and brackets each persona with {start}/{end}, so
+// we open a fresh bubble per persona - each types to completion, in turn.
+async function streamTurn(bodyObj) {
+  const btn = $("send-btn");
+  const skipBtn = $("skip-btn");
+  btn.disabled = true;
+  if (skipBtn) skipBtn.disabled = true;
+  const stopBtn = $("stop-btn");
+  stopBtn.style.display = "";
+  stopBtn.disabled = false;
+  $("chat-status").textContent = "thinking...";
+  let curSpan = null, curSpeaker = null, text = "";
+  const ensureBubble = (speaker) => {
+    if (curSpan && curSpeaker === (speaker || null)) return;
+    curSpeaker = speaker || null;
+    curSpan = appendMessage("assistant", "", speaker || undefined);
+    text = "";
+  };
+  try {
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(await encryptEnvelope(bodyObj)),
+    });
+    if (res.status === 401) {
+      showLogin("session expired - enter password again");
+      throw new Error("session expired");
+    }
+    if (!res.ok) {
+      const raw = await readJson(res);
+      throw new Error((raw && raw.error) || `request failed (${res.status})`);
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        const obj = await decryptEnvelope(JSON.parse(line));
+        if (obj.error) throw new Error(obj.error);
+        if (obj.done || obj.start) continue;          // start is advisory; bubble opens on first text
+        if (obj.end) { curSpan = null; curSpeaker = null; continue; }
+        const sp = obj.speaker;                       // undefined => single-Chloe reply
+        if (obj.delta) { ensureBubble(sp); text += obj.delta; curSpan.textContent = text; }
+        else if (obj.replace !== undefined) { ensureBubble(sp); text = obj.replace; curSpan.textContent = text; }
+      }
+      if (curSpan) curSpan.parentElement.scrollIntoView({ block: "end" });
+    }
+    if (curSpan && !text) curSpan.parentElement.remove();
+    setStatus("chat-status", "");
+  } catch (err) {
+    if (curSpan && !curSpan.textContent) curSpan.parentElement.remove();
+    setStatus("chat-status", err.message || "failed to get a reply");
+  } finally {
+    btn.disabled = false;
+    if (skipBtn) skipBtn.disabled = false;
+    if ($("stop-btn")) $("stop-btn").style.display = "none";
+    await refreshTranscript();   // replace live bubbles with indexed, editable ones
+  }
+}
+
+async function onChatSubmit(e) {
   e.preventDefault();
   const message = $("chat-message").value.trim();
   if (!message) return;
   $("chat-message").value = "";
   appendMessage("user", message);
-  const btn = e.target.querySelector("button");
-  btn.disabled = true;
-  $("chat-status").textContent = "thinking...";
-  try {
-    const path = withImages ? "/api/chat-images" : "/api/chat";
-    const result = await apiCall(path, { message });
-    // The image (chat-images) is already rendering on the GPU in parallel;
-    // start polling for it right away.
-    if (withImages && result.job_id) pollImageJob(result.job_id);
-    appendMessage("assistant", result.reply);
-    $("chat-status").textContent = "";
-  } catch (err) {
-    $("chat-status").textContent = "failed to get a reply";
-  } finally {
-    btn.disabled = false;
-  }
+  await streamTurn({ message });
+}
+
+// "Skip my turn": one round where every persona replies with no input from you,
+// so they respond to each other. Push again for another round.
+async function onSkipTurn() {
+  await streamTurn({ advance: true });
 }
 
 function appendPlaceholder() {
@@ -403,30 +866,48 @@ function appendPlaceholder() {
   return div;
 }
 
-async function pollImageJob(jobId) {
+const IMAGE_POLL_MS = 2000;
+const IMAGE_POLL_MAX_POLLS = 150;
+
+async function pollImageJob(jobId, onDone) {
   const mode = currentMode;
+  // Comparing modes is not enough: leaving a mode and coming back to it rebuilds
+  // #gallery, so the captured placeholder is detached while the mode matches
+  // again - the finished image would land in a subtree nobody can see.
+  const gen = viewGeneration;
   const placeholder = appendPlaceholder();
+  let polls = 0;
   const poll = async () => {
-    if (currentMode !== mode) return; // navigated away, stop polling
+    if (viewGeneration !== gen) return;
     let result;
     try {
       result = await apiCall("/api/image-status", { mode, job_id: jobId });
     } catch (err) {
+      if (viewGeneration !== gen) return;
       placeholder.remove();
+      if (onDone) onDone(err.message || "image failed");
       return;
     }
+    if (viewGeneration !== gen) return;
     if (result.status === "pending") {
-      setTimeout(poll, 2000);
+      if (++polls >= IMAGE_POLL_MAX_POLLS) {
+        placeholder.remove();
+        if (onDone) onDone("image is taking too long - giving up on it");
+        return;
+      }
+      setTimeout(poll, IMAGE_POLL_MS);
     } else if (result.status === "done" && result.image) {
       const img = document.createElement("img");
       img.src = "data:image/png;base64," + result.image;
       img.addEventListener("click", () => openLightbox(result.image));
       placeholder.replaceWith(img);
+      if (onDone) onDone();
     } else {
       placeholder.remove();
+      if (onDone) onDone(result.error || "image generation failed");
     }
   };
-  setTimeout(poll, 2000);
+  setTimeout(poll, IMAGE_POLL_MS);
 }
 
 // --- boot -----------------------------------------------------------------

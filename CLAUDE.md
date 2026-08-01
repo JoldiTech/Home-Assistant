@@ -83,6 +83,46 @@ authorized on both machines) — only the Access layer differs per box.
 Connect with `ssh aibox` (set up by the same SessionStart hook / Setup script as
 `ssh homeassistant`).
 
+**Networking & power (hard-won facts — verify, don't assume):**
+
+- **LAN addresses:** AI box = `192.168.22.6` (DHCP reservation + the same address
+  configured statically in `/etc/netplan/55-lan-static-fallback.yaml`, so its LAN
+  identity survives a dead UniFi DHCP). **HA Green = `192.168.22.254`** (NOT .4;
+  its MAC OUI `20:f8:3b` is easily mis-read as Arris). UniFi console/gateway/
+  Protect = `192.168.22.1`.
+- **Dual WAN:** primary = UniFi LAN → T-Mobile (egress `172.59.x`). Backup = USB
+  AX88179 dongle `enx00051ba3cee1` → AT&T ISP box LAN (`192.168.1.x`, gateway
+  `.254`, egress `99.x`), netplan `60-usb-wan-backup.yaml`: metric 700, IPv6
+  deliberately disabled (its RA would siphon dual-stack traffic during normal
+  operation). `wan-failover.service` health-checks the primary and swaps in a
+  metric-50 override only while the primary is genuinely dead; `usb-wan-guard`
+  (nftables) drops unsolicited inbound on the dongle. All remote access is
+  outbound Cloudflare tunnels, so failover re-homes SSH/Chloe automatically —
+  proven live. **LAN routes never depend on the default route**: even failed
+  over, the box still reaches HA/console/cameras via the connected route.
+- **UPS:** CyberPower CP1500PFCLCDa on USB, NUT (`upsc cyberpower`), shuts the
+  box down at 50% charge / 10 min runtime (on battery only) to leave the rest
+  of the battery for cameras + network gear. HA integration "NUT" shows it
+  (`sensor.cyberpower_*`); `script.wake_ai_box` sends WoL (MAC
+  `a8:5e:45:e6:62:1f`) to restart the box after an outage shutdown, since the
+  UPS never lets the PSU see AC drop. WoL persisted via `wol-enable.service`.
+- **Bulk downloads ride the backup line:** `via-att <command>` on the box runs
+  anything with egress pinned to the AT&T dongle (dedicated `dl` user +
+  uidrange ip rule -> table 107, asserted by `dl-route.service` at boot and a
+  networkd-dispatcher hook after any netplan/link event — netplan apply
+  flushes table 107 and would otherwise silently fall back to the store WAN).
+  ~95 Mbps measured to HuggingFace. Use it for every model download so the
+  store's T-Mobile line never feels it: `via-att curl -LO <url>`. /srv/dl is
+  the dl user's group-writable staging dir. Dongle MTU is pinned to **1430**
+  (probed: 1500/1452 drop with DF on AT&T Internet Air — a PMTUD blackhole
+  that strangles bulk TCP against hosts that filter ICMP).
+- **Minimal-image gotcha:** this box shipped WITHOUT `ping`, `iptables`,
+  `traceroute` (now installed: iputils-ping/arping, traceroute, mtr, tcpdump,
+  nftables). A missing tool exits 127, which reads as "host down" in sloppy
+  scripts/checks — the wan-failover watchdog explicitly refuses to act on
+  exec-failure exit codes for exactly this reason. Never diagnose "network
+  down" without confirming the diagnostic tool itself ran.
+
 **Python ML stack** lives in a venv at `~/transcribe-env` on the box (activate with
 `source ~/transcribe-env/bin/activate`): `torch` (CUDA build, confirmed working on
 the RTX 2060), `faster-whisper`, `demucs`, `nemo_toolkit[asr]` (Parakeet). This is
@@ -100,6 +140,20 @@ environment — they live only on the box itself:
   pipeline doesn't depend on that DNS mechanism at boot).
 - Verified: `curl -k -H "X-API-KEY: $PROTECT_API_KEY" https://$PROTECT_HOST/proxy/protect/integration/v1/meta/info`
   → `200 {"applicationVersion":"7.1.87"}`.
+- **The same key is console-level** — it also authorizes the **UniFi Network
+  Integration API** (`/proxy/network/integration/v1/...`, site id
+  `88f7af54-98f8-306a-a1c7-c9349722b1f6`, "Default"): device list (UDM Pro Max,
+  US-16-PoE-150W, AC Pro, U7 Pro Max), client list, stats, and ACTIONS
+  (device restart, per-port PoE power-cycle) — remote network remediation
+  without touching the rack. **It ALSO works on the legacy admin API**
+  (`/proxy/network/api/s/default/...` — stat/health, stat/device), which is
+  where WAN detail lives that the integration API omits.
+- **Store dual-WAN (UDM Pro Max):** WAN1 eth8 = AT&T Internet Air (via the
+  same AT&T box the AI-box dongle uses, `192.168.1.x`); WAN2 eth7 = T-Mobile
+  (`192.168.12.x`, egress `172.59.x`). Both monitored by the UDM; failover is
+  automatic. After a full rack power-cycle the UDM may sit on WAN2 without
+  failing back unless failback is enabled. UniFi Talk is installed but has NO
+  integration API - its endpoints reject API keys (admin session only).
 - Any future systemd service on this box should read secrets via
   `EnvironmentFile=/etc/nmteaco/protect.env`, never hardcode them.
 
@@ -257,23 +311,53 @@ recent detection cleared (≈ last seen).
 
 ### Person-detection cameras
 
-⚠️ **Entity IDs do NOT match friendly names.** Map via `friendly_name`, not the
-entity prefix — this mismatch is the #1 time-sink.
+✅ **Entity IDs now match the camera names** (fixed 2026-07-25). They used to
+encode each camera's *original* name — `binary_sensor.g6_dome_person_detected`
+was Tea One, `g6_180` was Back Yard, `tea_two` was Emporium Floor — which was
+documented here as the #1 time-sink. After the cameras were renamed in Protect,
+all 15 camera and 98 related `binary_sensor` entity IDs were renamed to match
+their device name, so `<camera>_person_detected` is now the reliable pattern.
 
-| Location (friendly name) | Person-detected entity |
-|---|---|
-| Emporium Floor | `binary_sensor.tea_two_person_detected` |
-| Emporium Hall | `binary_sensor.emporium_hall_person_detected` |
-| Tea One | `binary_sensor.g6_dome_person_detected` |
-| Tea Two Camera | `binary_sensor.tea_two_neo_person_detected` |
-| Packing Station | `binary_sensor.packing_station_person_detected` |
-| Store Room | `binary_sensor.store_room_person_detected` |
-| Back Yard | `binary_sensor.g6_180_person_detected` |
-| Tea One (secondary, often offline) | `binary_sensor.tea_one_person_detected` |
+**13 cameras** (all CONNECTED in Protect). Person-AI on 11 of them:
 
-Motion-only cameras (no person AI): **Kitchen**, **Curbside / Backdoor**,
-**12th Street Emporium**. Each camera also exposes `_motion`, `_vehicle_detected`,
-`_animal_detected`, plus audio detections.
+| Camera | Person-detected entity | Feed used on the dashboard |
+|---|---|---|
+| Back Yard | `binary_sensor.back_yard_person_detected` | `camera.back_yard_high_resolution_channel` |
+| Curbside / Backdoor | `binary_sensor.curbside_backdoor_person_detected` | `camera.curbside_backdoor_high_resolution_channel` |
+| Emporium Floor | `binary_sensor.emporium_floor_person_detected` | `camera.emporium_floor_high_resolution_channel` |
+| Emporium Hall | `binary_sensor.emporium_hall_person_detected` | `camera.emporium_hall_high_resolution_channel` |
+| G6 180 | `binary_sensor.g6_180_person_detected` | `camera.g6_180_high_resolution_channel` |
+| Packing Station | `binary_sensor.packing_station_person_detected` | `camera.packing_station_high_resolution_channel` |
+| Parking Lot | `binary_sensor.parking_lot_person_detected` | `camera.parking_lot_high_resolution_channel` |
+| Store Room | `binary_sensor.store_room_person_detected` | `camera.store_room_high_resolution_channel` |
+| Tea One | `binary_sensor.tea_one_person_detected` | `camera.tea_one_low_resolution_channel` ¹ |
+| Tea Two Camera | `binary_sensor.tea_two_camera_person_detected` | `camera.tea_two_camera_high_resolution_channel` |
+| West Side | `binary_sensor.west_side_person_detected` | `camera.west_side_high_resolution_channel` |
+
+¹ Tea One's and 12th Street Emporium's **high-resolution** entities report
+`unavailable` even though both cameras are CONNECTED; their low-res channels
+record fine, so the dashboard uses those. The Protect *integration* API doesn't
+expose per-channel config and the legacy Protect admin API rejects the console
+key with 401 (unlike the Network legacy API), so channel state can't be checked
+from a script — use the Protect UI.
+
+Motion-only cameras (no person AI): **Kitchen**, **12th Street Emporium**. Each
+camera also exposes `_motion`, `_vehicle_detected`, `_animal_detected`, plus
+audio detections.
+
+> **HA device names can override Protect.** "Tea Two Camera" is a `name_by_user`
+> set in HA; Protect calls that camera **Tea Two Neo**. Entity IDs follow the HA
+> name. If a camera's IDs look unrelated to Protect, check for a name override.
+
+**When cameras are renamed in Protect again:** reload the UniFi Protect config
+entry first (`homeassistant.reload_config_entry` targeting any Protect entity) —
+device names refresh, but **entity IDs never follow automatically**. Renaming
+them is a websocket-API job (`config/entity_registry/update`, not REST), and it
+silently breaks `automations.yaml`: the `last_person_detected_snapshot` cam_map
+and the two person-detection trigger lists all hardcode entity IDs. Worse, an
+old ID can survive pointing at a *different* camera (`g6_180` meant Back Yard
+before the rename and means G6 180 after), so replace whole blocks rather than
+find-and-replacing tokens, and re-check with `ha core check`.
 
 ### Useful raw API calls (cameras)
 
@@ -324,11 +408,247 @@ deployed to `~/transcribe/` on the AI box and run as the
   Integrations API, creds from `/etc/nmteaco/protect.env`) — no HA in the audio
   path. `condition_on_previous_text=False` + strict VAD to avoid hallucination
   loops.
+- **Whisper hallucinates on silence, and it reaches the log.** The empty closing
+  hour produced *"Thank you for watching, and I'll see you in the next video"*
+  and a fabricated distressed monologue that the summarizer wrote up as a real
+  event. 30–49 such lines a day. Two things that do NOT fix it, both measured:
+  **`no_speech_prob` is useless on this mic** (real speech p50 0.63 / p90 0.65
+  vs 0.64 for the hallucination — a 0.6 cut deletes 26 of 51 genuine segments),
+  and **`initial_prompt` is dangerous** — Whisper echoed the priming sentence
+  back as a transcript line, i.e. it injects invented speech into the record.
+  Use `hotwords` only. `transcribe_day.py` now drops the canonical video-isms
+  by phrase (`_HALLUCINATION_RE`).
+- **Audio conditioning (mic is fixed, the signal isn't):** band-pass + `dynaudnorm`
+  and `speechnorm` both recover real content that raw audio loses; spectral
+  denoise (`afftdn`) actively HURTS — it strips speech to rows of ".".
+
+#### Parakeet evaluated as a Whisper replacement (2026-07-25)
+
+`nvidia/parakeet-tdt-0.6b-v2` (2.3 GB, `~/transcribe/models/parakeet.nemo`,
+loaded via `EncDecRNNTBPEModel.restore_from`). Measured on this box against the
+same audio:
+
+| | faster-whisper large-v3 | Parakeet TDT 0.6B |
+| --- | --- | --- |
+| 10 min of empty shop | "Thank you" ×8 + a fabricated monologue | **5 of 6 chunks EMPTY** |
+| speed, 10 min audio | ~90 s | **4.0 s** (RTF 0.007) |
+| timestamps | yes | yes (segment/word/char) |
+| product names | `hotwords` bias helps | weaker — "Sencha" → "Scentage" |
+| long audio on 6 GB | 30 s internal windows | **OOMs past ~2 min; needs chunking** |
+
+Being a transducer rather than autoregressive-over-text, it emits nothing from
+silence — which is the defect class that put a distressing invented passage
+into a permanent record. Its weaker product names are largely handled by the
+catalog-correction stage the pipeline already runs (`_match_catalog` corrected
+3 names on the 07-25 run unaided).
+
+> **`numpy` is pinned `<2.5` in `~/transcribe-env`** (2.4.6). NeMo's numba
+> dependency refuses NumPy 2.5. Verified after downgrading that
+> faster-whisper produces byte-identical output, so the pin is safe — but do
+> not casually `pip install -U numpy` on this box.
+
+**Dual-ASR measured over three full days** (`ASR_ENGINE=dual`, Parakeet backbone
++ Whisper rescue):
+
+| day | parakeet | whisper | rescued | suppressed |
+| --- | --- | --- | --- | --- |
+| 07-23 | 2646 (266 s) | 2845 (1342 s) | 149 | 2 |
+| 07-24 | **5259** (287 s) | 4402 (1606 s) | 10 | 1 |
+| 07-25 | **4287** (285 s) | 3999 (1663 s) | 8 | 6 |
+
+Parakeet is ~5.5× faster and on two of three days found MORE than Whisper. The
+Whisper pass costs ~27 min and earned 8–10 lines on those days, 149 on 07-23.
+Known garbles: `foie`, `cinnamates`, `malignant` all eliminated; `Sencha`
+regressed to `Scentage` (the catalog stage fixes that class). Note Parakeet did
+not *correct* `foie` to pu-erh — it heard that minute differently; the engines
+genuinely disagree on marginal audio.
+
+**The merge discriminator is ISOLATION, not length.** The first rule suppressed
+Whisper-only windows under 60 chars and was wrong — over one day it deleted 31
+windows, mostly real short speech ("Yeah, have a good one.", "Well, it's in the
+back of the drawer."). Real conversation is full of short utterances; what the
+confabulations shared was sitting alone in a 19-minute dead stretch. Switching
+to "rescue if Parakeet heard anything within 4 minutes" moved 07-23 from
+112 rescued / 31 suppressed to **149 rescued / 2 suppressed**, and the two
+survivors are textbook ("I have to be some sort of master of the universe?").
+
+Each engine's raw output is kept in `~/captains_transcripts/engine_raw/` so a
+merge rule can be re-tuned in seconds instead of a 30-min re-transcription.
+
+#### ⏳ How far back the audio goes
+
+Probed 2026-07-26: 07-18 onward exported fine, **07-17 and 07-16 returned
+`Request failed: /proxy/protect/api/video`**.
+
+**That boundary is the start of the current recording setup, NOT a retention
+limit.** Retention is **~30 days** (per the owner, who configured it). I
+originally recorded this as "~8 day retention" purely by inferring a cause from
+two failed exports — a reminder that a boundary in the data tells you *where*
+something changes, never *why*.
+
+- **A backfill is possible within roughly 30 days**, not one week.
+- A nightly run that fails and goes unnoticed until the window closes is still
+  **permanent data loss** — the deadline is just further out. Nothing currently
+  alerts on a missing day: `sensor.captains_log` shows whatever is on GitHub, so
+  a missing day looks exactly like a quiet day. A "did today's log appear by
+  20:30 MT?" check remains the cheapest insurance.
+- Days with no audio still get a real log from the business data alone
+  (`_No speech captured today._` + the stats block) — that is what 2026-07-16
+  and 2026-07-17 are, and given nothing was recording then, it is the best they
+  can ever be.
+- **Retention is not queryable from here.** The integration API's `/nvrs`
+  returns only identity/doorbell/arm fields, and `/nvr`, `/storage`,
+  `/system-info` are 404; the legacy Protect admin API rejects the console key
+  with 401 (unlike the Network legacy API). Check the Protect UI.
+
+#### 🎵 The shop's Sonos is transcribed as speech
+
+Both engines do it — it is genuine audio, not hallucination. Whisper produced
+recognisable song lyrics in the 07-22 transcript ("The strength to go other ways
+than singing in the street", "If you think that you are in the ocean"), and the
+2026-07-23 closing passage that read as a distressed monologue overlapped music
+that HA shows playing until it paused at **18:32:07**.
+
+The dual merge only catches the Whisper half (music plays when nobody is
+talking, so those windows look "marooned"). Parakeet's share stays, because it
+is the backbone. **HA already holds the signal to fix this properly**:
+`media_player.store_store` records `playing` / `paused` with track titles and
+timestamps, so music-only windows could be excluded before the summarizer sees
+them. Not yet implemented — measure the coverage first.
+
+#### Summarizer: bigger is NOT better (tested, rejected 2026-07-25)
+
+Before reaching for a larger summarizer, read this. `Qwen3-30B-A3B-Instruct-2507`
+(MoE, 3B active, 17.3 GB) was downloaded, run against a real day at both 8k
+chunked and 32k single-pass, and **rejected**. It produced the most fluent,
+most specific, most readable log of anything tried — and fabricated nearly all
+of the specifics: a yoga class, a receipt-printer jam, a person ("Shawns
+office"), a product ("Tummy Tisane"), and it turned the transcript's *"she has
+RA"* into *"her mother who has rheumatoid arthritis"* — inventing a family
+relationship and expanding a diagnosis, the exact privacy failure the policy
+exists to prevent. Zero transcript support for any of it.
+
+**More capacity against lossy mic audio buys more convincing confabulation.**
+Qwen3-8B's clumsiness is a safety feature: it garbles visibly where the 30B
+invents plausibly. Keep `Qwen3-8B-Q4_K_M` at `SUMMARIZER_CTX=8192`. The model
+is staged at `~/transcribe/models/` if you want to re-verify; don't re-litigate
+it from first principles.
+
+Two related dead ends, both measured: the `/no_think` suffix is a Qwen3 *hybrid*
+control token and is meaningless to Instruct-2507 models (`SUMMARIZER_NOTHINK=0`
+strips it), and at 32k context the KV cache alone is ~4.8 GB on the 6 GB card,
+so single-pass summarization is CPU-bound regardless of model.
+
+#### llama.cpp: a failed load poisons the process
+
+A `Llama()` construction that fails raises a normal Python exception — but the
+**next** construction in that process dies on an uncatchable `SIGABRT`. So a
+retry chain is not a safety net; it turns a recoverable failure into a core
+dump, and `gc.collect()` does not help. `_summarize` now makes ONE attempt with
+the offload sized from measured free VRAM, then `os.execv`s itself with
+`SUMMARIZER_GPU_LAYERS=0`. Verified: the same 17-layer config that core-dumped
+twice now re-execs and completes.
+
+Relatedly, `_ensure_gpu()` had existed since the imagegen work and was **never
+called** — the summarizer simply collided with Chloe instead of asking her to
+release the card. It is wired in now; Chloe's `/api/release-gpu` works and is
+loopback-only.
+
+#### The prompts are an input, and the 8B model treats them as content
+
+Established by writing four logs by hand from the pipeline's exact input
+(2026-07-19/21/23/26) and diffing them against what shipped — see
+`captains_log/EVALUATION-4-day-blind-rewrite.md`, and the hand-written controls
+in `captains_log/evaluation/`. **Any concrete noun in a prompt WILL appear in a
+log**, on days it has nothing to do with:
+
+- `"restock XL gloves"` was a privacy example. "Reorder XL gloves" shipped on
+  all four days; the real Slack request exists once, in the 07-23 window, and
+  on two of those days it had not been made yet.
+- `"a customer asked about teas safe during pregnancy"` was a linkage example.
+  It shipped twice; `pregnan` appears in none of the four inputs.
+- The POS **format** example was `"[14:32] ⟦POS $23.50 — Earl Grey 2oz ×1⟧"`.
+  2026-07-26 shipped "A discrepancy in register: $23.50 unaccounted for". Not a
+  hallucination — a copy.
+
+Everything concrete in every prompt is now a `[bracketed]` slot, with
+`_reject_prompt_echoes` as a backstop and a test asserting the blocklist is
+empty. **Do not put a real product, supply, amount or situation in a prompt,
+even as an illustration.** If you must illustrate, bracket it.
+
+#### Three more things that were only true of bullets
+
+- **Gates ran on lines starting with `-` only.** The narrative — half the log —
+  was ungated for months. 07-26's run log shows the discrepancy gate correctly
+  dropping the `$23.50` bullet while the identical claim shipped in paragraph
+  one. `_edit_claims` now treats a narrative *sentence* as a claim too.
+- **"Was the amount spoken aloud?" cannot discriminate.** Every sale total in a
+  shop is read out loud, so the test is satisfied by definition. Both invented
+  shortfalls ($37.66, $6.46) were POS order totals read to a customer. The test
+  is now proximity to somebody actually reporting money wrong.
+- **A sale is proof of stock — in prose as well.** 07-26 asserted two products
+  were unavailable that the woven POS lines in its own input show sold minutes
+  earlier.
+
+#### Not all speech about products is a customer request
+
+2026-07-21 was a register-training day. A trainer said *"I want to give you some
+fake orders"* and read out three inventions; all three became the log's opening
+sentence, quoted, as genuine unmet demand. `_reject_training_artifacts` drops a
+quoted name that occurs only inside a training window. Watch for the same shape
+elsewhere: staff rehearsing, reading a catalog aloud, or quoting a customer from
+another day are all speech *about* orders, not orders.
+
+#### ⚠ The raw transcripts contain a credential
+
+The 2026-07-19 transcript records the shop's **password practice**, said aloud
+during POS training. It did not reach the log — but transcripts are retained on
+the AI box (`~/captains_transcripts/`) in plain text. Treat that directory as
+secret-bearing: never paste one into a PR, an issue, or a chat log, and delete
+transcripts once the debugging window closes.
+
+#### Verification traps that cost real time here
+
+Every one of these produced a confident wrong conclusion at least once:
+
+- **The log has FOUR sources** — audio, POS, Slack, business records. Grepping
+  only the transcript "proved" `XL gloves` was fabricated three times; it was a
+  real Slack request from George on 07-23. Check every source before calling
+  something invented.
+- **`grep "50.31"` matches `10:50:31`** — `.` is a regex wildcard. That
+  "confirmed" a fabricated dollar amount as real. Use `grep -F` for amounts.
+- **A running process is not a working process.** A backfill was checked with
+  `pgrep` ("alive"), produced zero output for 5.5 h, and was silently stuck.
+  Verify by output — a non-empty log — never by process existence.
+- **`pgrep -f`/`pkill -f <pattern>` match the command line you are running
+  them from.** `pkill -f` killed the SSH session twice, when the pattern
+  appeared in the remote command line. The same self-match in `pgrep` is
+  quieter and worse: `while pgrep -f "captains_pipeline.py 2026-07-19"; do
+  sleep 15; done` never exits, because the wrapper's own `bash -c` command
+  line contains that string — it waits forever for itself, and looks exactly
+  like a slow job. Resolve the PID first and act on that, or match on the
+  interpreter path (`bin/python captains_pipeline`) which the wrapper does not
+  contain.
+- **The transcript is POS-woven before post-processing.** A gate that asks "was
+  this amount said aloud?" must read the RAW speech; against the woven text a
+  sale total vouches for itself, which silently no-op'd the discrepancy gate in
+  production while passing every local test.
+- **Business data:** the pipeline also pulls the **6pm–6pm MT business day**
+  (log for date D = 6pm D-1 → 6pm D) from the dashboard's **datalog API**
+  (`/dashboard/tools/datalog/{sales,shipping,support,calls,texts,timeclock}.php`,
+  bearer `DATALOG_API_TOKEN`) plus Slack staff chat. In-store POS orders are
+  woven into the transcript by timestamp (`[14:14] ⟦POS $43.50 — Earl Grey ×1⟧`)
+  so the summarizer can tie conversations to actual sales; dollar/count sections
+  are appended deterministically (never through the LLM). All fetches fail soft.
+  Full design: `captains_log/README.md`.
 - **Summarizer:** `Qwen3-8B-Q4_K_M.gguf` (`~/transcribe/models/`, not in git) via
   llama-cpp-python (CUDA), ~30 GPU layers with a `[30, 20, 0]` fallback chain so
   the job still finishes (slower) if Chloe is holding VRAM. Timestamps are
   compacted to hourly markers + hierarchical chunk→notes→merge so a full day fits
-  the context, then a redaction pass strips names/personal-life/garbled products.
+  the context. A **correlation pass** then links draft bullets to specific
+  order/ticket/call ids from the day's records, and a redaction pass strips
+  names/personal-life/garble — **audio-derived content only**; names from
+  structured sources (Slack, tickets, timeclock, POS references) stay.
 - **Output:** one Markdown day-file `captains_log/YYYY-MM-DD.md` pushed to the
   **`captains-log` branch** of this repo (persistent clone `~/ha-captains-repo`,
   auth via a fine-grained PAT in `/etc/nmteaco/captains.env`). The transcription
@@ -338,15 +658,39 @@ deployed to `~/transcribe/` on the AI box and run as the
   from the `captains-log` branch via the GitHub API (read PAT in
   `/config/captains_gh.token`) and emits `{"count", "content"}`. The **"Captain's
   Log"** view on the **DowntownControls** dashboard (`dashboard-downtowncontrols`)
-  renders `content` (one collapsible `<details>` per day).
+  renders `content` (one collapsible `<details>` per day). It reads every rendered
+  day in **two GraphQL round trips**; the REST version cost one request per file
+  and was drifting toward the sensor's 15 s `command_timeout` as days accumulated,
+  and a killed process drops the sensor entirely rather than showing the error
+  card. **`/share/` is not in git** — editing `scripts/render_captains_log.py`
+  changes nothing until it is copied to the box.
+- **You cannot test the GitHub API from the Claude sandbox.** Every call returns
+  `403 Forbidden` through the environment's MITM proxy, *including* calls that
+  work perfectly on the boxes. This looks exactly like a bad token or a scope
+  problem and it is neither — it cost a needless rollback of a working script.
+  Test GitHub-facing code by running it **on the AI box** (`ssh aibox`, which has
+  python3 and direct egress), never from the sandbox.
+- **Control panel (on-demand runs):** the trigger service exposes `POST /run`
+  (full log, reuses an existing transcript), `POST /transcribe` (audio-only —
+  stage the slow ~30 min step, build the log later in seconds), and `GET /status`
+  (LAN, unauthed: `{running, job, date, transcripts[]}` — which days have a raw
+  transcript on disk + what the one worker is doing; only one job runs at a time,
+  a second returns 409). HA surfaces this as `sensor.captains_status`
+  (`/share/captains_status.py` merges `/status` with the GitHub log listing into
+  a per-day Transcript/Log table), an `input_datetime.captains_target_date` day
+  picker, and two scripts (`captains_create_transcript`, `captains_create_log`)
+  wired to buttons on the Captain's Log dashboard view. rest_commands
+  `captains_log_run` / `captains_transcribe` POST to the box with the picked date.
 - **Manage:** on the AI box `sudo systemctl {status,restart} captains-transcribe.service`,
   `sudo journalctl -u captains-transcribe.service -f`; trigger a run by hand with
   `curl -X POST -H "X-Trigger-Token: <tok>" -d '{"date":"YYYY-MM-DD"}'
-  http://127.0.0.1:8190/run`. Fire the whole HA→box path with
+  http://127.0.0.1:8190/run` (or `/transcribe`). Fire the whole HA→box path with
   `POST /api/services/rest_command/captains_log_run`.
-- **Secrets:** AI box `/etc/nmteaco/captains.env` (trigger token + GitHub write
-  PAT); HA `secrets.yaml` `aibox_trigger_token` + `/config/captains_gh.token`
-  (GitHub read PAT). None are committed.
+- **Secrets:** AI box `/etc/nmteaco/captains.env` (trigger token, GitHub write
+  PAT, `DATALOG_API_TOKEN`, optional `DASHBOARD_BASE_URL` / `SLACK_BOT_TOKEN` /
+  `SLACK_CHANNELS`); HA `secrets.yaml` `aibox_trigger_token` +
+  `/config/captains_gh.token` (GitHub read PAT). The datalog token's other half
+  lives in the dashboard's `/home/nmteaco/.env`. None are committed.
 
 ### Chloe / ephemeral generation tool (AI box)
 
@@ -358,9 +702,15 @@ only** (SDXL). Source of truth is `imagegen/` in this repo (`app.py`,
 `static/{index.html,app.js}`, `imagegen.service`); deployed to `~/imagegen/` on
 the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
 
-- **Models (not in git):** image = JuggernautXL Ragnarok (SDXL) at
-  `~/imagegen/models/juggernautXL_ragnarok.safetensors` (6.6 GB, re-download
-  from Civitai); chat = `Gemma-4-12B-OBLITERATED.Q4_K_M.gguf` (~7.4 GB, from
+- **Models (not in git):** image models live in `~/imagegen/models/` and are
+  **selectable at Initialize** (image-model picker, parallel to the chat picker).
+  `_list_image_models()` enumerates both single-file `*.safetensors` checkpoints
+  AND diffusers-format model folders (a subdir with `model_index.json`), and
+  `_load_sdxl()` branches `from_single_file` vs `from_pretrained` — so adding a
+  model is just dropping the file/folder in. Currently: JuggernautXL Ragnarok
+  (`juggernautXL_ragnarok.safetensors`, 6.6 GB, from Civitai) and RealVisXL V5.0
+  (`RealVisXL_V5.0.safetensors`, ~6.9 GB, from `SG161222/RealVisXL_V5.0` on HF).
+  chat = `Gemma-4-12B-OBLITERATED.Q4_K_M.gguf` (~7.4 GB, from
   `mradermacher/Gemma-4-12B-OBLITERATED-GGUF`) via `llama-cpp-python`, **CPU-only**
   (`n_gpu_layers=0`) so it never contends with SDXL for the 6 GB VRAM. Install
   llama-cpp-python with `--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu`
@@ -368,6 +718,35 @@ the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
 - **Lazy load:** nothing loads at startup (~700 MB cold). The **Initialize**
   button (`/api/initialize`) loads both models; steady state ~17 GB RAM. The
   unit caps memory (`MemoryHigh=22G`, `MemoryMax=26G`) as a safety net.
+- **Unload leak — found and fixed 2026-07-25.** Chloe reported
+  `{"status":"cold"}` and genuinely freed the GPU, yet still held **9.6 GB
+  RSS** (13× the cold figure) 16 h later; only a restart recovered it. Cause:
+  `_unload_models` dropped the Python reference to the chat model, which frees
+  nothing — llama-cpp-python holds the weights in C and releases them in
+  `close()`. Measured in isolation: model loaded 8348 MB → ref dropped + gc
+  **8348 MB** → after `.close()` **90 MB** → after `malloc_trim(0)` 45 MB.
+  The unload path now calls `close()` and then `malloc_trim`, and logs
+  `RSS before -> after` so a regression is visible rather than inferred.
+  If it ever creeps back, check `ps -o rss= -p $(systemctl show -p MainPID
+  --value imagegen.service)` before blaming the summarizer for an OOM — the
+  two share this 31 GB box.
+- **Reference photos (IP-Adapter FaceID):** the image-only view accepts one
+  headshot and puts that person's likeness into the generated image. Identity
+  comes from an **InsightFace `buffalo_l` embedding computed on the CPU**
+  (onnxruntime), NOT a CLIP image encoder in VRAM — that's what makes it fit the
+  6 GB card. Extra deps in `imagegen-env`: `insightface`, `onnxruntime`, `peft`;
+  weights `ip-adapter-faceid_sdxl.bin` + `..._lora.safetensors` in
+  `~/imagegen/models/ip_adapter/` (from `h94/IP-Adapter-FaceID`, not in git);
+  `buffalo_l` auto-downloads to `~/.insightface/`. **Why two SDXL pipes, one
+  resident at a time:** normal gen keeps `model_cpu_offload` (whole UNet on GPU,
+  ~20 s, fast) but FaceID's extra UNet weights don't fit that way — the ref pipe
+  uses `enable_sequential_cpu_offload` (streams weights, ~650 MB VRAM, ~50 s).
+  Both pipes resident *plus* the 12B chat peaked ~31 GB RSS (OOM). So the base
+  pipe and ref pipe **swap** (build one, drop the other; ~15 s rebuild only when
+  a session alternates normal↔reference) — one SDXL + chat stays ~17–18 GB.
+  Multi-person (two distinct faces) is a deliberate follow-up: basic FaceID
+  blends two embeddings into one face; distinct placement needs regional
+  attention masking.
 
 **Two hard guarantees (do not "optimize" away):**
 
@@ -382,15 +761,17 @@ the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
    (session cookie, no Max-Age). No database, no disk writes of content.
 
 - **Persisted state (the only two things on disk):** `/var/lib/imagegen/`
-  (owned by `nmteaco`, mode 700; `ReadWritePaths` hole in the strict sandbox).
-  `password` = current password, plaintext, mode 600 (server is the trusted
-  endpoint and needs it to derive keys — same trust model as `protect.env`).
+  (owned by `nmteaco`, mode 700; a systemd `StateDirectory=imagegen`, not a
+  `ReadWritePaths` hole). `k_auth` = the **auth half** of the password's PBKDF2
+  output, mode 600 — a login verifier only. PBKDF2's halves are computationally
+  independent, so it cannot yield the encryption key; the enc half is never
+  stored, and any legacy plaintext `password` file is deleted at start.
   `prompts.enc` = the editable prompts (assistant system prompt + image-prompt
   prefix), AES-GCM encrypted under the password-derived key, decrypted only at
-  time of use. First-ever start seeds `password` from `IMAGEGEN_PASSWORD` (via
+  time of use. First-ever start seeds `k_auth` from `IMAGEGEN_PASSWORD` (via
   the systemd EnvironmentFile `/etc/nmteaco/imagegen.env`), then the file wins.
 - **Settings (after login):** edit the assistant prompts (persisted encrypted),
-  and **change the password** — which rewrites the password file, re-derives the
+  and **change the password** — which rewrites `k_auth`, re-derives the
   keys, re-encrypts the prompts under the new key, and clears all sessions. The
   password IS the encryption key until changed again.
 - **Network:** binds `127.0.0.1:8189` only. Public hostname → tunnel →
@@ -404,6 +785,17 @@ the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
   (confirmed OOM at 16 GB+) via per-thread CUDA state. Conversation-with-images
   generates the image in the background (client polls `/api/image-status`),
   keeping any single request under Cloudflare's ~100 s origin timeout.
+- **`Unexpected token 'I', "Internal S"... is not valid JSON` in the browser
+  means a STALE SESSION KEY, not a broken server.** Session cookies are
+  per-host, not per-tab: after a restart (or a password change) a re-login mints
+  a new session key and overwrites the shared cookie, so any still-open older
+  tab sends a valid cookie with the *previous* key. `_decrypt` raised
+  `InvalidTag`, FastAPI returned a plain-text 500, and the client's `res.json()`
+  choked on the "I" of "Internal Server Error" — burying the real cause. Fixed
+  2026-07-26: `_decrypt` raises `StaleSessionKey` → an exception handler answers
+  **401**, which the client already treats as "session expired" and re-prompts;
+  the client also never parses a body before checking the response. If these
+  reappear, suspect a *new* unguarded parse, not the crypto.
 - **Manage:** `sudo systemctl {status,restart,stop} imagegen.service`,
   `sudo journalctl -u imagegen.service -f`. Hardened unit (`ProtectSystem=strict`,
   `NoNewPrivileges=yes`); GPU needs `PrivateDevices=no`.

@@ -1,8 +1,16 @@
 # Home Assistant side — Captain's Log trigger + display
 
 HA owns the schedule and triggers the AI box over the LAN. The AI box does the
-transcription + de-identified summary and pushes the log to the private GitHub
-repo. HA reads it back from GitHub for the dashboard.
+transcription + de-identified summary — plus the business-day data (sales,
+shipping, support, calls, texts, timeclock via the dashboard datalog API, and
+Slack staff chat) — and pushes the log to the private GitHub repo. HA reads it
+back from GitHub for the dashboard.
+
+AI-box keys in `/etc/nmteaco/captains.env` (mode 600): `TRIGGER_TOKEN`,
+`GITHUB_TOKEN`, `DATALOG_API_TOKEN` (same value as the dashboard's
+`DATALOG_API_TOKEN` in `/home/nmteaco/.env` — see the API Credentials page),
+optional `DASHBOARD_BASE_URL`, `SLACK_BOT_TOKEN`, `SLACK_CHANNELS`. See
+`captains_log/README.md` for what each feeds.
 
 ## 1. Trigger the AI box (add to `/config/configuration.yaml`)
 
