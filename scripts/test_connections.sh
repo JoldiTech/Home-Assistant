@@ -6,7 +6,8 @@
 # Output is one line per check:  PASS|WARN|FAIL|SKIP  <check>  <detail>
 # Exit status is the number of FAILs (0 = all good).
 #
-# The HA API check makes exactly ONE authenticated request and never retries:
+# The HA API check makes ONE authenticated request to prove the token, then a
+# second (/api/states) only if that succeeded. It never retries:
 # ip_ban is on (login_attempts_threshold: 5), and every rejected token counts
 # toward banning this sandbox's egress IP.
 # =============================================================================
@@ -36,6 +37,7 @@ for v in HOMEASSISTANT_TOKEN HA_SSH_HOST HA_SSH_KEY_B64 CF_ACCESS_CLIENT_ID_HA C
 done
 if [ ${#missing[@]} -eq 0 ]; then res PASS "secrets present" "all 8 set"
 else res FAIL "secrets present" "missing: ${missing[*]}"; fi
+[ -n "${DATALOG_API_TOKEN:-}" ] || res WARN "DATALOG_API_TOKEN" "not in this environment — the AI box's datalog token can't be auto-repaired"
 if [ -n "${CF_ACCESS_CLIENT_ID:-}${CF_ACCESS_CLIENT_SECRET:-}" ]; then
   res WARN "legacy var names" "CF_ACCESS_CLIENT_ID/SECRET are set; nothing reads them — use the _HA names"
 fi
@@ -108,6 +110,8 @@ else
   body=$(curl -s --max-time 20 -w '\n%{http_code}' -H "Authorization: Bearer $HOMEASSISTANT_TOKEN" "$HA_BASE/api/config")
   acode=$(tail -1 <<<"$body")
   if [ "$acode" = 200 ]; then
+    STATES=$(mktemp); trap 'rm -f "$STATES"' EXIT
+    curl -s --max-time 30 -H "Authorization: Bearer $HOMEASSISTANT_TOKEN" "$HA_BASE/api/states" >"$STATES"
     res PASS "REST API" "$(head -n -1 <<<"$body" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("HA", d["version"] + ",", d["state"])' 2>/dev/null)"
   else
     res FAIL "REST API" "HTTP $acode — token rejected; NOT retried (ip_ban counts each failure)"
@@ -119,6 +123,7 @@ if [ -n "$HA_HOST" ]; then
   out=$(timeout 60 ssh -o BatchMode=yes homeassistant '
     printf "core|%s\n" "$(ha core info --raw-json 2>/dev/null | jq -r "\"\(.data.version) (update: \(.data.update_available))\"")"
     ha apps --raw-json 2>/dev/null | jq -r ".data.addons[] | select(.name|test(\"cloudflared|ssh\";\"i\")) | \"app|\(.name)|\(.state)\""
+    jq -r ".data.entities[] | select((.platform==\"unifi\" or .platform==\"unifiprotect\") and .disabled_by==null) | \"ent|\(.platform)|\(.entity_id)\"" /config/.storage/core.entity_registry 2>/dev/null
     printf "disk|%s\n" "$(ha host info --raw-json 2>/dev/null | jq -r ".data.disk_free")"
     cf=$(ha apps --raw-json 2>/dev/null | jq -r ".data.addons[] | select(.name|test(\"cloudflared\";\"i\")) | .slug" | head -1)
     printf "proto|%s\n" "$(ha apps logs "$cf" 2>/dev/null | grep -oE "protocol=[a-z0-9]+" | tail -1 | cut -d= -f2)"
@@ -129,6 +134,25 @@ if [ -n "$HA_HOST" ]; then
     while IFS='|' read -r _ name state; do
       [ "$state" = started ] && res PASS "app: $name" "$state" || res FAIL "app: $name" "$state"
     done < <(grep '^app|' <<<"$out")
+    if [ -s "${STATES:-}" ]; then
+      while IFS='|' read -r s n d; do res "$s" "$n" "$d"; done < <(grep '^ent|' <<<"$out" | python3 -c '
+import sys, json
+states = {s["entity_id"]: s["state"] for s in json.load(open(sys.argv[1]))}
+tot, bad = {}, {}
+for line in sys.stdin:
+    _, plat, eid = line.strip().split("|")
+    tot[plat] = tot.get(plat, 0) + 1
+    if states.get(eid, "unavailable") in ("unavailable", "unknown"):
+        bad[plat] = bad.get(plat, 0) + 1
+for plat, label in (("unifi", "UniFi Network"), ("unifiprotect", "UniFi Protect")):
+    n, b = tot.get(plat, 0), bad.get(plat, 0)
+    if not n: print("FAIL|HA -> %s|no enabled %s entities (integration missing?)" % (label, plat))
+    elif b > n * 0.5: print("FAIL|HA -> %s|%d of %d entities unavailable — integration cannot reach the console" % (label, b, n))
+    else: print("%s|HA -> %s|%d entities, %d unavailable" % ("PASS" if b <= n * 0.2 else "WARN", label, n, b))
+' "$STATES")
+    else
+      res SKIP "HA -> UniFi" "needs a working REST API check"
+    fi
     disk=$(sed -n 's/^disk|//p' <<<"$out")
     awk -v d="$disk" 'BEGIN{exit !(d+0 < 5)}' && res WARN "HA disk free" "${disk} GB" || res PASS "HA disk free" "${disk} GB"
     proto=$(sed -n 's/^proto|//p' <<<"$out")
@@ -152,8 +176,8 @@ if [ -n "$AI_HOST" ]; then
 r() { printf '%s|%s|%s\n' "$1" "$2" "$3"; }
 r PASS "SSH login" "$(whoami)@$(hostname), $(uptime -p)"
 
-g=$(nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader 2>/dev/null)
-[ -n "$g" ] && r PASS "GPU" "$g" || r FAIL "GPU" "nvidia-smi failed"
+g=$(nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader 2>&1); rc=$?
+[ $rc -eq 0 ] && r PASS "GPU" "$g" || r FAIL "GPU" "nvidia-smi: $(head -1 <<<"$g") — driver/library mismatch usually needs a reboot"
 
 for s in captains-transcribe imagegen cloudflared wan-failover nut-monitor; do
   st=$(systemctl is-active "$s.service" 2>/dev/null)
@@ -187,6 +211,9 @@ if [ -r /etc/nmteaco/protect.env ]; then
   v=$(curl -sk --max-time 10 -H "X-API-KEY: $PROTECT_API_KEY" "https://$PROTECT_HOST/proxy/protect/integration/v1/meta/info" \
       | python3 -c 'import sys,json; print(json.load(sys.stdin)["applicationVersion"])' 2>/dev/null)
   [ -n "$v" ] && r PASS "UniFi Protect API" "v$v" || r FAIL "UniFi Protect API" "no answer from $PROTECT_HOST"
+  n=$(curl -sk --max-time 10 -H "X-API-KEY: $PROTECT_API_KEY" "https://$PROTECT_HOST/proxy/network/integration/v1/sites" \
+      | python3 -c 'import sys,json; print(json.load(sys.stdin)["totalCount"])' 2>/dev/null)
+  [ -n "$n" ] && r PASS "UniFi Network API" "integration API answers, $n site(s)" || r FAIL "UniFi Network API" "integration API gave no answer from $PROTECT_HOST"
   curl -sk --max-time 10 -H "X-API-KEY: $PROTECT_API_KEY" "https://$PROTECT_HOST/proxy/network/api/s/default/stat/health" \
   | python3 -c '
 import sys, json
