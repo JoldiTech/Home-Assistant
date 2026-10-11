@@ -38,7 +38,7 @@ long-lived tokens, so **add-on / Supervisor / host management must go through SS
 | --- | --- | --- |
 | `HOMEASSISTANT_BASE_URL` | no | `https://ha.nmteaco.com` — HA web UI + REST API base |
 | `HOMEASSISTANT_TOKEN` | **yes** | HA long-lived access token (REST API auth) |
-| `HA_SSH_HOST` | no | `ssh.nmteaco.com` — the Cloudflare Access SSH hostname |
+| `HA_SSH_HOST` | no | `ssh-ha.nmteaco.com` — the Cloudflare Access SSH hostname |
 | `HA_SSH_USER` | no | SSH login user. **May be empty — default to `root`** |
 | `HA_SSH_KEY_B64` | **yes** | base64 of the ed25519 private key (also authorized on the AI box, see below) |
 | `CF_ACCESS_CLIENT_ID_HA` | **yes** | Cloudflare Access service-token ID for the **HA box's** tunnel |
@@ -52,7 +52,7 @@ long-lived tokens, so **add-on / Supervisor / host management must go through SS
 > `CF_ACCESS_CLIENT_SECRET` (HA was the only box). They were renamed to the `_HA`
 > suffix when the AI box got its own independent tunnel + service token, so each
 > box's credentials are distinct and independently revocable. If something that
-> reaches `ssh.nmteaco.com` breaks with `Permission denied (publickey,password)`
+> reaches `ssh-ha.nmteaco.com` breaks with `Permission denied (publickey,password)`
 > after an env-var change, check for this exact renaming first.
 
 ---
@@ -62,11 +62,18 @@ long-lived tokens, so **add-on / Supervisor / host management must go through SS
 - The box is a **Home Assistant Green** running **HAOS** (`aarch64`) on a home network.
 - It is exposed through a **Cloudflare Tunnel + Cloudflare Access (Zero Trust)** —
   there are **no open inbound ports** at home.
-- Two hostnames ride the **same tunnel**:
-  - `https://ha.nmteaco.com` → HA web UI / REST API (origin: HA core, port 8123)
-  - `ssh.nmteaco.com` → SSH, **Access-protected** (tunnel ingress: `ssh://core-ssh:22`,
+- Two hostnames ride the **same tunnel** (`ha-green`, a dashboard-managed tunnel
+  run by the Cloudflared app from a **tunnel token**):
+  - `https://ha.nmteaco.com` → HA web UI / REST API (route: `http://homeassistant:8123`)
+  - `ssh-ha.nmteaco.com` → SSH, **Access-protected** (route: `ssh://core-ssh:22`,
     the *Terminal & SSH* add-on)
-- **`ssh.nmteaco.com` is NOT raw SSH on port 22.** It is SSH wrapped in an HTTPS
+- **Rebuilt 2026-10-11.** The original tunnel (`443def61…`) was locally managed: the
+  add-on started it with an API cert that was later revoked, after which its
+  startup name-check failed and HA went dark (530 / error 1033). Token mode has
+  no such check and no cert to expire. A new published route gets **no Access
+  protection by default** — the SSH hostname must be added to a Zero Trust Access
+  application, or anyone with `cloudflared` reaches the SSH port (`/test` checks this).
+- **`ssh-ha.nmteaco.com` is NOT raw SSH on port 22.** It is SSH wrapped in an HTTPS
   WebSocket behind Cloudflare Access. You **must** tunnel through `cloudflared` and
   authenticate with the service token — a plain `ssh -p 22` will not work.
 
@@ -159,6 +166,14 @@ environment — they live only on the box itself:
 
 ---
 
+## Check everything at once: `/test`
+
+`/test` (`.claude/skills/test/`) runs `scripts/test_connections.sh`: env secrets,
+SSH aliases, HA web/API/SSH, Access enforcement on both SSH hostnames, AI-box
+services/GPU/UPS/egress, store WANs, Protect, the datalog token, Chloe and
+Captain's Log freshness. Read-only, and it makes exactly one authenticated HA
+request — `ip_ban` is on, so never wrap HA auth in a retry loop.
+
 ## Connect over SSH (copy-paste)
 
 > **In this repo it's already automated.** The committed SessionStart hook
@@ -239,9 +254,9 @@ curl -fsS -X POST -H "Authorization: Bearer $HOMEASSISTANT_TOKEN" \
 
 - **`error in libcrypto` / `Permission denied (publickey)`** → the decoded key is
   missing its trailing newline. Re-run step 2 above (it appends one).
-- **HTTP `502 Bad Gateway` from `ssh.nmteaco.com`** → Cloudflare Access auth is fine
+- **HTTP `502 Bad Gateway` from `ssh-ha.nmteaco.com`** → Cloudflare Access auth is fine
   but the tunnel can't reach the SSH origin. Confirm with a side-by-side: if
-  `ha.nmteaco.com` returns 200 while `ssh.nmteaco.com` 502s, the problem is on the
+  `ha.nmteaco.com` returns 200 while `ssh-ha.nmteaco.com` 502s, the problem is on the
   **HA side** — the Terminal & SSH add-on is stopped, or the tunnel's SSH ingress
   target is wrong (it should be `ssh://core-ssh:22`, not `ssh://localhost:22`).
 - **`cloudflared` won't install** → do **not** use github.com (out of scope here).
