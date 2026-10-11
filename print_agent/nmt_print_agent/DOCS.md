@@ -41,6 +41,15 @@ stops quietly. Home Assistant gets a persistent notification when an order
 fails, may not have printed, can't be reported, or when the printer blocks an
 order (cleared when it recovers).
 
+## Home Assistant entity
+
+`sensor.instore_order_printing`, republished every 30 s and on every job change:
+state `ready` / `printing` / `problem` / `unreachable`; attributes `problem`
+(the blocking reason), `printer_state`, `reasons`, `page_count`, `queue`,
+`last_jobs` (the three newest: id, order, kind, status, pages, error, time in
+UTC) and `checked`. Order numbers only, never job content. The "Store State"
+panel on the DowntownControls dashboard shows it.
+
 ## Log
 
 One line per request (method, path, job id, answer) and one per job (id,

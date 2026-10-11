@@ -44,13 +44,19 @@ def fresh_agent():
         os.remove(os.path.join(agent.SPOOL, name))
     a = agent.Agent(OPTS)
     a.printer.snap = snap()
-    a.alerts = FakeAlerts()
+    a.ha = FakeHA()
     return a
 
 
-class FakeAlerts:
+class FakeHA:
+    """Records notifications in .sent and status-entity updates in .states."""
+
     def __init__(self):
         self.sent = []
+        self.states = []
+
+    def set_state(self, entity_id, state, attributes):
+        self.states.append((entity_id, state, attributes))
 
     def notify(self, nid, title, message):
         self.sent.append(("create", nid, message))
@@ -244,7 +250,7 @@ class Reporter(unittest.TestCase):
         self.assertEqual(a.store.outbox, [])
         with a.store.lock, open(agent.STATE_FILE) as f:  # removal and save happen under the lock
             self.assertEqual(json.load(f)["outbox"], [], "delivery persisted")
-        self.assertEqual(a.alerts.sent, [], "a delivered result raises no alert")
+        self.assertEqual(a.ha.sent, [], "a delivered result raises no alert")
 
     def test_gives_up_after_four_retries_and_alerts(self):
         a = fresh_agent()
@@ -256,12 +262,12 @@ class Reporter(unittest.TestCase):
         a.finish(12, "printed", 1, 2, None)
         threading.Thread(target=a.reporter, daemon=True).start()
         deadline = time.time() + 10
-        while time.time() < deadline and not a.alerts.sent:
+        while time.time() < deadline and not a.ha.sent:
             time.sleep(0.1)
         time.sleep(0.5)
         self.assertEqual(len(calls), 5, "first attempt + 4 retries, then stop")
         self.assertEqual(a.store.outbox, [])
-        (kind, nid, message), = a.alerts.sent
+        (kind, nid, message), = a.ha.sent
         self.assertEqual((kind, nid), ("create", "nmt_print_agent_report_12"))
         self.assertIn("after 4 retries", message)
         self.assertEqual(a.accept(job(12))[1]["outcome"], "printed", "outcome still answerable as a duplicate")
@@ -281,12 +287,12 @@ class Reporter(unittest.TestCase):
 
     def test_unknown_id_stops_quietly(self):
         a, calls = self.run_reporter_once(("unknown", "HTTP 200"))
-        self.assertEqual((len(calls), a.store.outbox, a.alerts.sent), (1, [], []))
+        self.assertEqual((len(calls), a.store.outbox, a.ha.sent), (1, [], []))
 
     def test_4xx_stops_at_once_and_alerts(self):
         a, calls = self.run_reporter_once(("reject", "HTTP 401"))
         self.assertEqual((len(calls), a.store.outbox), (1, []))
-        (kind, nid, message), = a.alerts.sent
+        (kind, nid, message), = a.ha.sent
         self.assertIn("refused it (HTTP 401)", message)
 
 
@@ -352,6 +358,36 @@ class ParseJob(unittest.TestCase):
         self.assertEqual(fresh_agent().status()["formats"], ["pdf"])
 
 
+class StatusEntity(unittest.TestCase):
+    def test_last_three_jobs_newest_first_no_content(self):
+        a = fresh_agent()
+        for i in (61, 62, 63, 64):
+            a.accept(job(i))
+        for i, outcome in ((61, "printed"), (62, "failed"), (63, "printed")):
+            a.store.queue.remove(i)
+            a.finish(i, outcome, 100, 101 if outcome == "printed" else 100, None if outcome == "printed" else "media-jam")
+        entity, state, attrs = a.ha.states[-1]
+        self.assertEqual(entity, "sensor.instore_order_printing")
+        self.assertEqual(state, "printing", "job 64 is still queued")
+        self.assertEqual([(j["id"], j["status"], j["pages"]) for j in attrs["last_jobs"]],
+                         [(64, "queued", None), (63, "printed", 1), (62, "failed", 0)])
+        self.assertEqual(attrs["last_jobs"][2]["error"], "media-jam")
+        self.assertTrue(attrs["last_jobs"][1]["time"].endswith("+00:00"))
+        self.assertNotIn("PDF", json.dumps(attrs))
+        self.assertNotIn("pdf_bytes", json.dumps(attrs))
+
+    def test_states(self):
+        a = fresh_agent()
+        a.publish()
+        self.assertEqual(a.ha.states[-1][1], "ready")
+        a.printer.snap = snap(["media-empty"])
+        a.publish()
+        self.assertEqual((a.ha.states[-1][1], a.ha.states[-1][2]["problem"]), ("problem", "media-empty"))
+        a.printer.snap = snap(["unreachable"], reachable=False)
+        a.publish()
+        self.assertEqual(a.ha.states[-1][1], "unreachable")
+
+
 class AlertsOnOutcome(unittest.TestCase):
     def test_failed_and_uncertain_alert_printed_does_not(self):
         a = fresh_agent()
@@ -359,20 +395,20 @@ class AlertsOnOutcome(unittest.TestCase):
             a.accept(job(i))
             a.store.queue.remove(i)
             a.finish(i, outcome, 1, 1 if outcome != "printed" else 2, None if outcome == "printed" else "media-jam")
-        self.assertEqual([(k, n) for k, n, _ in a.alerts.sent],
+        self.assertEqual([(k, n) for k, n, _ in a.ha.sent],
                          [("create", "nmt_print_agent_job_22"), ("create", "nmt_print_agent_job_23")])
-        self.assertNotIn("%PDF", " ".join(m for _, _, m in a.alerts.sent), "no job content in alerts")
+        self.assertNotIn("%PDF", " ".join(m for _, _, m in a.ha.sent), "no job content in alerts")
 
     def test_printer_alert_once_per_incident_then_cleared(self):
         a = fresh_agent()
         a.printer.snap = snap(["media-empty"])
         a.accept(job(31))
         a.accept(job(32))
-        self.assertEqual([(k, n) for k, n, _ in a.alerts.sent], [("create", agent.PRINTER_ALERT)])
-        self.assertIn("media-empty", a.alerts.sent[0][2])
+        self.assertEqual([(k, n) for k, n, _ in a.ha.sent], [("create", agent.PRINTER_ALERT)])
+        self.assertIn("media-empty", a.ha.sent[0][2])
         a.printer_ok()
         a.printer_ok()
-        self.assertEqual([k for k, _, _ in a.alerts.sent], ["create", "dismiss"])
+        self.assertEqual([k for k, _, _ in a.ha.sent], ["create", "dismiss"])
 
 
 if __name__ == "__main__":

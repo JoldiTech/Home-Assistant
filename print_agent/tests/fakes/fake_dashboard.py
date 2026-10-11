@@ -3,8 +3,9 @@ and appends them to $SHARED/results.jsonl. `$SHARED/dash_mode` = "down"
 answers 503, so the agent must retry.
 
 Also plays the Supervisor's Core API proxy on port 80 (network alias
-`supervisor`): persistent_notification create/dismiss calls carrying the
-right bearer token are appended to $SHARED/notifications.jsonl."""
+`supervisor`): with the right bearer token, persistent_notification
+create/dismiss calls are appended to $SHARED/notifications.jsonl and state
+updates to $SHARED/states.jsonl."""
 
 import json
 import os
@@ -58,6 +59,11 @@ class Supervisor(BaseHTTPRequestHandler):
         prefix = "/core/api/services/persistent_notification/"
         if self.headers.get("Authorization") != f"Bearer {SUP_TOKEN}":
             code = 401
+        elif self.path.startswith("/core/api/states/"):
+            with open(os.path.join(SHARED, "states.jsonl"), "a") as f:
+                f.write(json.dumps({"t": time.time(), "entity_id": self.path[len("/core/api/states/"):],
+                                    **json.loads(body)}) + "\n")
+            code = 200
         elif not self.path.startswith(prefix):
             code = 404
         else:

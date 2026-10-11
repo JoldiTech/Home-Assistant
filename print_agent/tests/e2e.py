@@ -115,6 +115,19 @@ def notifications():
         return []
 
 
+def states():
+    try:
+        with open(os.path.join(SHARED, "states.jsonl")) as f:
+            return [json.loads(line) for line in f]
+    except FileNotFoundError:
+        return []
+
+
+def entity(pred, timeout=40):
+    """The latest status-entity update satisfying pred (waits for it)."""
+    return wait_for(lambda: next((u for u in reversed(states()) if pred(u)), None), timeout)
+
+
 def alert(nid, service="create", timeout=30):
     return wait_for(lambda: next((n for n in notifications()
                                   if n["notification_id"] == nid and n["service"] == service), None), timeout)
@@ -180,6 +193,11 @@ def main():
           r and r["outcome"] == "printed" and r["pages_after"] - r["pages_before"] == 1, r)
     check("1 normal: one sheet", printed() == 1, printed())
     check("1 normal: no alert", not [n for n in notifications() if n["service"] == "create"], notifications())
+    u = entity(lambda u: u["attributes"]["last_jobs"] and u["attributes"]["last_jobs"][0]["status"] == "printed")
+    check("HA entity: ready, job 1 printed with 1 page",
+          u and u["entity_id"] == "sensor.instore_order_printing" and u["state"] == "ready"
+          and (u["attributes"]["last_jobs"][0]["id"], u["attributes"]["last_jobs"][0]["pages"]) == (1, 1)
+          and u["attributes"]["page_count"] == 7164, u)
 
     # 2. Duplicate
     code, body, _ = push(1)
@@ -234,6 +252,7 @@ def main():
           code == 503 and body == {"accepted": False, "reason": "unreachable"} and secs < 5, f"{code} {body} {secs:.1f}s")
     a = alert("nmt_print_agent_printer")
     check("6 power off: HA alert raised", a and "unreachable" in a["message"], a)
+    check("HA entity: unreachable while the printer is off", entity(lambda u: u["state"] == "unreachable"))
     sh("docker", "rm", "-f", "printer")
     start_printer()
     wait_for(lambda: request("GET", "/status")[1]["printer"]["reachable"], 20)
@@ -318,7 +337,10 @@ def main():
     check("5b blocked past grace: held job never printed", printed() == n, (n, printed()))
     a = alert("nmt_print_agent_job_54")
     check("5b blocked past grace: HA alert 'didn't print'", a and "unreachable" in a["message"], a)
-    alerts_text = json.dumps(notifications())
+    u = states()[-1]
+    check("HA entity: three most recent jobs, newest first",
+          [j["id"] for j in u["attributes"]["last_jobs"]] == [54, 53, 52], u["attributes"]["last_jobs"])
+    alerts_text = json.dumps(notifications()) + json.dumps(states())
     check("alerts: no job content", "TEST PAGE" not in alerts_text and "PDF-" not in alerts_text)
 
     # Logs never carry job content or header values

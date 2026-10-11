@@ -37,7 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipp
 import snmp
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 
 def container_env(name, default=None):
@@ -81,6 +81,7 @@ PROBE_MAX_AGE = 10        # /print re-probes the printer if the cached state is 
 # last one the agent gives up and raises a Home Assistant alert.
 RETRY_DELAYS = [float(s) for s in container_env("NMT_RETRY_DELAYS", "5,30,120,300").split(",")]
 PRINTER_ALERT = "nmt_print_agent_printer"
+STATUS_ENTITY = "sensor.instore_order_printing"  # read by the HA "Instore Order Printing" dashboard
 
 # Printer-state-reasons that mean the printer cannot print, after stripping the
 # -error/-warning/-report suffix and folding synonyms into the names the
@@ -309,35 +310,42 @@ class Store:
 
 
 # --------------------------------------------------------------------------
-# Home Assistant alerts
+# Home Assistant: alerts and the status entity
 # --------------------------------------------------------------------------
 
-class Alerts:
-    """Persistent notifications in Home Assistant, through the Supervisor's
-    Core API proxy (`homeassistant_api: true`). Sent from a background thread
-    so /print never waits on HA. Best effort: a few retries on network errors
-    or 5xx, none on a 4xx."""
+class HomeAssistant:
+    """Talks to Home Assistant through the Supervisor's Core API proxy
+    (`homeassistant_api: true`): persistent notifications, and the state of
+    STATUS_ENTITY. Calls run on a background thread so /print never waits on
+    HA. Notifications get a few retries on network errors or 5xx; a state
+    update gets none, because the next one replaces it within POLL_INTERVAL.
+    Never a retry on a 4xx."""
 
     def __init__(self):
         self.token = (container_env("SUPERVISOR_TOKEN") or "").strip()
         self.base = container_env("NMT_HA_API", "http://supervisor/core/api").rstrip("/")
         self.queue = queue.Queue()
+        self.state_failing = False
 
     def start(self):
         if not self.token:
-            log("alerts: no SUPERVISOR_TOKEN; Home Assistant alerts are off")
-        threading.Thread(target=self.run, daemon=True, name="alerts").start()
+            log("home assistant: no SUPERVISOR_TOKEN; alerts and the status entity are off")
+        threading.Thread(target=self.run, daemon=True, name="homeassistant").start()
 
     def notify(self, nid, title, message):
-        self.queue.put(("create", {"notification_id": nid, "title": title, "message": message}))
+        self.queue.put(("services/persistent_notification/create",
+                        {"notification_id": nid, "title": title, "message": message}))
 
     def dismiss(self, nid):
-        self.queue.put(("dismiss", {"notification_id": nid}))
+        self.queue.put(("services/persistent_notification/dismiss", {"notification_id": nid}))
 
-    def call(self, service, data):
+    def set_state(self, entity_id, state, attributes):
+        self.queue.put((f"states/{entity_id}", {"state": state, "attributes": attributes}))
+
+    def call(self, path, data):
         req = urllib.request.Request(
-            f"{self.base}/services/persistent_notification/{service}", data=json.dumps(data).encode(),
-            method="POST", headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
+            f"{self.base}/{path}", data=json.dumps(data).encode(), method="POST",
+            headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
                 return r.status
@@ -348,16 +356,27 @@ class Alerts:
 
     def run(self):
         while True:
-            service, data = self.queue.get()
+            path, data = self.queue.get()
             if not self.token:
                 continue
+            if path.startswith("states/"):
+                code = self.call(path, data)
+                failing = code not in (200, 201)
+                if failing != self.state_failing:  # log changes only: this runs every 30 s
+                    self.state_failing = failing
+                    log(f"home assistant: status entity {'not updated (' + str(code or 'no connection') + ')' if failing else 'updating again'}")
+                continue
             for attempt in range(3):
-                code = self.call(service, data)
+                code = self.call(path, data)
                 if code is not None and code < 500:
                     break
                 time.sleep(10)
             outcome = "sent" if code == 200 else f"failed ({code or 'no connection'})"
-            log(f"alert {service} {data['notification_id']} {outcome}")
+            log(f"alert {path.rsplit('/', 1)[1]} {data['notification_id']} {outcome}")
+
+
+def iso(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(ts)) if ts else None
 
 
 def job_label(job):
@@ -390,7 +409,7 @@ class Agent:
         self.cups = Cups(opts["printer_uri"])
         self.store = Store(STATE_FILE)
         self.current = None  # job id being printed
-        self.alerts = Alerts()
+        self.ha = HomeAssistant()
         self.printer_alerted = False
 
     def printer_blocked(self, reason):
@@ -398,13 +417,14 @@ class Agent:
         incident, cleared by printer_ok()."""
         if not self.printer_alerted:
             self.printer_alerted = True
-            self.alerts.notify(PRINTER_ALERT, "Downtown printer can't print",
+            self.ha.notify(PRINTER_ALERT, "Downtown printer can't print",
                                f"The pickup printer reports **{reason}**. Orders can't print until it's fixed.")
+            self.publish()
 
     def printer_ok(self):
         if self.printer_alerted:
             self.printer_alerted = False
-            self.alerts.dismiss(PRINTER_ALERT)
+            self.ha.dismiss(PRINTER_ALERT)
 
     # ---- results -----------------------------------------------------------
 
@@ -413,7 +433,10 @@ class Agent:
         delete the job's files."""
         with self.store.lock:
             job = self.store.jobs[str(job_id)]
-            job.update(status="done", outcome=outcome, pages_before=before, pages_after=after, error=error)
+            job.update(status="done", outcome=outcome, pages_before=before, pages_after=after, error=error,
+                       finished=time.time())
+            if self.current == job["id"]:
+                self.current = None  # before publish(), or the entity shows it still printing
             self.store.outbox.append({
                 "payload": {"action": "result", "agent": self.name, "id": job["id"], "outcome": outcome,
                             "pages_before": before, "pages_after": after, "error": error},
@@ -422,12 +445,13 @@ class Agent:
             self.store.save()
             self.store.wake.notify_all()
         remove_files(job_id)
+        self.publish()
         nid = f"nmt_print_agent_job_{job['id']}"
         if outcome == "failed":
-            self.alerts.notify(nid, "Pickup order didn't print",
+            self.ha.notify(nid, "Pickup order didn't print",
                                f"{job_label(job)} (job {job['id']}) did not print: **{error}**.")
         elif outcome == "uncertain":
-            self.alerts.notify(nid, "Pickup order may not have printed",
+            self.ha.notify(nid, "Pickup order may not have printed",
                                f"{job_label(job)} (job {job['id']}) may not have printed: {error}. "
                                "Check the printer tray and reprint it from the curbside tablet if it's missing.")
         delta = after - before if before is not None and after is not None else None
@@ -484,6 +508,7 @@ class Agent:
             self.store.queue.remove(job["id"])
             self.current = job["id"]
             self.store.save()  # durable BEFORE anything reaches CUPS
+        self.publish()
         try:
             before = self.printer.page_count()
             with self.store.lock:
@@ -570,6 +595,7 @@ class Agent:
                 self.cups.ensure_queue()
             if not snap["blocking"]:
                 self.printer_ok()
+            self.publish()
             if not self.cups.alive():
                 log("cupsd exited; stopping so the Supervisor restarts the add-on")
                 os._exit(1)
@@ -627,7 +653,7 @@ class Agent:
                     why = (f"refused it ({how})" if verdict == "reject"
                            else f"didn't accept it after {due['attempt']} retries ({how})")
                     log(f"result job {p['id']} not delivered: dashboard {why}; giving up")
-                    self.alerts.notify(
+                    self.ha.notify(
                         f"nmt_print_agent_report_{p['id']}", "Print result not reported",
                         f"{job_label(job)} (job {p['id']}): the outcome was **{p['outcome']}**, but the dashboard "
                         f"{why}. The dashboard may still show it as sending.")
@@ -641,6 +667,42 @@ class Agent:
                 self.store.save()
 
     # ---- HTTP --------------------------------------------------------------
+
+    def publish(self):
+        """Push STATUS_ENTITY: overall state, printer details and the last
+        three jobs. Order numbers only, never job content."""
+        snap = self.printer.current()
+        with self.store.lock:
+            queued = len(self.store.queue) + (1 if self.current is not None else 0)
+            recent = list(self.store.jobs.values())[-3:][::-1]
+        jobs = []
+        for j in recent:
+            b, a = j.get("pages_before"), j.get("pages_after")
+            jobs.append({"id": j["id"], "order": j["order"], "kind": j["kind"],
+                         "status": j.get("outcome") or j["status"],
+                         "pages": a - b if a is not None and b is not None else None,
+                         "error": j.get("error"),
+                         "time": iso(j.get("finished") or j.get("started") or j.get("accepted"))})
+        if not snap["reachable"]:
+            state = "unreachable"
+        elif snap["blocking"]:
+            state = "problem"
+        elif queued:
+            state = "printing"
+        else:
+            state = "ready"
+        self.ha.set_state(STATUS_ENTITY, state, {
+            "friendly_name": "Instore Order Printing",
+            "icon": "mdi:printer-check" if state in ("ready", "printing") else "mdi:printer-alert",
+            "problem": (snap["blocking"] or [None])[0],
+            "printer_state": snap["state"],
+            "reasons": snap["reasons"],
+            "page_count": snap["page_count"],
+            "queue": queued,
+            "last_jobs": jobs,
+            "agent_version": VERSION,
+            "checked": iso(snap["at"]),
+        })
 
     def status(self):
         snap = self.printer.current()
@@ -677,6 +739,7 @@ class Agent:
             self.store.prune()
             self.store.save()
             self.store.wake.notify_all()
+        self.publish()
         return 202, {"accepted": True}
 
 
@@ -806,13 +869,13 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
-    agent.alerts.start()
+    agent.ha.start()
     snap = agent.printer.poll()
     agent.recover()
     if snap["reachable"]:
         agent.cups.ensure_queue()
     if not snap["blocking"]:
-        agent.alerts.dismiss(PRINTER_ALERT)  # one raised before a restart may be stale
+        agent.ha.dismiss(PRINTER_ALERT)  # one raised before a restart may be stale
     for target in (agent.worker, agent.monitor, agent.reporter):
         threading.Thread(target=target, daemon=True, name=target.__name__).start()
 
