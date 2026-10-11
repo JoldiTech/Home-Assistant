@@ -105,7 +105,12 @@ PROXY_EOF
 chmod 700 "$PROXY"
 
 # --- 5) ssh config alias -> `ssh homeassistant` ------------------------------
-HOST="${HA_SSH_HOST:-ssh.nmteaco.com}"
+# Connection setup through HA's tunnel fails intermittently (HA's internal DNS
+# lookup of core-ssh is periodically starved — see "Reliability" in CLAUDE.md),
+# so the alias multiplexes: the setup cost is paid once, and later
+# `ssh homeassistant` calls reuse the live socket. scripts/ha-ssh adds retry
+# with backoff for establishing that first connection.
+HOST="${HA_SSH_HOST:-ssh-ha.nmteaco.com}"
 USER_NAME="${HA_SSH_USER:-root}"
 [ -n "$USER_NAME" ] || USER_NAME="root"   # HA_SSH_USER may be set-but-empty
 CFG="$SSH_DIR/config"
@@ -122,10 +127,16 @@ END="# <<< ha-ssh-setup <<<"
   echo "    StrictHostKeyChecking accept-new"
   echo "    UserKnownHostsFile $SSH_DIR/known_hosts"
   echo "    ProxyCommand $PROXY %h"
-  echo "    ConnectTimeout 50"
+  echo "    ConnectTimeout 30"
+  echo "    ConnectionAttempts 3"
   echo "    ServerAliveInterval 15"
+  echo "    ServerAliveCountMax 3"
+  echo "    ControlMaster auto"
+  echo "    ControlPath $SSH_DIR/cm/%r@%h:%p"
+  echo "    ControlPersist 300"
   echo "$END"
 } >> "$CFG"
+mkdir -p "$SSH_DIR/cm" && chmod 700 "$SSH_DIR/cm"
 chmod 600 "$CFG"
 log "ssh config ready — connect with: ssh homeassistant"
 

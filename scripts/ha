@@ -35,7 +35,12 @@ case "$path" in
   *)                  url="${HOMEASSISTANT_BASE_URL%/}/${path}" ;;
 esac
 
+# Retries ride out tunnel blips (502/503/504, and a refused origin during an
+# HA core restart). curl never retries a 4xx, so a rejected token fails once
+# and does not walk this IP into ip_ban.
 curl -fsS \
+  --connect-timeout 10 --max-time 60 \
+  --retry 4 --retry-delay 1 --retry-connrefused \
   -H "Authorization: Bearer ${HOMEASSISTANT_TOKEN}" \
   -H "Content-Type: application/json" \
   "$@" \

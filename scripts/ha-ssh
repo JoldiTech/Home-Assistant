@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# ha-ssh — resilient SSH into Home Assistant over the Cloudflare Access tunnel.
+#
+# Why this exists: the tunnel is reliable once a connection is *up*, but the
+# initial handshake (cloudflared edge session + internal DNS lookup of
+# `core-ssh`) intermittently times out with "banner exchange" — a single plain
+# `ssh homeassistant` fails roughly 1 in 3. This wrapper makes that first
+# connection reliable and cheap for everything after it:
+#
+#   1. Establishes a multiplexed *master* connection, retrying with exponential
+#      backoff until it succeeds (or MAX_TRIES is hit).
+#   2. Runs your command over that master — instant, no cloudflared, no DNS.
+#      Every later `ssh homeassistant ...` in the session reuses it too.
+#
+# Usage:
+#   scripts/ha-ssh 'ha core info'          # run a command
+#   scripts/ha-ssh                          # open an interactive shell
+#   scripts/ha-ssh --up                     # just (re)establish the master, then exit
+#   scripts/ha-ssh --down                   # tear the master down
+#
+# Env knobs (all optional):
+#   HA_SSH_ALIAS   ssh_config host to use          (default: homeassistant)
+#   HA_SSH_TRIES   master-establish attempts        (default: 6)
+#   HA_SSH_PERSIST ControlPersist seconds           (default: 300)
+set -uo pipefail
+
+ALIAS="${HA_SSH_ALIAS:-homeassistant}"
+MAX_TRIES="${HA_SSH_TRIES:-6}"
+PERSIST="${HA_SSH_PERSIST:-300}"
+CM_DIR="$HOME/.ssh/cm"
+SOCK="$CM_DIR/%r@%h:%p"
+
+log() { printf 'ha-ssh: %s\n' "$*" >&2; }
+
+mkdir -p "$CM_DIR" && chmod 700 "$CM_DIR" 2>/dev/null || true
+
+master_up() { ssh -O check -o ControlPath="$SOCK" "$ALIAS" >/dev/null 2>&1; }
+
+establish() {
+  master_up && return 0
+  local attempt=1 delay=2
+  while [ "$attempt" -le "$MAX_TRIES" ]; do
+    if ssh -o ControlMaster=auto -o ControlPath="$SOCK" -o ControlPersist="$PERSIST" \
+           -o ConnectTimeout=25 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+           -fN "$ALIAS" 2>/dev/null && master_up; then
+      [ "$attempt" -gt 1 ] && log "master established (attempt $attempt/$MAX_TRIES)"
+      return 0
+    fi
+    if [ "$attempt" -lt "$MAX_TRIES" ]; then
+      log "connection setup failed (attempt $attempt/$MAX_TRIES); retrying in ${delay}s"
+      sleep "$delay"; delay=$((delay * 2)); [ "$delay" -gt 16 ] && delay=16
+    fi
+    attempt=$((attempt + 1))
+  done
+  log "ERROR: could not establish tunnel after $MAX_TRIES attempts"
+  return 1
+}
+
+teardown() { ssh -O exit -o ControlPath="$SOCK" "$ALIAS" 2>/dev/null; log "master closed"; }
+
+case "${1:-}" in
+  --down|--exit)  teardown; exit 0 ;;
+  --up)           establish; exit $? ;;
+esac
+
+establish || exit 1
+exec ssh -o ControlPath="$SOCK" "$ALIAS" "$@"

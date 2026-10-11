@@ -120,6 +120,8 @@ if [ -n "$HA_HOST" ]; then
     printf "core|%s\n" "$(ha core info --raw-json 2>/dev/null | jq -r "\"\(.data.version) (update: \(.data.update_available))\"")"
     ha apps --raw-json 2>/dev/null | jq -r ".data.addons[] | select(.name|test(\"cloudflared|ssh\";\"i\")) | \"app|\(.name)|\(.state)\""
     printf "disk|%s\n" "$(ha host info --raw-json 2>/dev/null | jq -r ".data.disk_free")"
+    cf=$(ha apps --raw-json 2>/dev/null | jq -r ".data.addons[] | select(.name|test(\"cloudflared\";\"i\")) | .slug" | head -1)
+    printf "proto|%s\n" "$(ha apps logs "$cf" 2>/dev/null | grep -oE "protocol=[a-z0-9]+" | tail -1 | cut -d= -f2)"
   ' 2>&1)
   if grep -q '^core|' <<<"$out"; then
     res PASS "SSH login" "root@core-ssh"
@@ -129,6 +131,12 @@ if [ -n "$HA_HOST" ]; then
     done < <(grep '^app|' <<<"$out")
     disk=$(sed -n 's/^disk|//p' <<<"$out")
     awk -v d="$disk" 'BEGIN{exit !(d+0 < 5)}' && res WARN "HA disk free" "${disk} GB" || res PASS "HA disk free" "${disk} GB"
+    proto=$(sed -n 's/^proto|//p' <<<"$out")
+    case "$proto" in
+      http2) res PASS "tunnel transport" "http2" ;;
+      "")    res WARN "tunnel transport" "no protocol line in the Cloudflared app's recent log" ;;
+      *)     res WARN "tunnel transport" "$proto — expect UI freezes; set run_parameters [\"--protocol=http2\"]" ;;
+    esac
   else
     res FAIL "SSH login" "$(ssh_fail_reason "$out")"
   fi

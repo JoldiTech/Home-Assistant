@@ -1,5 +1,10 @@
 # Home Assistant — Connection Self-Assessment
 
+> **Superseded.** This is the 2026-07-18 point-in-time assessment and is out of
+> date (SSH works, the HA SSH hostname is now `ssh-ha.nmteaco.com`, and the
+> Access variables are the `_HA` / `_AI_BOX` names). The current runbook is
+> [`CLAUDE.md`](CLAUDE.md); run `/test` to check every connection.
+
 **Date:** 2026-07-18
 **Result:** ✅ Connectable out of the box via the **REST API**. SSH is provisioned
 but gated behind Cloudflare Access and needs an extra credential that is not

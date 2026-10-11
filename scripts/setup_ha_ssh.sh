@@ -9,7 +9,7 @@
 # and exits 0 even when unconfigured so it never blocks a SessionStart hook.
 #
 # Required sticky env vars (set once in the environment settings):
-#   HA_SSH_HOST                 Cloudflare Access hostname, e.g. ssh.nmteaco.com
+#   HA_SSH_HOST                 Cloudflare Access hostname, e.g. ssh-ha.nmteaco.com
 #   HA_SSH_KEY_B64              base64 of the PEM SSH private key  (`base64 -w0 key`)
 #   CF_ACCESS_CLIENT_ID_HA      Cloudflare Access service-token Client ID
 #   CF_ACCESS_CLIENT_SECRET_HA  Cloudflare Access service-token Client Secret
