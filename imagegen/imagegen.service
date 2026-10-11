@@ -1,0 +1,65 @@
+[Unit]
+Description=Ephemeral local image generation (JuggernautXL Ragnarok)
+After=network.target
+
+[Service]
+Type=simple
+User=nmteaco
+Group=nmteaco
+WorkingDirectory=/home/nmteaco/imagegen
+EnvironmentFile=/etc/nmteaco/imagegen.env
+Environment=MODEL_PATH=/home/nmteaco/imagegen/models/juggernautXL_ragnarok.safetensors
+Environment=LLM_MODEL_PATH=/home/nmteaco/imagegen/models/Gemma-4-12B-OBLITERATED.Q4_K_M.gguf
+Environment=PORT=8189
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# The huggingface cache only appears on first download, but a ReadWritePaths
+# target that does not exist yet aborts start with 226/NAMESPACE, and
+# ProtectHome=read-only leaves the service no way to create it. '+' runs these
+# outside the sandbox, before the mount namespace is built. .cache itself is
+# chowned too: mkdir -p creates it as root on a fresh box, and a root-owned
+# ~/.cache blocks every other cache this machine's user needs (torch.hub for
+# demucs, pip).
+ExecStartPre=+/usr/bin/mkdir -p /home/nmteaco/.cache/huggingface
+ExecStartPre=+/usr/bin/chown nmteaco:nmteaco /home/nmteaco/.cache /home/nmteaco/.cache/huggingface
+ExecStart=/home/nmteaco/imagegen-env/bin/python /home/nmteaco/imagegen/app.py
+Restart=on-failure
+RestartSec=5
+
+# --- Hardening ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# The huggingface cache is the only writable path outside the state dir, and
+# it is a cache - no generated image or conversation content ever lands on disk.
+ReadWritePaths=/home/nmteaco/.cache/huggingface
+# /var/lib/imagegen holds the two persisted things: the login verifier (the
+# auth half of the PBKDF2 output) and the prompts, encrypted under a key that
+# is never stored here. StateDirectory rather than ReadWritePaths because
+# systemd creates it before the sandbox exists, so a fresh box starts instead
+# of dying at 226/NAMESPACE.
+StateDirectory=imagegen
+StateDirectoryMode=0700
+PrivateTmp=yes
+PrivateDevices=no
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# Safety net, not a fix: caps a runaway process well below the box's 31G so
+# a leak kills+restarts this service instead of swap-thrashing the whole
+# machine. Confirmed steady-state with both models loaded is ~17.2G (one-
+# time CUDA/accelerate init cost on first generation, then flat across
+# repeated calls - see imagegen/README.md) - these ceilings sit above that
+# with headroom, not at the bare minimum.
+MemoryHigh=22G
+MemoryMax=26G
+# Security-critical: never let this service's memory (which holds plaintext
+# conversations and in-memory generated images) be paged to the on-disk swap,
+# where it would be forensically recoverable. Under pressure the process gets
+# OOM-killed and restarted (memory cleared) instead of swapping secrets out.
+MemorySwapMax=0
+
+[Install]
+WantedBy=multi-user.target
