@@ -17,6 +17,23 @@ script makes exactly one authenticated HA API request because `ip_ban` is on
 (5 failed authentications bans this sandbox's IP), and a retry loop with a
 stale token is how that ban happens.
 
+## Datalog token repair
+
+If the report has a **FAIL datalog API** row and `DATALOG_API_TOKEN` is set in
+this environment (the script WARNs when it isn't), run once:
+
+```bash
+bash scripts/sync_datalog_token.sh
+```
+
+It pushes the environment's token to the AI box's `/etc/nmteaco/captains.env`
+over ssh stdin (never on a command line or in output), but only after the datalog
+API accepts it, and only if the box's current token is failing. No restart is
+needed. Report its one-line result; never print the token. If it's unset, tell
+the user to add `DATALOG_API_TOKEN` in the environment settings (value: the
+dashboard's `DATALOG_API_TOKEN`, API Credentials page) and start a new session.
+Do not ask the user to paste it into chat.
+
 ## Reporting
 
 Lead with one line: everything is up, or which connections are down.
@@ -43,7 +60,10 @@ each with the fix from the map below. Don't paste the raw output unless asked.
 | AI box egress | failed over to the AT&T dongle | The store's primary WAN is down; the box is on its backup line. |
 | UPS | ON BATTERY | Store power is out. The AI box shuts itself down at 50% / 10 min. |
 | WAN1 / WAN2 | no monitor data or < 99% | That ISP link is down or flapping at the UDM. |
-| datalog API | HTTP 401/403 | `DATALOG_API_TOKEN` in `/etc/nmteaco/captains.env` on the AI box doesn't match the dashboard's. Business numbers are missing from every log until fixed. |
+| HA -> UniFi Network / Protect | entities unavailable, or none | HA's UniFi integration can't reach the console (192.168.22.1): reload the config entry, check the console is up. |
+| UniFi Network API (AI box) | no answer | The key in `/etc/nmteaco/protect.env` is invalid or the console is down. |
+| GPU | nvidia-smi: NVML mismatch | Driver updated without a reboot. Reboot the AI box (it WoL-restarts via `script.wake_ai_box` only after UPS shutdowns). |
+| datalog API | HTTP 401/403 | `DATALOG_API_TOKEN` in `/etc/nmteaco/captains.env` on the AI box doesn't match the dashboard's → run the repair above. Business numbers are missing from every log until fixed. |
 | Captain's Log | latest day-file is old | A nightly run was missed. Recoverable from Protect for ~30 days via the dashboard's Create Transcript / Create Log buttons. |
 | Chloe (public) | not 200 | The AI box's tunnel or `imagegen.service` is down. |
 

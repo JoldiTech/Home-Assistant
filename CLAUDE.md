@@ -171,8 +171,17 @@ environment — they live only on the box itself:
 `/test` (`.claude/skills/test/`) runs `scripts/test_connections.sh`: env secrets,
 SSH aliases, HA web/API/SSH, Access enforcement on both SSH hostnames, AI-box
 services/GPU/UPS/egress, store WANs, Protect, the datalog token, Chloe and
-Captain's Log freshness. Read-only, and it makes exactly one authenticated HA
-request — `ip_ban` is on, so never wrap HA auth in a retry loop.
+Captain's Log freshness. Read-only apart from the optional datalog repair below. It
+makes one authenticated HA request to prove the token (plus `/api/states` only if
+that succeeded) — `ip_ban` is on, so never wrap HA auth in a retry loop. It also
+checks that HA's UniFi Network/Protect integrations and the AI box can reach the
+console.
+
+**Datalog token repair:** put `DATALOG_API_TOKEN` in the environment's secrets
+(never paste it in chat); on a datalog FAIL, `/test` runs
+`scripts/sync_datalog_token.sh`, which verifies the token against the API and
+writes it to the AI box's `captains.env` over ssh stdin. Needs write access or
+passwordless sudo for `nmteaco` on that file.
 
 ## Connect over SSH (copy-paste)
 
