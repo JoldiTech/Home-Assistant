@@ -625,8 +625,9 @@ exists to prevent. Zero transcript support for any of it.
 
 **More capacity against lossy mic audio buys more convincing confabulation.**
 Qwen3-8B's clumsiness is a safety feature: it garbles visibly where the 30B
-invents plausibly. Keep `Qwen3-8B-Q4_K_M` at `SUMMARIZER_CTX=8192`. The model
-is staged at `~/transcribe/models/` if you want to re-verify; don't re-litigate
+invents plausibly. Keep `Qwen3-8B-Q4_K_M` at `SUMMARIZER_CTX=8192`. The 30B
+was deleted from the box on 2026-10-11 (with an unused Qwen2.5-7B and a
+duplicate Qwen3-8B); re-download it only to re-verify, and don't re-litigate
 it from first principles.
 
 Two related dead ends, both measured: the `/no_think` suffix is a Qwen3 *hybrid*
@@ -805,9 +806,16 @@ the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
   model is just dropping the file/folder in. Currently: JuggernautXL Ragnarok
   (`juggernautXL_ragnarok.safetensors`, 6.6 GB, from Civitai) and RealVisXL V5.0
   (`RealVisXL_V5.0.safetensors`, ~6.9 GB, from `SG161222/RealVisXL_V5.0` on HF).
-  chat = `Gemma-4-12B-OBLITERATED.Q4_K_M.gguf` (~7.4 GB, from
-  `mradermacher/Gemma-4-12B-OBLITERATED-GGUF`) via `llama-cpp-python`, **CPU-only**
-  (`n_gpu_layers=0`) so it never contends with SDXL for the 6 GB VRAM. Install
+  Chat models (2026-10-11; Gemma-4-12B-OBLITERATED and Rocinante-12B were
+  removed as weak): **`NemoMix-Unleashed-12B.Q4_K_M.gguf`** (the owner's main
+  one, default), `Impish_Bloodmoon_12B.Q4_K_M.gguf` (Sep 2025, NeMo base, 7.5 GB)
+  and `G4-MeroMero-26B-A4B.Q4_K_M.gguf` (Gemma 4 26B MoE, ~4B active, 16.8 GB),
+  all from mradermacher on HF. Run via `llama-cpp-python`; in "CPU chat +
+  images" mode **CPU-only** (`n_gpu_layers=0`) so it never contends with SDXL
+  for the 6 GB VRAM. **Per-model modes:** a GGUF over `CPU_IMAGES_MAX_GB` (9 GB)
+  or listed in `CHAT_MODEL_PROFILES` (`app.py`) is offered only "GPU chat, no
+  images" — it can't fit in RAM beside SDXL under `MemoryHigh=22G`. MeroMero is
+  one; its profile also sets where the GPU-layer search starts. Install
   llama-cpp-python with `--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu`
   (plain `--index-url` breaks dep resolution).
 - **Lazy load:** nothing loads at startup (~700 MB cold). The **Initialize**

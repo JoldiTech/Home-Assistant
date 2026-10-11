@@ -431,14 +431,27 @@ function renderInitState(st) {
       <select id="image-model-sel"></select>
       <label for="chat-mode-sel">mode</label>
       <select id="chat-mode-sel"></select>
+      <p id="mode-note" style="color:#888;font-size:.85rem"></p>
       <button id="init-btn">initialize system</button>
       ${errLine}
       <p id="chat-status">models aren't loaded yet - nothing uses memory until you start this</p>`;
     fillSelect($("chat-model-sel"), st.models || [st.chat_model], st.chat_model, (m) => m);
     fillSelect($("image-model-sel"), st.image_models || [st.image_model], st.image_model,
                (m) => m.replace(/\.safetensors$/, ""));
-    fillSelect($("chat-mode-sel"), st.modes || ["cpu_images"], st.mode || "cpu_images",
-               (m) => CHAT_MODE_LABELS[m] || m);
+    // Each chat model only offers the modes it can run in: one too big to sit
+    // beside the image model is chat-only (the server enforces this too).
+    const fillModes = () => {
+      const model = $("chat-model-sel").value;
+      const allowed = (st.model_modes && st.model_modes[model]) || st.modes || ["cpu_images"];
+      const sel = $("chat-mode-sel");
+      sel.innerHTML = "";
+      fillSelect(sel, allowed, allowed.includes(st.mode) ? st.mode : allowed[0],
+                 (m) => CHAT_MODE_LABELS[m] || m);
+      $("mode-note").textContent = allowed.includes("cpu_images") ? "" :
+        "this model is too large to run next to the image generator, so it's chat only (no images)";
+    };
+    fillModes();
+    $("chat-model-sel").addEventListener("change", fillModes);
     $("init-btn").addEventListener("click", startInit);
   }
 }

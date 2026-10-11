@@ -9,7 +9,7 @@ Group=nmteaco
 WorkingDirectory=/home/nmteaco/imagegen
 EnvironmentFile=/etc/nmteaco/imagegen.env
 Environment=MODEL_PATH=/home/nmteaco/imagegen/models/juggernautXL_ragnarok.safetensors
-Environment=LLM_MODEL_PATH=/home/nmteaco/imagegen/models/Gemma-4-12B-OBLITERATED.Q4_K_M.gguf
+Environment=LLM_MODEL_PATH=/home/nmteaco/imagegen/models/NemoMix-Unleashed-12B.Q4_K_M.gguf
 Environment=PORT=8189
 Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # The huggingface cache only appears on first download, but a ReadWritePaths

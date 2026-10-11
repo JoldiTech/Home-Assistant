@@ -4,7 +4,10 @@ A single password-gated web app on the AI box, public at
 `https://aibox.nmteaco.com`, with three modes after login:
 
 - **conversation** — chat with a local LLM. Any `.gguf` in the models dir is
-  selectable at Initialize (default Gemma-4-12B-OBLITERATED).
+  selectable at Initialize (default NemoMix-Unleashed-12B). Each model is only
+  offered the modes it can run in: one too large to sit beside SDXL (over
+  `CPU_IMAGES_MAX_GB`, or listed in `CHAT_MODEL_PROFILES`) is GPU-chat only,
+  no images.
 - **conversation with images** — same chat, plus an image "from the assistant"
   auto-generated after every reply, flowing into a session sidebar.
 - **image only** — type a prompt, get an SDXL image (any checkpoint in the

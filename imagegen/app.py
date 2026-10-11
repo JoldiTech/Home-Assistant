@@ -1,6 +1,6 @@
 """
 Ephemeral, end-to-end-encrypted, three-mode generation tool:
-  - conversation            (Gemma-4-12B-OBLITERATED, CPU inference)
+  - conversation            (any .gguf in the models dir; default NemoMix-Unleashed-12B)
   - conversation with images (same, + an auto-generated image every turn)
   - image only               (JuggernautXL Ragnarok / SDXL, GPU)
 
@@ -130,7 +130,7 @@ IMAGE_MODEL_PATH = os.environ.get(
     "MODEL_PATH", os.path.expanduser("~/imagegen/models/juggernautXL_ragnarok.safetensors")
 )
 LLM_MODEL_PATH = os.environ.get(
-    "LLM_MODEL_PATH", os.path.expanduser("~/imagegen/models/Gemma-4-12B-OBLITERATED.Q4_K_M.gguf")
+    "LLM_MODEL_PATH", os.path.expanduser("~/imagegen/models/NemoMix-Unleashed-12B.Q4_K_M.gguf")
 )
 # Chat-model picker: any .gguf in the models dir is selectable at Initialize.
 # Chat is ALWAYS CPU-inference. This is not a limitation to "fix": imagegen-env
@@ -165,6 +165,21 @@ GPU_CHAT_LAYERS = int(os.environ.get("GPU_CHAT_LAYERS", "999"))
 # 2048 keeps the KV cache + CUDA compute buffers small enough to leave headroom
 # on a 6GB card (4096 was OOMing at generation time with a big offload).
 GPU_CHAT_CTX = int(os.environ.get("GPU_CHAT_CTX", "2048"))
+# Per-model settings. A chat model is offered "cpu_images" only if it fits in
+# RAM beside SDXL: the unit caps memory at MemoryHigh=22G and SDXL plus its
+# CUDA/accelerate init sits around 10 GB resident, so the GGUF has to stay at
+# or under CPU_IMAGES_MAX_GB (a 12B Q4_K_M is ~7.5 GB). Anything bigger is
+# GPU-chat only, decided from its file size - so a newly dropped-in model gets
+# a workable mode with no code change. CHAT_MODEL_PROFILES overrides by file
+# name: "modes" (allowed init modes, first = default) and "gpu_layers" (where
+# the GPU-offload search starts, to skip load attempts that are bound to OOM).
+CPU_IMAGES_MAX_GB = 9.0
+CHAT_MODEL_PROFILES: dict[str, dict] = {
+    # Gemma 4 26B mixture-of-experts (~4B active per token): 16.8 GB at Q4_K_M,
+    # so never beside SDXL. Only part of it fits the 6 GB card; the rest runs on
+    # the CPU, which stays quick because so few weights are active per token.
+    "G4-MeroMero-26B-A4B.Q4_K_M.gguf": {"modes": ["gpu_chat"], "gpu_layers": 16},
+}
 # The GPU chat worker runs under transcribe-env, whose CUDA llama build needs
 # the torch-bundled CUDA runtime on LD_LIBRARY_PATH (same trick the captains-
 # log runner uses to load the summarizer on the GPU).
@@ -348,6 +363,31 @@ def _list_chat_models() -> list[str]:
         return [Path(LLM_MODEL_PATH).name]
 
 
+def _chat_model_modes(name: str) -> list[str]:
+    """Init modes this chat model can run in, default first (see
+    CHAT_MODEL_PROFILES / CPU_IMAGES_MAX_GB)."""
+    prof = CHAT_MODEL_PROFILES.get(name, {})
+    if "modes" in prof:
+        return [m for m in prof["modes"] if m in CHAT_MODES] or ["gpu_chat"]
+    try:
+        size_gb = (GGUF_DIR / name).stat().st_size / 1e9
+    except OSError:
+        return list(CHAT_MODES)
+    return list(CHAT_MODES) if size_gb <= CPU_IMAGES_MAX_GB else ["gpu_chat"]
+
+
+def _settle_chat_selection() -> None:
+    """Keep the selection runnable: a model that's been deleted falls back to
+    the first one on disk, and a mode the model can't run in falls back to the
+    model's default mode."""
+    models = _list_chat_models()
+    if models and _chat_selection["model"] not in models:
+        _chat_selection["model"] = models[0]
+    allowed = _chat_model_modes(_chat_selection["model"])
+    if _chat_selection["mode"] not in allowed:
+        _chat_selection["mode"] = allowed[0]
+
+
 def _list_image_models() -> list[str]:
     """Selectable SDXL checkpoints: single-file *.safetensors in the models dir,
     PLUS diffusers-format model folders (a subdir holding a model_index.json).
@@ -386,6 +426,8 @@ def _init_payload() -> dict:
     with _model_status_lock:
         status = _model_status
         err = _model_error
+        if status not in ("loading", "ready"):
+            _settle_chat_selection()
     payload = {"status": status, "chat_model": _chat_selection["model"],
                "image_model": _image_selection["model"]}
     # Any state that isn't actively loading or ready is a state the user must
@@ -401,6 +443,7 @@ def _init_payload() -> dict:
         payload["models"] = _list_chat_models()
         payload["image_models"] = _list_image_models()
         payload["modes"] = list(CHAT_MODES)
+        payload["model_modes"] = {m: _chat_model_modes(m) for m in payload["models"]}
     if status == "error":
         payload["error"] = err
     return payload
@@ -1578,10 +1621,12 @@ async def image_only(request: Request):
 
 def _gpu_layer_chain() -> list[int]:
     """Descending GPU-layer counts to try, each in a SEPARATE worker process.
-    Starts at GPU_CHAT_LAYERS (default 999 = offload everything, which fully fits
-    a ~7B on this 6GB card) and steps down so bigger models that OOM still land
-    on a count that loads and generates."""
-    top = GPU_CHAT_LAYERS if GPU_CHAT_LAYERS > 0 else 999
+    Starts at the model's profile "gpu_layers", else GPU_CHAT_LAYERS (default
+    999 = offload everything, which fully fits a ~7B on this 6GB card), and
+    steps down so bigger models that OOM still land on a count that loads and
+    generates."""
+    top = CHAT_MODEL_PROFILES.get(_chat_selection["model"], {}).get("gpu_layers") or GPU_CHAT_LAYERS
+    top = top if top > 0 else 999
     out, seen = [], set()
     for n in [top, 24, 20, 16, 12, 8]:
         n = min(n, top)
@@ -1852,6 +1897,9 @@ async def initialize(request: Request):
             mode = body.get("chat_mode")
             if mode in CHAT_MODES:
                 _chat_selection["mode"] = mode
+            # A model too big to sit beside SDXL can't start in "cpu_images",
+            # whatever the request asked for.
+            _settle_chat_selection()
             _model_status = "loading"
             _model_error = ""
             # Load on _gpu_executor's thread specifically, so the CUDA
