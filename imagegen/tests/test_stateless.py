@@ -162,6 +162,19 @@ with TestClient(A.app, base_url="https://testserver") as client:
     no_content_on_server("secret-picture", r["image"])
     ok("image-only: returned, not kept")
 
+    # Prompt assist: the model's style fragments are appended; the user's
+    # prompt is never cut, however long.
+    long_prompt = "secret-" + "x" * 900
+    st, r = t1.call("/api/image", {"prompt": long_prompt, "assist": True})
+    assert st == 200, r
+    rendered = base64.b64decode(r["image"]).decode()[len("PNG:"):]
+    assert rendered == long_prompt + ", a scene", rendered[-40:]
+    assert r["used_prompt"] == rendered
+    assert FakeLlama.seen[-1][0]["content"] == A.PROMPT_ASSIST_SYSTEM
+    assert FakeLlama.seen[-1][1]["content"] == long_prompt
+    no_content_on_server("secret-xxxx")
+    ok("prompt assist: appends style, keeps the whole user prompt")
+
     # Removed endpoints are gone.
     for p in ("/api/reset", "/api/chat-edit", "/api/chat-delete"):
         assert client.post(p, json=t1.env({})).status_code in (404, 405), p

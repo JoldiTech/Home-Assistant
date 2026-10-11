@@ -984,6 +984,20 @@ def _strip_other_speakers(text: str, me: str, personas: list[dict], user_name: s
     return text[:cut]
 
 
+# Prompt assist asks only for style to bolt onto the user's prompt. Generic on
+# purpose: any concrete noun put here would turn up in images (the Captain's
+# Log learned that the model treats prompt examples as content).
+PROMPT_ASSIST_SYSTEM = (
+    "You add artistic direction to an image-generation prompt. Reply with ONLY "
+    "a comma-separated list of short fragments about composition, camera angle, "
+    "lens, lighting, color palette, mood and rendering style that would make "
+    "the described image striking. Never restate, rename or change the subject, "
+    "never add people, objects or text that the prompt does not mention, and "
+    "never write sentences or explanations. At most 25 words."
+)
+PROMPT_ASSIST_MAX_CHARS = 300  # cap on what assist appends; the user's prompt is never cut
+
+
 def _expand_image_prompt(user_prompt: str) -> str:
     """Optional 'prompt assist': the local chat LLM (CPU) generates artistic-
     direction fragments which are APPENDED to the user's untouched prompt -
@@ -999,11 +1013,14 @@ def _expand_image_prompt(user_prompt: str) -> str:
                 max_tokens=110, temperature=0.5, top_p=0.9, repeat_penalty=1.15,
             )
         additions = _clean_llm_text(completion["choices"][0]["message"]["content"]).strip('"').strip(",. ")
+        additions = additions[:PROMPT_ASSIST_MAX_CHARS].rsplit(",", 1)[0] if len(additions) > PROMPT_ASSIST_MAX_CHARS else additions
         if not additions:
             return user_prompt
-        return f"{user_prompt}, {additions}"[:400]
+        return f"{user_prompt}, {additions}"
     except Exception as e:
-        print(f"prompt assist failed, using raw prompt: {e}", flush=True)
+        # Type only: an exception message can quote the prompt, and Chloe's
+        # journal must never hold prompt-derived text.
+        print(f"prompt assist failed, using raw prompt: {type(e).__name__}", flush=True)
         return user_prompt
 
 
