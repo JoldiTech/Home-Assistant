@@ -60,9 +60,9 @@ each with the fix from the map below. Don't paste the raw output unless asked.
 | AI box egress | failed over to the AT&T dongle | The store's primary WAN is down; the box is on its backup line. |
 | UPS | ON BATTERY | Store power is out. The AI box shuts itself down at 50% / 10 min. |
 | WAN1 / WAN2 | no monitor data or < 99% | That ISP link is down or flapping at the UDM. |
-| HA -> UniFi Network / Protect | entities unavailable, or none | HA's UniFi integration can't reach the console (192.168.22.1): reload the config entry, check the console is up. |
+| HA -> UniFi Network / Protect | entities unavailable, or none | HA's UniFi integration can't reach the console (192.168.22.1): reload the config entry, check the console is up. SKIP "not installed" is informational — the AI box reads the UDM directly, so HA doesn't need the Network integration. |
 | UniFi Network API (AI box) | no answer | The key in `/etc/nmteaco/protect.env` is invalid or the console is down. |
-| GPU | nvidia-smi: NVML mismatch | Driver updated without a reboot. Reboot the AI box (it WoL-restarts via `script.wake_ai_box` only after UPS shutdowns). |
+| GPU | nvidia-smi: NVML mismatch | The driver packages were upgraded but the old kernel module is still loaded. A reboot fixes it: `ssh aibox 'sudo reboot'` (after 20:30 MT, so it doesn't cut into the 19:00 Captain's Log run). A reboot brings itself back; WoL (`script.wake_ai_box`) is only for after a UPS **shutdown**. |
 | datalog API | HTTP 401/403 | `DATALOG_API_TOKEN` in `/etc/nmteaco/captains.env` on the AI box doesn't match the dashboard's → run the repair above. Business numbers are missing from every log until fixed. |
 | Captain's Log | latest day-file is old | A nightly run was missed. Recoverable from Protect for ~30 days via the dashboard's Create Transcript / Create Log buttons. |
 | Chloe (public) | not 200 | The AI box's tunnel or `imagegen.service` is down. |

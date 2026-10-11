@@ -68,7 +68,9 @@ done
 # reaching the SSH server at all means the hostname is outside any Access app.
 access_guard() {
   local host=$1 out
-  out=$(timeout 40 ssh -o BatchMode=yes -o PreferredAuthentications=none \
+  # -F /dev/null: the homeassistant alias also matches this hostname, and its
+  # ControlPersist hides cloudflared's stderr - the refusal this greps for.
+  out=$(timeout 40 ssh -F /dev/null -o BatchMode=yes -o PreferredAuthentications=none \
         -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 \
         -o "ProxyCommand=${NOPROXY[*]} cloudflared access ssh --hostname %h --service-token-id '' --service-token-secret ''" \
         "probe@$host" true 2>&1)
@@ -120,10 +122,11 @@ fi
 
 if [ -n "$HA_HOST" ]; then
   access_guard "$HA_HOST"
-  out=$(timeout 60 ssh -o BatchMode=yes homeassistant '
+  out=$(timeout 60 ssh -o BatchMode=yes -o ControlMaster=no -o ControlPath=none homeassistant '
     printf "core|%s\n" "$(ha core info --raw-json 2>/dev/null | jq -r "\"\(.data.version) (update: \(.data.update_available))\"")"
     ha apps --raw-json 2>/dev/null | jq -r ".data.addons[] | select(.name|test(\"cloudflared|ssh\";\"i\")) | \"app|\(.name)|\(.state)\""
     jq -r ".data.entities[] | select((.platform==\"unifi\" or .platform==\"unifiprotect\") and .disabled_by==null) | \"ent|\(.platform)|\(.entity_id)\"" /config/.storage/core.entity_registry 2>/dev/null
+    jq -r ".data.entries[] | select(.domain==\"unifi\" or .domain==\"unifiprotect\") | \"cfg|\(.domain)|\(.disabled_by)\"" /config/.storage/core.config_entries 2>/dev/null
     printf "disk|%s\n" "$(ha host info --raw-json 2>/dev/null | jq -r ".data.disk_free")"
     cf=$(ha apps --raw-json 2>/dev/null | jq -r ".data.addons[] | select(.name|test(\"cloudflared\";\"i\")) | .slug" | head -1)
     printf "proto|%s\n" "$(ha apps logs "$cf" 2>/dev/null | grep -oE "protocol=[a-z0-9]+" | tail -1 | cut -d= -f2)"
@@ -135,18 +138,23 @@ if [ -n "$HA_HOST" ]; then
       [ "$state" = started ] && res PASS "app: $name" "$state" || res FAIL "app: $name" "$state"
     done < <(grep '^app|' <<<"$out")
     if [ -s "${STATES:-}" ]; then
-      while IFS='|' read -r s n d; do res "$s" "$n" "$d"; done < <(grep '^ent|' <<<"$out" | python3 -c '
+      while IFS='|' read -r s n d; do res "$s" "$n" "$d"; done < <(grep -E '^(ent|cfg)\|' <<<"$out" | python3 -c '
 import sys, json
 states = {s["entity_id"]: s["state"] for s in json.load(open(sys.argv[1]))}
-tot, bad = {}, {}
+tot, bad, cfg = {}, {}, {}
 for line in sys.stdin:
-    _, plat, eid = line.strip().split("|")
+    kind, plat, val = line.strip().split("|")
+    if kind == "cfg":
+        cfg.setdefault(plat, []).append(val)
+        continue
     tot[plat] = tot.get(plat, 0) + 1
-    if states.get(eid, "unavailable") in ("unavailable", "unknown"):
+    if states.get(val, "unavailable") in ("unavailable", "unknown"):
         bad[plat] = bad.get(plat, 0) + 1
 for plat, label in (("unifi", "UniFi Network"), ("unifiprotect", "UniFi Protect")):
     n, b = tot.get(plat, 0), bad.get(plat, 0)
-    if not n: print("FAIL|HA -> %s|no enabled %s entities (integration missing?)" % (label, plat))
+    if plat not in cfg: print("SKIP|HA -> %s|integration not installed in HA" % label)
+    elif "null" not in cfg[plat]: print("WARN|HA -> %s|integration is disabled in HA (disabled_by: %s)" % (label, cfg[plat][0]))
+    elif not n: print("FAIL|HA -> %s|integration installed but has no enabled entities" % label)
     elif b > n * 0.5: print("FAIL|HA -> %s|%d of %d entities unavailable — integration cannot reach the console" % (label, b, n))
     else: print("%s|HA -> %s|%d entities, %d unavailable" % ("PASS" if b <= n * 0.2 else "WARN", label, n, b))
 ' "$STATES")
