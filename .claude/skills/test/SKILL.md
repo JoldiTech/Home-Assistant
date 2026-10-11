@@ -35,8 +35,9 @@ each with the fix from the map below. Don't paste the raw output unless asked.
 | REST API | 401 | `HOMEASSISTANT_TOKEN` is revoked/rotated. New long-lived token: HA profile → Security. |
 | Access enforced | reaches SSH WITHOUT a token | The SSH hostname isn't in any Cloudflare Access application — the box is exposed to anyone with cloudflared. Add it in Zero Trust → Access → Applications. Treat as urgent. |
 | Access enforced / SSH login | no DNS record | The tunnel's published route for that hostname is missing. |
-| SSH login | Access rejected the service token | `CF_ACCESS_CLIENT_SECRET_HA` / `_AI_BOX` is stale (rotated in Zero Trust but not in the environment), or that box's tunnel is down. |
+| SSH login | Access rejected the service token | The ID/secret pair in this environment doesn't match a live token: the secret was rotated in Zero Trust but not here, or the ID and secret come from different tokens (each box has its own — `_HA` vs `_AI_BOX`). Compare both values against Zero Trust → Service credentials. If Chloe (public) passes, that box's tunnel is up and it's the credentials. |
 | SSH login | box rejected the SSH key/user | HA user is `root`; AI box user is `nmteaco`. Same key (`HA_SSH_KEY_B64`) for both. |
+| tunnel transport | not http2, or no protocol line | QUIC over this ISP causes multi-minute UI freezes. Set `run_parameters: ["--protocol=http2"]` on the Cloudflared app's Configuration page — never via the Supervisor options API, which would wipe the tunnel token. "No protocol line" just means the log rotated; not a fault by itself. |
 | app: Cloudflared / Terminal & SSH | not started | Start it in HA → Settings → Apps. |
 | service: … | inactive/failed | On the AI box: `sudo systemctl restart <name>` and read `journalctl -u <name>`. |
 | AI box egress | failed over to the AT&T dongle | The store's primary WAN is down; the box is on its backup line. |

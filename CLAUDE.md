@@ -272,6 +272,48 @@ curl -fsS -X POST -H "Authorization: Bearer $HOMEASSISTANT_TOKEN" \
 
 ---
 
+## Reliability — tunnel transport and connection setup
+
+Diagnosed 2026-07-18 on the old tunnel; the causes live on the HA box, so they
+apply to `ha-green` too. The box itself was healthy (RAM, load, disk all fine);
+the flakiness was at **connection-setup time**:
+
+1. **QUIC transport → multi-minute UI "freezes."** cloudflared defaults to QUIC
+   (UDP/7844), which is broken over this ISP — its own precheck reports
+   `region2 … QUIC connection failed … proceed using 'http2'`, and on the `auto`
+   protocol it limped along on degraded QUIC, producing ~28 s dead windows where
+   the API was unreachable while HA core was fine. A browser holding HA's
+   WebSocket through one of those reads it as a frozen UI. **Fix: pin http2** —
+   the Cloudflared app option `run_parameters: ["--protocol=http2"]` (the
+   `--flag=value` form is required; the validator rejects `["--protocol","http2"]`).
+   Applied 2026-07-18. `/test` reports the protocol the live tunnel registered
+   with, so a rebuild or reset that lost the option shows up as a WARN.
+   Set it on the app's **Configuration** page only. Do **not** POST to the
+   Supervisor `/addons/<slug>/options` endpoint: it replaces the whole options
+   object, and anything left out — including the **tunnel token** — is wiped,
+   taking HA offline remotely. Leave `post_quantum` off; it forces QUIC.
+2. **SSH "banner exchange" timeouts (~1 in 3).** Each new SSH connection makes
+   cloudflared resolve `core-ssh` over HA's internal DNS plugin, which is
+   periodically flooded with reverse-DNS `PTR` lookups for the whole LAN
+   (`*.22.168.192.in-addr.arpa`), so a lookup sometimes misses its deadline
+   (`lookup core-ssh: operation was canceled`). Client-side mitigations:
+   - the `ssh homeassistant` alias multiplexes (`ControlMaster`/`ControlPersist`),
+     so the setup cost is paid once per 5 minutes;
+   - `scripts/ha-ssh '<cmd>'` establishes that master with retry + backoff — use
+     it for anything scripted (`--up` / `--down` to manage the master);
+   - `scripts/ha` retries 502/503/504 and refused connections (never a 4xx).
+   The real fix is server-side and not yet done: find the integration
+   PTR-scanning `192.168.22.0/24` (an nmap/ping/SNMP device tracker or router
+   integration) and stop or narrow it.
+3. **Brief HA-core reload windows** (~25 s of `connection refused` to `:8123`).
+   Cause not yet identified — check `ha core logs` around one.
+
+`scripts/tunnel_health.py -n 30 --ssh` measures success rate and latency
+percentiles for the API and SSH (exit 1 below `--threshold`). It stops at the
+first 401/403 so a stale token can't trip `ip_ban`.
+
+---
+
 ## How this persists (the container is wiped every session)
 
 The container filesystem does **not** survive between sessions — installed tools,
@@ -816,6 +858,38 @@ the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
   `NoNewPrivileges=yes`); GPU needs `PrivateDevices=no`.
 - **Password:** change it in-app (Settings → change password), not by editing
   files. `/etc/nmteaco/imagegen.env` only seeds the very first start. Never commit it.
+
+### Store open/close automations (lights & music)
+
+- `script.store_open` → `all_lights_on` + `music_on`; `script.store_close` →
+  `all_lights_off` + `music_off`. `all_lights_on/off` template-target **every**
+  `light.*` plus every `switch.*` whose name contains "light" plus
+  `switch.smart_strip` — running `store_close` blacks out the whole store.
+- WallMote Quad (`zwave_js_value_notification`, Central Scene): **button 4** =
+  store open, **button 3** = store close, **button 1** (tap or hold) = a quiet
+  chirp on Shawn's Office Siren (`wallmote_btn1_siren_beep`; that siren is
+  notification-only — the alarm uses the other siren). A morning automation
+  also runs `store_open` on the first person seen 9–10am on Tea Two Neo.
+- `input_select.store_state` (Open/Closed/Armed) was left an **orphaned helper**
+  after the incident below (as of 2026-07-19 nothing acted on it).
+
+### ⚠️ Incident 2026-07-19: live automation experiment blacked out the store
+
+A session working through the API token created `automation.store_state_apply`
+(bare `state:` trigger on `input_select.store_state`, no conditions, action =
+`script.store_close`) at 9:48am **while the store was staffed**. Setting the
+select killed every light twice (9:48:57, 9:53:20 — the second firing happened
+during edit/delete because a bare state trigger also fires on attribute/metadata
+updates); employees had to press WallMote button 4 to recover. Rules learned:
+
+- **Service calls via the token are attributed to the "New Mexico Tea Company"
+  user** — indistinguishable from the store dashboard. Your actions ARE
+  production actions.
+- **Never create/enable/test automations that touch lights or music during
+  business hours** (roughly 9am–7pm MT, any day people are on camera). Create
+  new automations with `initial_state: false` or test after hours.
+- Automations acting on state helpers must use explicit `to:` triggers plus
+  guard conditions — never a bare `state:` trigger wired to `store_close`.
 
 ### Repo conventions
 
