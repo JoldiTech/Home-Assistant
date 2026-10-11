@@ -1,0 +1,55 @@
+====================================================================== 
+PRINTER 192.168.22.73
+IPP Get-Printer-Attributes ipp://192.168.22.73/ipp/print -> status 0x0000, 128 attributes
+  document-format-supported = ['text/plain', 'application/octet-stream', 'image/jpeg', 'application/vnd.hp-PCL', 'application/vnd.hp-PCLXL', 'application/postscript', 'application/pdf', 'image/urf', 'image/pwg-raster', 'image/tiff', 'application/PCLm']
+  job-pages-per-set-supported = [False]
+  media-ready = ['na_letter_8.5x11in']
+  pages-per-minute = [40]
+  pages-per-minute-color = [40]
+  printer-device-id = ['MFG:Hewlett-Packard;CMD:PCL,PCLXL,POSTSCRIPT,PDF,URF,PWGRaster,TIFF;MDL:HP Color LaserJet M553;CLS:PRINTER;MEM:MEM=163MB;COMMENT:URF=V1.4,CP99,RS600,MT1-2-3-5-12,W8,PQ4,SRGB24,IS20-21,IFU21,OB10;DES:HP Color LaserJet M553;SN:JPBCK5T1DW;']
+  printer-firmware-string-version = ['2309025_582089']
+  printer-firmware-version = ['323330393032355f353832303839']
+  printer-info = ['HP Color LaserJet M553 [A31FAE]']
+  printer-location = ['']
+  printer-make-and-model = ['HP Color LaserJet M553']
+  printer-name = ['NPIA31FAE']
+  printer-state = [3]
+  printer-state-reasons = ['none']
+  printer-uri-supported = ['ipp://192.168.22.73:631/ipp/print', 'ipps://192.168.22.73:443/ipp/print']
+  printer-uuid = ['urn:uuid:ed98acfd-4253-11e7-836f-3368afd266d1']
+  urf-supported = ['V1.4', 'CP99', 'RS600', 'MT1-2-3-5-12', 'W8', 'PQ4', 'SRGB24', 'IS20-21', 'IFU21', 'OB10']
+SNMP v2c community 'public':
+  lifetime page count          (0, '1.3.6.1.2.1.43.10.2.1.4.1.1', 90998)
+  hrPrinterStatus              (0, '1.3.6.1.2.1.25.3.5.1.1.1', 3)
+  hrPrinterDetectedErrorState  (0, '1.3.6.1.2.1.25.3.5.1.2.1', '00')
+  sysDescr                     (0, '1.3.6.1.2.1.1.1.0', 'HP ETHERNET MULTI-ENVIRONMENT,ROM none,JETDIRECT,JD153,EEPROM JSI23900037,CIDATE 11/07/2019')
+  prtAlert table (1.3.6.1.2.1.43.18):
+====================================================================== 
+PRINTER 192.168.22.238
+IPP Get-Printer-Attributes ipp://192.168.22.238/ipp/print -> status 0x0000, 132 attributes
+  document-format-supported = ['image/urf', 'application/PCLm', 'application/octet-stream', 'application/pdf', 'application/postscript', 'application/vnd.hp-PCL', 'application/vnd.hp-PCLXL', 'image/jpeg']
+  job-impressions-supported = ['1-99999']
+  job-media-sheets-supported = ['1-99999']
+  media-ready = ['na_letter_8.5x11in']
+  pages-per-minute = [30]
+  printer-alert = ['code=markerTonerAlmostEmpty']
+  printer-alert-description = ['']
+  printer-device-id = ['MFG:HP;CMD:PJL,PML,PCLXL,URP,PCL,PDF,POSTSCRIPT;MDL:HP LaserJet M203-M206;CLS:PRINTER;DES:HP LaserJet M203dw;MEM:MEM=240MB;PRN:G3Q47A;COMMENT:RES=1200x1;LEDMDIS:USB#ff#04#01;CID:HPLJPDLV1;IPP-E:FF-04-01,FF-04-01,FF-09-01,FF-09-01;MCT:PR;MCL:DL;MCV:3.1;']
+  printer-firmware-string-version = ['20200605']
+  printer-firmware-version = ['3230323030363035']
+  printer-info = ['HP LaserJet M203dw']
+  printer-location = ['']
+  printer-make-and-model = ['HP LaserJet M203-M206']
+  printer-name = ['NPI02EFF1']
+  printer-state = [3]
+  printer-state-message = ['']
+  printer-state-reasons = ['toner-low-warning']
+  printer-uri-supported = ['ipp://192.168.22.238/ipp/print', 'ipps://192.168.22.238/ipp/print']
+  printer-uuid = ['urn:uuid:564e4233-4734-3237-3434-489ebd02eff1']
+  urf-supported = ['V1.4', 'CP99', 'W8', 'OB10', 'PQ3-4-5', 'DM1', 'IS1', 'MT1-3-5', 'RS600']
+SNMP v2c community 'public':
+  lifetime page count          (0, '1.3.6.1.2.1.43.10.2.1.4.1.1', 7163)
+  hrPrinterStatus              (0, '1.3.6.1.2.1.25.3.5.1.1.1', 1)
+  hrPrinterDetectedErrorState  (0, '1.3.6.1.2.1.25.3.5.1.2.1', ' ')
+  sysDescr                     (0, '1.3.6.1.2.1.1.1.0', 'HP ETHERNET MULTI-ENVIRONMENT,SN:VNB3G42744,FN:3B75LRN,SVCID:32020,PID:HP LaserJet M203dw')
+  prtAlert table (1.3.6.1.2.1.43.18):
