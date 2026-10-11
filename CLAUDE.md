@@ -353,7 +353,15 @@ The hook activates for all sessions once merged to the default branch.
 
 Beyond the generic connection info above, these instance-specific facts save time:
 
-- **HA version:** 2026.7.x · **Timezone:** `America/Denver` (Mountain). The REST
+- **HA version:** 2026.10.x (Core 2026.10.1 / HAOS 18.3 since 2026-10-11, from
+  2026.7.2 / 18.1; full backup `pre-updates-2026-10-11`, slug `1c3066f6`, taken
+  first) · **Timezone:** `America/Denver` (Mountain).
+- **UniFi Protect must stay ≥ 7.2.105.** Since HA 2026.9 the integration refuses
+  to set up on older Protect, which would kill every camera sensor and the
+  automations built on them. The console was on exactly 7.2.105 at the update.
+- **Shawn's Office Siren (Z-Wave node 34) is dead** since at least 05:43 MT
+  2026-10-11 (before the update round); the WallMote button-1 chirp targets it.
+  Studio Code Server was already in an error state before its 7.2.0 update. The REST
   API returns timestamps in **UTC** — convert to Mountain for anything shown to a
   human.
 - **Cameras are UniFi Protect.** AI detections surface as
