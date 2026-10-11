@@ -882,11 +882,15 @@ Pickup orders print on the downtown **HP LaserJet M203dw** (192.168.22.238,
 UniFi fixed IP since 2026-10-11, Wi-Fi, MAC `5c:fb:3a:0d:80:7e`). The dashboard
 pushes each job to the add-on through `print-downtown.nmteaco.com` (Cloudflare
 Access, service token `dashboard-print`) → `http://local-nmt-print-agent:8080`.
-The add-on renders HTML to a Letter PDF (WeasyPrint) and prints through a
-driverless CUPS queue inside its container. It confirms each job with the SNMP
-page counter (`1.3.6.1.2.1.43.10.2.1.4.1.1`) and posts the outcome, signed, to
-`<dashboard>/tools/orders/curbsideAgent.php`. Plan/contract:
-`print_agent/INSTRUCTIONS.md`; what was done: `print_agent/PHASE2-4-REPORT.md`.
+Since v1.1.0 the dashboard sends each order as a finished **PDF** (base64 in
+`POST /print`), and the add-on prints it unchanged through a driverless CUPS
+queue inside its container; nothing is rendered on the box. `/status` reports
+`formats: ["pdf"]`, which is the dashboard's switch: without it the dashboard
+falls back to emailing the printer. Each job is confirmed with the SNMP page
+counter (`1.3.6.1.2.1.43.10.2.1.4.1.1`), and the outcome is posted, signed, to
+`<dashboard>/tools/webhook/printAgent.php`. Plan/contract:
+`print_agent/INSTRUCTIONS.md` + `print_agent/INSTRUCTIONS-UPDATE-PDF.md`; what
+was done: `print_agent/PHASE2-4-REPORT.md`.
 
 - **Source:** `print_agent/nmt_print_agent/` → copied to `/local_apps/nmt_print_agent`
   on the box (`/local_apps`, not `/addons/local`). After an edit: copy it, bump
@@ -897,11 +901,19 @@ page counter (`1.3.6.1.2.1.43.10.2.1.4.1.1`) and posts the outcome, signed, to
   Live: `print_agent/tests/remote_request.py status|print <id>` signs with
   `PRINT_AGENT_SIGNING_KEY` and sends from inside the box. **Test job ids start at
   2100000001**: a test id that collides with a real dashboard job id would make
-  the agent answer "duplicate" and never print that order.
+  the agent answer "duplicate" and never print that order. Used so far:
+  2100000001, 2100000007, 2100000010, 2100000011.
 - **Never print twice:** a job id is persisted before CUPS sees it. A job in
   flight at restart, or still unfinished after 3 min, is reported `uncertain`
   (staff decide) and is never `failed`, because the dashboard resends `failed`
   jobs under a new id.
+- **Result delivery** retries 4 times on a network error or 5xx (5 s, 30 s,
+  2 min, 5 min; the owner's limit), stops at once on a 4xx, and stops quietly on
+  `{"ok":true,"unknown":true}`. Giving up raises an HA alert.
+- **HA alerts** (`homeassistant_api: true`, persistent notifications): an order
+  `failed` or `uncertain`, a result not reported, or the printer blocking an
+  order (one per incident, dismissed when it recovers). The token is read from
+  `/run/s6/container_environment`, because s6 starts the agent with a clean env.
 - **State from IPP, count from SNMP:** `hrPrinterStatus` reads `other` while the
   M203 sleeps, and IPP has no page counter.
 - **Logs** carry ids, order numbers, page deltas and errors only, never job

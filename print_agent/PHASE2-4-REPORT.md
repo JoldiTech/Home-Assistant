@@ -1,5 +1,11 @@
 # Downtown print agent: Phases 2–4
 
+> **Now running v1.1.0** (deployed 2026-10-11 06:15 MT): the dashboard sends
+> finished PDFs, results go to `/tools/webhook/printAgent.php`, result delivery
+> retries 4 times, and Home Assistant gets alerts. See
+> [v1.1.0](#v110-pdf-jobs-bounded-retries-ha-alerts) at the end. The Phase 3
+> description below is of v1.0.0, which rendered HTML.
+
 Done 2026-10-11 (MT morning, store closed). Phase 1 report approved by the
 owner first. Contract: `INSTRUCTIONS.md`.
 
@@ -144,10 +150,8 @@ Reprint.
 
 ## For the dashboard side
 
-- **Answer `{"ok": true}` for an unknown job id.** Results for test jobs
-  **2100000001** and **2100000007** are queued on the agent now and are retried
-  every 5 minutes until accepted. Until then they hit
-  `/tools/orders/curbsideAgent.php` and get the current 404.
+- ~~Answer `{"ok": true}` for an unknown job id.~~ Done by the dashboard
+  (`unknown: true`); since v1.1.0 the agent stops retrying on it.
 - `uncertain` results come from two cases: a restart mid-job, and a job still
   unfinished after 3 minutes. Neither should be resent automatically. Show
   them to staff.
@@ -174,15 +178,72 @@ Reprint.
 6. **The watchdog** had to be switched on separately (Supervisor API
    `{"watchdog": true}`, not touching the options). `config.yaml` only declares
    it.
-7. **Fetching resources:** WeasyPrint may load only `data:` URIs and `https`
-   files from the dashboard's own host. Anything else is refused, so a job
-   can't make the box contact a third party.
+7. **Fetching resources (v1.0.0 only):** WeasyPrint could load only `data:`
+   URIs and `https` files from the dashboard's own host. Moot since v1.1.0,
+   which renders nothing.
+
+## v1.1.0: PDF jobs, bounded retries, HA alerts
+
+Deployed 2026-10-11 06:15 MT (`ha apps update`, built on the Green). Boot,
+watchdog and options were kept.
+
+**From the owner's PDF update** (`INSTRUCTIONS-UPDATE-PDF.md`):
+- `GET /status` adds `"formats": ["pdf"]`, the dashboard's switch.
+- `POST /print` takes `"pdf"` (base64). Missing, undecodable, not starting
+  `%PDF-`, or over 5 MB → `400 {"accepted": false, "reason": "bad-request"}`,
+  nothing printed. A body with the old `html` field is a 400 too. The PDF is
+  spooled (mode 600) and given to CUPS unchanged.
+- **The HTML renderer is gone.** WeasyPrint and the fonts were removed from the
+  Dockerfile and the render/fetch code from the agent. The image dropped from
+  1.66 GB to 343 MB (amd64 build).
+- Results go to `https://dashboard.nmteaco.com/tools/webhook/printAgent.php`,
+  signed over that path, with `User-Agent: nmt-print-agent/1.1.0`.
+  - `{"ok": true}` → delivered.
+  - `{"ok": true, "unknown": true}` → stop quietly.
+  - Network error or 5xx → retry.
+  - Any 4xx → stop at once and alert, since resending the same report can't fix it.
+
+**From the owner's instruction in chat:** result delivery retries **4 times**
+(5 s, 30 s, 2 min, 5 min) instead of forever, then gives up with an HA alert.
+The outcome stays recorded, so a re-push of the same id still gets it.
+
+**HA alerts** are persistent notifications through the Supervisor's Core API
+(`homeassistant_api: true`). They don't carry job content.
+- `nmt_print_agent_job_<id>`: "Pickup order didn't print" (`failed`) or "may
+  not have printed" (`uncertain`, check the tray).
+- `nmt_print_agent_report_<id>`: the result couldn't be reported.
+- `nmt_print_agent_printer`: the printer blocked an order (503, or a held
+  queue). One per incident, dismissed when the printer is ready.
+
+**Tests:** 23 unit tests and 35 e2e checks, all pass. New e2e cases:
+- 400s (not a PDF, the old HTML body, bad base64, over 5 MB), nothing printed;
+- a multi-page PDF prints once;
+- results reach the new path with the User-Agent;
+- HA alert raised and cleared on printer-off;
+- alerts on `uncertain` and `failed`;
+- giving up after 4 retries with an alert, the outcome still answered as a
+  duplicate;
+- no job content in logs or alerts.
+
+**Live on the Green after the deploy (06:15–06:33 MT):**
+- `/status` → `version 1.1.0`, `formats ["pdf"]`, printer idle, `toner-low`,
+  page count 7165.
+- The startup `persistent_notification.dismiss` call → sent (HA API access works).
+- The two queued v1.0.0 test results (2100000001, 2100000007) went to the new
+  address and got `unknown`, so they stopped. This proves the dashboard accepts
+  the agent's signature on the new path.
+- `POST /print` with a non-PDF (id 2100000011) → 400 `bad-request`, nothing
+  printed.
+- **PDF test page (id 2100000010):** `job 2100000010 order=TEST-2100000010
+  kind=test outcome=printed pages_delta=1 took=18s error=-`. Counter 7165 →
+  7166, one sheet.
 
 ## Still open
 
-- Tests 4, 5, 6 and 10 (someone at the printer).
-- A 200 through the tunnel (test 8 completion), from the dashboard or with the
-  `dashboard-print` token added to this environment as
-  `CF_ACCESS_CLIENT_ID_PRINT` / `CF_ACCESS_CLIENT_SECRET_PRINT`.
-- Live confirmation of test 9 once `curbsideAgent.php` exists.
+- **The dashboard's own test page** through the full path (update step 2–3):
+  waiting on the owner to send one from the dashboard.
+- Tests 4, 5, 6 and 10 (someone at the printer), now with PDF test pages.
+- A 200 for `/status` through the tunnel is confirmed by the dashboard (it read
+  `/status` through the tunnel), but not from this environment, which lacks the
+  `dashboard-print` token.
 - Unchanged from Phase 1: toner at 2 %, no printer admin password, printer on Wi-Fi.
