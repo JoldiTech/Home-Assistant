@@ -1,6 +1,6 @@
 # Downtown print agent: Phases 2–4
 
-> **Now running v1.2.0** (1.1.0 deployed 2026-10-11 06:15 MT, 1.2.0 at 06:47): the dashboard sends
+> **Now running v1.2.1** (1.1.0 deployed 2026-10-11 06:15 MT, 1.2.0 at 06:47, 1.2.1 at 08:40): the dashboard sends
 > finished PDFs, results go to `/tools/webhook/printAgent.php`, result delivery
 > retries 4 times, and Home Assistant gets alerts. See
 > [v1.1.0](#v110-pdf-jobs-bounded-retries-ha-alerts) at the end. The Phase 3
@@ -274,11 +274,43 @@ the DowntownControls dashboard).
   shows `ready` and job 1 printed with 1 page; `unreachable` while the printer
   is off; the three newest jobs, newest first; no job content.
 
+## Live with the dashboard (2026-10-11 07:27–08:40 MT)
+
+The agent's own log, which holds no job content:
+
+```
+13:27:57 POST /print job=1 -> 202
+13:28:02 printer: reachable=True state=processing reasons=spool-area-full,toner-low
+13:28:16 job 1 order=TEST kind=test outcome=printed pages_delta=1 took=18s error=-
+13:28:17 result job 1 delivered (HTTP 200)
+14:27:37 POST /print job=2 -> 202
+14:28:00 job 2 order=T-99459 kind=reprint outcome=printed pages_delta=1 took=22s error=-
+14:28:00 result job 2 delivered (HTTP 200)
+```
+
+(UTC; 07:27 and 08:27 MT.)
+
+- **Update step 3 (the dashboard's test page):** ✅ one sheet, `printed`, page delta 1.
+- **Test 10 (real Reprint, T-99459):** ✅ one sheet, `printed`, page delta 1.
+  The owner's screenshot of the Store State panel shows it.
+- **Test 9, live half:** ✅ both results were delivered to `printAgent.php` on
+  the first try.
+
+**v1.2.1** (deployed 08:40 MT): job 1's log shows the M203 reporting
+`spool-area-full` while it received the job. v1.0–1.2.0 counted that as
+blocking. A second order arriving in that window would have been refused with
+503, held, and raised a false "printer can't print" alert. It's now treated as
+busy, which CUPS already waits for. There's a unit test for it.
+
+**Panel layout:** at the owner's request the printing cards are now one
+vertical stack: status tile, then toner and drum side by side, then the jobs
+table. The dashboard was backed up first as
+`lovelace.dashboard_downtowncontrols.bak-20261011084010`.
+
 ## Still open
 
-- **The dashboard's own test page** through the full path (update step 2–3):
-  waiting on the owner to send one from the dashboard.
-- Tests 4, 5, 6 and 10 (someone at the printer), now with PDF test pages.
+- Tests 4, 5, 6 (someone at the printer: paper out, door open mid-queue,
+  printer off).
 - A 200 for `/status` through the tunnel is confirmed by the dashboard (it read
   `/status` through the tunnel), but not from this environment, which lacks the
   `dashboard-print` token.

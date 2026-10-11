@@ -120,6 +120,8 @@ class Reasons(unittest.TestCase):
         self.assertEqual(agent.normalize_reasons(["media-jam"])[1], ["media-jam"])
         self.assertEqual(agent.normalize_reasons(["none"]), ([], []))
         self.assertEqual(agent.normalize_reasons(["other-error"])[1], ["other"])
+        # Seen live on the M203 mid-job: busy, not blocked.
+        self.assertEqual(agent.normalize_reasons(["spool-area-full", "toner-low-warning"])[1], [])
 
 
 class Decide(unittest.TestCase):

@@ -917,14 +917,18 @@ was done: `print_agent/PHASE2-4-REPORT.md`.
 - **Store State panel** (DowntownControls → Store view, first section): an
   "Instore Order Printing" block shows the agent's `sensor.instore_order_printing`
   (status tile, colour by state), toner and drum gauges from the IPP
-  integration, and a "Last 3 print jobs" markdown table. The cards live in
+  integration, and a "Last 3 print jobs" markdown table, all in one
+  vertical stack (the owner wanted them stacked). The cards live in
   `print_agent/dashboard/`; `apply_store_panel.py` (needs `websocket-client`)
   re-applies them over the websocket API and replaces only the cards from the
   "Instore Order Printing" heading to the end of that section. Back up the
   storage file first. The entity is pushed by the agent (no unique_id), so
   after an HA restart it reappears within 30 s.
 - **State from IPP, count from SNMP:** `hrPrinterStatus` reads `other` while the
-  M203 sleeps, and IPP has no page counter.
+  M203 sleeps, and IPP has no page counter. The M203 reports `spool-area-full`
+  while it is receiving a job; that is busy, not blocked (v1.2.1).
+- **Dashboard job ids are small** (1, 2, … since the 2026-10-11 switch-over), so
+  test ids from 2100000001 can't collide.
 - **Logs** carry ids, order numbers, page deltas and errors only, never job
   HTML or header values. Keep it that way.
 

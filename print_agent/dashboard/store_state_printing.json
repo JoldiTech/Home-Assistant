@@ -6,79 +6,113 @@
     "icon": "mdi:printer"
   },
   {
-    "type": "conditional",
-    "conditions": [{"entity": "sensor.instore_order_printing", "state": "ready"}],
-    "card": {
-      "type": "tile",
-      "entity": "sensor.instore_order_printing",
-      "name": "Order printer ready",
-      "icon": "mdi:printer-check",
-      "color": "green",
-      "hide_state": true
-    },
-    "grid_options": {"columns": 12, "rows": 1}
-  },
-  {
-    "type": "conditional",
-    "conditions": [{"entity": "sensor.instore_order_printing", "state": "printing"}],
-    "card": {
-      "type": "tile",
-      "entity": "sensor.instore_order_printing",
-      "name": "Order printer printing",
-      "icon": "mdi:printer",
-      "color": "blue",
-      "hide_state": true
-    },
-    "grid_options": {"columns": 12, "rows": 1}
-  },
-  {
-    "type": "conditional",
-    "conditions": [{"entity": "sensor.instore_order_printing", "state": "problem"}],
-    "card": {
-      "type": "tile",
-      "entity": "sensor.instore_order_printing",
-      "name": "Order printer can't print",
-      "icon": "mdi:printer-alert",
-      "color": "red",
-      "state_content": "problem"
-    },
-    "grid_options": {"columns": 12, "rows": 1}
-  },
-  {
-    "type": "conditional",
-    "conditions": [{"entity": "sensor.instore_order_printing", "state": "unreachable"}],
-    "card": {
-      "type": "tile",
-      "entity": "sensor.instore_order_printing",
-      "name": "Order printer unreachable",
-      "icon": "mdi:printer-off",
-      "color": "red",
-      "hide_state": true
-    },
-    "grid_options": {"columns": 12, "rows": 1}
-  },
-  {
-    "type": "gauge",
-    "entity": "sensor.hp_laserjet_m203_m206_black_cartridge_hp_cf230x",
-    "name": "Toner",
-    "min": 0,
-    "max": 100,
-    "severity": {"green": 25, "yellow": 10, "red": 0},
-    "grid_options": {"columns": 6, "rows": 2}
-  },
-  {
-    "type": "gauge",
-    "entity": "sensor.hp_laserjet_m203_m206_imaging_drum_hp_cf232a",
-    "name": "Drum",
-    "min": 0,
-    "max": 100,
-    "severity": {"green": 25, "yellow": 10, "red": 0},
-    "grid_options": {"columns": 6, "rows": 2}
-  },
-  {
-    "type": "markdown",
-    "title": "Last 3 print jobs",
-    "content": "@last_jobs.md.j2",
-    "grid_options": {"columns": 12}
+    "type": "vertical-stack",
+    "cards": [
+      {
+        "type": "conditional",
+        "conditions": [
+          {
+            "entity": "sensor.instore_order_printing",
+            "state": "ready"
+          }
+        ],
+        "card": {
+          "type": "tile",
+          "entity": "sensor.instore_order_printing",
+          "name": "Order printer ready",
+          "icon": "mdi:printer-check",
+          "color": "green",
+          "hide_state": true
+        }
+      },
+      {
+        "type": "conditional",
+        "conditions": [
+          {
+            "entity": "sensor.instore_order_printing",
+            "state": "printing"
+          }
+        ],
+        "card": {
+          "type": "tile",
+          "entity": "sensor.instore_order_printing",
+          "name": "Order printer printing",
+          "icon": "mdi:printer",
+          "color": "blue",
+          "hide_state": true
+        }
+      },
+      {
+        "type": "conditional",
+        "conditions": [
+          {
+            "entity": "sensor.instore_order_printing",
+            "state": "problem"
+          }
+        ],
+        "card": {
+          "type": "tile",
+          "entity": "sensor.instore_order_printing",
+          "name": "Order printer can't print",
+          "icon": "mdi:printer-alert",
+          "color": "red",
+          "state_content": "problem"
+        }
+      },
+      {
+        "type": "conditional",
+        "conditions": [
+          {
+            "entity": "sensor.instore_order_printing",
+            "state": "unreachable"
+          }
+        ],
+        "card": {
+          "type": "tile",
+          "entity": "sensor.instore_order_printing",
+          "name": "Order printer unreachable",
+          "icon": "mdi:printer-off",
+          "color": "red",
+          "hide_state": true
+        }
+      },
+      {
+        "type": "horizontal-stack",
+        "cards": [
+          {
+            "type": "gauge",
+            "entity": "sensor.hp_laserjet_m203_m206_black_cartridge_hp_cf230x",
+            "name": "Toner",
+            "min": 0,
+            "max": 100,
+            "severity": {
+              "green": 25,
+              "yellow": 10,
+              "red": 0
+            }
+          },
+          {
+            "type": "gauge",
+            "entity": "sensor.hp_laserjet_m203_m206_imaging_drum_hp_cf232a",
+            "name": "Drum",
+            "min": 0,
+            "max": 100,
+            "severity": {
+              "green": 25,
+              "yellow": 10,
+              "red": 0
+            }
+          }
+        ]
+      },
+      {
+        "type": "markdown",
+        "title": "Last 3 print jobs",
+        "content": "@last_jobs.md.j2"
+      }
+    ],
+    "grid_options": {
+      "columns": 12
+    }
   }
 ]

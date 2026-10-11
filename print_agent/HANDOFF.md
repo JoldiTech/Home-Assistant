@@ -4,7 +4,7 @@
   **What was done and tested:** `PHASE2-4-REPORT.md`. Running notes in the
   CLAUDE.md "Downtown print agent" section.
 - **State:** the printer is pinned at 192.168.22.238 (UniFi). The add-on
-  `local_nmt_print_agent` **v1.1.0** runs on the HA Green (boot auto, watchdog
+  `local_nmt_print_agent` **v1.2.1** runs on the HA Green (boot auto, watchdog
   on, signing key set). It takes **PDF** jobs (`INSTRUCTIONS-UPDATE-PDF.md`),
   and `/status` says `formats ["pdf"]`, so the dashboard sends live orders to it.
   Live tests 1, 2, 3, 7 and 8 passed on v1.0.0; a PDF test page and a 400
@@ -12,19 +12,15 @@
 
 ## Remaining
 
-0. The dashboard's own test page (owner sends it from the dashboard): check the
-   add-on log for `outcome=printed pages_delta=1`.
 1. Tests 4, 5, 6 (paper out, door open mid-queue, printer off): need someone at
    the printer. Push jobs with `tests/remote_request.py print <id>`, using ids
    from **2100000012 upward** (2100000001, …07, …10, …11 are used). Never use
    a small id: it could collide with a real dashboard job id.
-2. Test 10 (real Reprint from the curbside tablet): after the dashboard side is live.
 3. A 200 for `/status` *through* the tunnel: needs the `dashboard-print` token as
    `CF_ACCESS_CLIENT_ID_PRINT` / `CF_ACCESS_CLIENT_SECRET_PRINT`, or a check
    from the dashboard.
-4. Test 9 live: results now reach `printAgent.php` (the dashboard answered
-   `unknown` for the test ids). A real order's result should log
-   `result job … delivered`.
+Done live 2026-10-11: the dashboard's test page, a real Reprint (test 10) and
+live result delivery (test 9). See PHASE2-4-REPORT.md.
 
 ## Rules carried over
 

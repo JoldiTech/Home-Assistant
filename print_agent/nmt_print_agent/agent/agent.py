@@ -37,7 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipp
 import snmp
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 
 def container_env(name, default=None):
@@ -86,10 +86,12 @@ STATUS_ENTITY = "sensor.instore_order_printing"  # read by the HA "Instore Order
 # Printer-state-reasons that mean the printer cannot print, after stripping the
 # -error/-warning/-report suffix and folding synonyms into the names the
 # dashboard knows (media-empty, media-jam, door-open, offline, unreachable).
+# Not spool-area-full: the M203 reports it while it is busy receiving a job,
+# and CUPS already waits for a busy printer.
 BLOCKING = {
     "media-empty", "media-jam", "door-open", "offline", "unreachable",
     "toner-empty", "input-tray-missing", "output-area-full", "marker-waste-full",
-    "paused", "spool-area-full",
+    "paused",
 }
 ALIASES = {
     "media-needed": "media-empty",

@@ -35,14 +35,21 @@ SECTION_HEADING = "Store State"
 OUR_HEADING = "Instore Order Printing"
 
 
+def _inline(card):
+    """Replace "content": "@file" with that file's text, in nested stacks too."""
+    content = card.get("content", "")
+    if content.startswith("@"):
+        with open(os.path.join(HERE, content[1:])) as f:
+            card["content"] = f.read()
+    for child in card.get("cards", []):
+        _inline(child)
+
+
 def our_cards():
     with open(os.path.join(HERE, "store_state_printing.json")) as f:
         cards = json.load(f)
     for card in cards:
-        content = card.get("content", "")
-        if content.startswith("@"):
-            with open(os.path.join(HERE, content[1:])) as f:
-                card["content"] = f.read()
+        _inline(card)
     return cards
 
 

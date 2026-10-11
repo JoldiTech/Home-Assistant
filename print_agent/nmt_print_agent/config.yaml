@@ -1,5 +1,5 @@
 name: NMT Print Agent
-version: "1.2.0"
+version: "1.2.1"
 slug: nmt_print_agent
 description: >-
   Prints pickup orders pushed by the dashboard on the downtown printer and
