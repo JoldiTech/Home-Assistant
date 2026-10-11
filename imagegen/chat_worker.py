@@ -36,30 +36,28 @@ def _emit(obj):
 def main():
     model_path = sys.argv[1]
     target_layers = int(sys.argv[2])
-    n_ctx = int(sys.argv[3]) if len(sys.argv) > 3 else 4096
+    n_ctx = int(sys.argv[3]) if len(sys.argv) > 3 else 2048
 
-    # Fallback chain: a 12B Q4 doesn't fully fit a 6GB card, so try the target
-    # offload then progressively less (descending), so a tight card still gets
-    # SOME GPU speed instead of failing outright.
-    if target_layers > 0:
-        raw_chain = [target_layers, target_layers * 3 // 4, target_layers // 2, 8]
-    else:
-        raw_chain = [0]
-    seen = set()
-    chain = [n for n in raw_chain if n > 0 and not (n in seen or seen.add(n))] or [target_layers]
-    llm, used = None, 0
-    for layers in chain:
-        try:
-            llm = Llama(model_path=model_path, n_ctx=n_ctx, n_threads=8,
-                        n_gpu_layers=layers, verbose=False)
-            used = layers
-            break
-        except Exception as e:
-            print(f"worker: load with {layers} layers failed: {e}", file=sys.stderr, flush=True)
-    if llm is None:
-        _emit({"error": "model failed to load on GPU and CPU"})
+    # ONE attempt at exactly the layer count we were told to use. The parent
+    # (imagegen app) owns the fallback and re-spawns us with fewer layers if we
+    # fail - because a CUDA OOM in llama.cpp can abort the whole process
+    # (uncatchable in Python), only a fresh process can recover, not an
+    # in-process retry.
+    try:
+        llm = Llama(model_path=model_path, n_ctx=n_ctx, n_threads=8,
+                    n_gpu_layers=target_layers, verbose=False)
+        # Warm up with a 1-token generation BEFORE signalling ready. Loading only
+        # allocates the weights; the KV cache and CUDA compute buffers are
+        # allocated on the first token - and THAT is where a too-tight offload
+        # OOMs. Forcing it now means a bad layer count fails here (parent falls
+        # back to fewer layers) instead of dying mid-reply later.
+        llm.create_chat_completion(messages=[{"role": "user", "content": "hi"}],
+                                   max_tokens=1)
+    except Exception as e:
+        _emit({"error": f"load/warmup failed at {target_layers} gpu layers: {str(e)[:160]}"})
         _emit({"fatal": True})
         return
+    used = target_layers
     _emit({"ready": True, "gpu_layers": used})
 
     for line in sys.stdin:

@@ -2,7 +2,9 @@
 /*
  * All crypto happens here, in the browser. No key persists anywhere - not
  * localStorage/sessionStorage/IndexedDB; a page reload wipes memory, by
- * design. The server stores ONLY the auth half of the PBKDF2 output (a
+ * design. The conversation and both galleries live HERE too (the `store`
+ * below), never on the server: each request sends what it needs, the server
+ * answers and forgets. When this tab closes, the only copy is gone. The server stores ONLY the auth half of the PBKDF2 output (a
  * login verifier that cannot decrypt anything). Every login runs an
  * ephemeral ECDH exchange; all traffic rides a session key bound to BOTH
  * the password and that one-time secret, so once this tab closes, recorded
@@ -22,6 +24,25 @@ let kSess = null;
 let currentMode = null;
 let imagesEnabled = true;   // false in GPU-chat mode (SDXL not loaded)
 let viewGeneration = 0;
+// Pre-sealed {"logout": true} envelope for the close beacon: pagehide can't
+// await encryption, and only this tab's key can seal it, so closing a stale
+// tab can't log out a newer one that shares the cookie.
+let logoutEnvelope = null;
+
+// The whole conversation state, in memory only. Lost on reload/close by design.
+const GALLERY_MAX = 30;
+const HISTORY_MAX = 40;   // what the model is shown; older messages stay visible here
+let store = freshStore();
+
+function freshStore() {
+  return { chat: { history: [], gallery: [], turn: 0 }, image: { gallery: [] } };
+}
+
+function pushGallery(mode, b64png) {
+  const g = store[mode].gallery;
+  g.push(b64png);
+  g.splice(0, Math.max(0, g.length - GALLERY_MAX));
+}
 
 const $ = (id) => document.getElementById(id);
 
@@ -142,6 +163,8 @@ async function apiCall(path, payload) {
 
 function showLogin(error) {
   kSess = null;
+  logoutEnvelope = null;
+  store = freshStore();
   currentMode = null;
   viewGeneration++;
   $("app").innerHTML = `
@@ -192,6 +215,8 @@ async function onLoginSubmit(e) {
     // Only the session key survives past this point - the password-derived
     // halves are dropped so nothing longer-lived than the session exists here.
     kSess = sessKey;
+    store = freshStore();
+    logoutEnvelope = JSON.stringify(await encryptEnvelope({ logout: true }));
     showModePicker();
   } catch (err) {
     showLogin("something went wrong, try again");
@@ -381,7 +406,7 @@ function renderInitState(st) {
     const modeNote = imagesEnabled ? "CPU chat + images" : "GPU chat (images off)";
     area.innerHTML = `<p id="chat-status">chat model: ${escapeText(st.chat_model)} — ${modeNote}
       &mdash; <a href="#" id="unload-btn">shut down models</a>
-      (frees the GPU and RAM; your chats stay until logout)</p>`;
+      (frees the GPU and RAM; your chats stay in this tab)</p>`;
     modeButtons.style.display = "flex";
     // "image only" is meaningless in GPU-chat mode (SDXL isn't loaded).
     const imgBtn = document.querySelector('[data-mode="image"]');
@@ -525,9 +550,9 @@ function renderImageOnly() {
     <div id="image-status"></div>
     <div id="gallery-panel" class="wide"><h3>images this session</h3><div id="gallery"></div></div>`;
   $("back").addEventListener("click", (e) => { e.preventDefault(); showModePicker(); });
-  $("reset").addEventListener("click", async (e) => {
+  $("reset").addEventListener("click", (e) => {
     e.preventDefault();
-    await apiCall("/api/reset", { mode: "image" });
+    store.image.gallery = [];
     $("gallery").innerHTML = "";
   });
   $("image-form").addEventListener("submit", onImageSubmit);
@@ -566,7 +591,10 @@ async function onImageSubmit(e) {
       payload.refs = await Promise.all(refFiles.map(fileToB64));
       payload.ref_strength = parseFloat($("image-ref-strength").value);
     }
+    const gen = viewGeneration;
     const { image, used_prompt } = await apiCall("/api/image", payload);
+    pushGallery("image", image);
+    if (viewGeneration !== gen) return;   // left the view; it's in the gallery for next time
     appendGalleryImage(image);
     setStatus("used-prompt", used_prompt ? `assist used: ${used_prompt}` : "");
     setStatus("image-status", "");
@@ -604,9 +632,9 @@ function renderChat() {
       ${gallery}
     </div>`;
   $("back").addEventListener("click", (e) => { e.preventDefault(); showModePicker(); });
-  $("reset").addEventListener("click", async (e) => {
+  $("reset").addEventListener("click", (e) => {
     e.preventDefault();
-    await apiCall("/api/reset", { mode: currentMode });
+    store.chat = freshStore().chat;
     $("transcript").innerHTML = "";
     if ($("gallery")) $("gallery").innerHTML = "";
   });
@@ -626,7 +654,7 @@ async function onGetImage() {
   btn.disabled = true;
   $("chat-status").textContent = "picturing the scene... (~45s: the LLM reads the conversation, then the image renders)";
   try {
-    const { job_id } = await apiCall("/api/chat-image", {});
+    const { job_id } = await apiCall("/api/chat-image", { history: store.chat.history.slice(-6) });
     if (job_id) pollImageJob(job_id, (errMsg) => setStatus("chat-status", errMsg || ""));
     else setStatus("chat-status", "");
   } catch (err) {
@@ -667,9 +695,8 @@ function appendGalleryImage(b64png) {
   img.scrollIntoView({ block: "end" });
 }
 
-// A finished message, with edit/delete controls. index = position in the
-// server-side history, so edits/deletes target the exact message the model
-// conditions on. Editing an assistant reply rewrites what the model "said" for
+// A finished message, with edit/delete controls. index = position in
+// store.chat.history, which is exactly what the next turn sends the model. Editing an assistant reply rewrites what the model "said" for
 // every future turn - the way out of a stuck merge-model register.
 function makeBubble(index, role, content, name) {
   const div = document.createElement("div");
@@ -725,50 +752,37 @@ function beginEdit(div, index) {
   ta.focus();
   const close = () => { ta.remove(); bar.remove(); span.style.display = ""; if (actions) actions.style.display = ""; };
   cancel.addEventListener("click", close);
-  save.addEventListener("click", async () => {
+  save.addEventListener("click", () => {
     const content = ta.value.trim();
     if (!content) { setStatus("chat-status", "empty - use delete instead"); return; }
-    save.disabled = true;
-    try {
-      const { history } = await apiCall("/api/chat-edit", { index, content });
-      renderTranscript(history);
-      setStatus("chat-status", "");
-    } catch (err) {
-      save.disabled = false;
-      setStatus("chat-status", err.message || "edit failed");
-    }
+    const m = store.chat.history[index];
+    if (m) m.content = content;
+    renderTranscript(store.chat.history);
+    setStatus("chat-status", "");
   });
 }
 
-async function onDeleteMessage(index) {
-  try {
-    const { history } = await apiCall("/api/chat-delete", { index });
-    renderTranscript(history);
-    setStatus("chat-status", "");
-  } catch (err) {
-    setStatus("chat-status", err.message || "delete failed");
-  }
+function onDeleteMessage(index) {
+  store.chat.history.splice(index, 1);
+  renderTranscript(store.chat.history);
+  setStatus("chat-status", "");
 }
 
-// Re-pull authoritative history and re-render, so freshly-streamed messages
-// pick up their real index + edit/delete controls.
-async function refreshTranscript() {
-  try {
-    const { history } = await apiCall("/api/state", { mode: currentMode });
-    renderTranscript(history || []);
-  } catch (err) {
-    // leave the live-streamed bubbles as-is
-  }
+// Re-render from the browser's history, so freshly-streamed messages pick up
+// their index + edit/delete controls.
+function refreshTranscript() {
+  if ($("transcript")) renderTranscript(store.chat.history);
 }
 
 async function loadState(mode) {
+  if (mode === "chat") renderTranscript(store.chat.history);
+  if ($("gallery")) for (const img of store[mode].gallery) appendGalleryImage(img);
+  if (mode !== "chat") return;
   try {
-    const { history, gallery, group_mode } = await apiCall("/api/state", { mode });
-    renderTranscript(history || []);
-    if (gallery) for (const img of gallery) appendGalleryImage(img);
+    const { group_mode } = await apiCall("/api/state", {});
     if (group_mode && $("skip-btn")) $("skip-btn").style.display = "";
   } catch (err) {
-    // fresh conversation, nothing to load
+    // group controls just stay hidden
   }
 }
 
@@ -779,6 +793,10 @@ async function loadState(mode) {
 // tags events with {speaker} and brackets each persona with {start}/{end}, so
 // we open a fresh bubble per persona - each types to completion, in turn.
 async function streamTurn(bodyObj) {
+  // The model sees the conversation BEFORE this turn; the new message rides
+  // alongside and is appended here only once the server has accepted it.
+  const chat = store.chat;
+  const payload = { ...bodyObj, history: chat.history.slice(-HISTORY_MAX), turn: chat.turn };
   const btn = $("send-btn");
   const skipBtn = $("skip-btn");
   btn.disabled = true;
@@ -798,7 +816,7 @@ async function streamTurn(bodyObj) {
     const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(await encryptEnvelope(bodyObj)),
+      body: JSON.stringify(await encryptEnvelope(payload)),
     });
     if (res.status === 401) {
       showLogin("session expired - enter password again");
@@ -808,6 +826,8 @@ async function streamTurn(bodyObj) {
       const raw = await readJson(res);
       throw new Error((raw && raw.error) || `request failed (${res.status})`);
     }
+    if (bodyObj.message) chat.history.push({ role: "user", content: bodyObj.message });
+    chat.turn++;   // rotates the group-chat lead; the server no longer counts
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
@@ -824,6 +844,12 @@ async function streamTurn(bodyObj) {
         if (obj.error) throw new Error(obj.error);
         if (obj.done || obj.start) continue;          // start is advisory; bubble opens on first text
         if (obj.end) { curSpan = null; curSpeaker = null; continue; }
+        if (obj.final) {
+          const m = { role: "assistant", content: obj.final };
+          if (obj.speaker) m.name = obj.speaker;
+          chat.history.push(m);
+          continue;
+        }
         const sp = obj.speaker;                       // undefined => single-Chloe reply
         if (obj.delta) { ensureBubble(sp); text += obj.delta; curSpan.textContent = text; }
         else if (obj.replace !== undefined) { ensureBubble(sp); text = obj.replace; curSpan.textContent = text; }
@@ -839,7 +865,7 @@ async function streamTurn(bodyObj) {
     btn.disabled = false;
     if (skipBtn) skipBtn.disabled = false;
     if ($("stop-btn")) $("stop-btn").style.display = "none";
-    await refreshTranscript();   // replace live bubbles with indexed, editable ones
+    if (store.chat === chat) refreshTranscript();   // replace live bubbles with indexed, editable ones
   }
 }
 
@@ -870,41 +896,47 @@ const IMAGE_POLL_MS = 2000;
 const IMAGE_POLL_MAX_POLLS = 150;
 
 async function pollImageJob(jobId, onDone) {
-  const mode = currentMode;
+  // Polling outlives the view: the server hands the finished image over once
+  // and keeps no copy, so leaving the conversation view mid-render must not
+  // drop it - it goes into the gallery either way. Only a "new conversation",
+  // a logout, or a closed tab abandons it.
+  const chat = store.chat;
   // Comparing modes is not enough: leaving a mode and coming back to it rebuilds
   // #gallery, so the captured placeholder is detached while the mode matches
   // again - the finished image would land in a subtree nobody can see.
   const gen = viewGeneration;
+  const visible = () => viewGeneration === gen;
   const placeholder = appendPlaceholder();
+  const finish = (errMsg) => {
+    if (!visible()) return;
+    if (errMsg !== undefined) placeholder.remove();
+    if (onDone) onDone(errMsg);
+  };
   let polls = 0;
   const poll = async () => {
-    if (viewGeneration !== gen) return;
+    if (!kSess || store.chat !== chat) return;
     let result;
     try {
-      result = await apiCall("/api/image-status", { mode, job_id: jobId });
+      result = await apiCall("/api/image-status", { job_id: jobId });
     } catch (err) {
-      if (viewGeneration !== gen) return;
-      placeholder.remove();
-      if (onDone) onDone(err.message || "image failed");
+      finish(err.message || "image failed");
       return;
     }
-    if (viewGeneration !== gen) return;
+    if (store.chat !== chat) return;
     if (result.status === "pending") {
-      if (++polls >= IMAGE_POLL_MAX_POLLS) {
-        placeholder.remove();
-        if (onDone) onDone("image is taking too long - giving up on it");
-        return;
-      }
+      if (++polls >= IMAGE_POLL_MAX_POLLS) { finish("image is taking too long - giving up on it"); return; }
       setTimeout(poll, IMAGE_POLL_MS);
     } else if (result.status === "done" && result.image) {
+      chat.gallery.push(result.image);
+      chat.gallery.splice(0, Math.max(0, chat.gallery.length - GALLERY_MAX));
+      if (!visible()) return;   // the gallery renders it when the view is opened again
       const img = document.createElement("img");
       img.src = "data:image/png;base64," + result.image;
       img.addEventListener("click", () => openLightbox(result.image));
       placeholder.replaceWith(img);
-      if (onDone) onDone();
+      finish();
     } else {
-      placeholder.remove();
-      if (onDone) onDone(result.error || "image generation failed");
+      finish(result.error || "image generation failed");
     }
   };
   setTimeout(poll, IMAGE_POLL_MS);
@@ -913,4 +945,10 @@ async function pollImageJob(jobId, onDone) {
 // --- boot -----------------------------------------------------------------
 
 $("lightbox").addEventListener("click", () => $("lightbox").classList.remove("open"));
+// Closing (or reloading) the tab ends the session on the server right away
+// instead of at the 20-minute idle reaper. A crashed browser or a dead network
+// never sends this; the reaper is the backstop.
+addEventListener("pagehide", () => {
+  if (logoutEnvelope) navigator.sendBeacon("/api/logout", new Blob([logoutEnvelope], { type: "text/plain" }));
+});
 showLogin();

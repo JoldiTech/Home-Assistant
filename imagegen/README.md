@@ -34,10 +34,25 @@ rules that must not be "fixed" away.
    for. The browser holds its keys in plain JS variables — never
    localStorage/sessionStorage — so a reload requires the password again, by
    construction.
-2. **Nothing conversational is ever persisted.** Conversations, generated
-   images, and sessions live only in process memory and are gone on restart,
-   idle-timeout (20 min), explicit reset, or tab close (session cookie, no
-   Max-Age). No database, no disk writes of content, no history.
+2. **The server keeps no conversation at all.** The chat history and both
+   image galleries live in the browser tab's memory. Each request carries what
+   it needs (the history for a chat turn, the last few messages for a scene
+   image) inside the envelope; the server decrypts it, generates, encrypts the
+   answer and drops it when the request ends. Close the tab and the only copy
+   is gone: there is nothing left on the box to decrypt, with or without a
+   key. The one exception is a chat image waiting to be polled, which waits
+   *already encrypted* under the session key and is deleted on delivery.
+   A session itself is just a key and a timestamp. It ends when the tab closes
+   (a `pagehide` beacon to `/api/logout`), at the 20-minute idle reaper as the
+   backstop for a crashed browser, or on restart. When the last session ends,
+   the prompt-store key and the decrypted prompts are wiped from memory too.
+
+   What this cannot cover: plaintext must be in this process's RAM *while a
+   request is served* (the model reads it), and Python can't overwrite freed
+   memory, so fragments may linger in RAM until reused. Hence the unit forbids
+   swap (`MemorySwapMax=0`) and core dumps (`LimitCORE=0`, plus apport disabled
+   on the box): nothing in this process's memory may ever reach the disk. RAM
+   is all there is, and power-off clears it.
 
 The **only** two things persisted to disk (in `/var/lib/imagegen/` — systemd's
 `StateDirectory=imagegen`, mode 0700, both files mode 0600):
@@ -118,8 +133,8 @@ mode are all chosen there. The two modes are mutually exclusive on a 6 GB card:
 Steady state in `cpu_images` with both models loaded is ~17 GB RAM (one-time
 CUDA/accelerate init on the first generation, then flat — see the memory notes
 below). The systemd unit caps memory at 22 G/26 G as a safety net. "Shut down
-models" (`/api/unload`) returns to cold without touching sessions or
-conversations, which live in memory independent of the model objects.
+models" (`/api/unload`) returns to cold without touching sessions, and the
+conversations are in the browser anyway.
 
 ## Notes & caveats
 
@@ -148,7 +163,9 @@ conversations, which live in memory independent of the model objects.
   restart. `_unload_models` logs `RSS before -> after` so a regression shows up
   instead of being inferred.
 - **Conversation-with-images is async.** The reply returns immediately; the
-  image generates in the background and the client polls `/api/image-status`,
+  image generates in the background and the client polls `/api/image-status`
+  (it keeps polling if you leave the view, since the server hands the image
+  over once and keeps no copy),
   showing a shimmer placeholder meanwhile. This also keeps a single request
   under Cloudflare's ~100 s origin timeout (LLM + SDXL sequentially can exceed
   it).
@@ -194,3 +211,32 @@ Residual note: journald is persistent (`/var/log/journal`), but after fix #1 it
 only holds request *paths* (`POST /api/chat`), never bodies. System-wide swap
 is still enabled for other processes; only this service is barred from it,
 which is the correct scope.
+
+### Second audit (2026-10-11): conversations moved out of the server
+
+Asked: "once the tab is closed, can anyone recover a prompt, conversation or
+image, even with the physical box?" Under the old design, yes:
+
+1. **A crash dump.** `/var/crash` held a ~500 MB apport report with the full
+   memory image of an `imagegen-env` Python process (Jul 21, SIGABRT).
+   `MemorySwapMax=0` does nothing for core dumps, and the unit had
+   `LimitCORE=infinity`. Deleted (along with the whole journal, at the owner's
+   request); `LimitCORE=0` added and apport disabled.
+2. **The server held every conversation in plaintext**, keyed to a session it
+   kept after the tab closed - and the deployed build (older than `main`) only
+   swept abandoned sessions when someone next logged in, so a conversation
+   could sit in RAM indefinitely. The browser's key protected the *traffic*,
+   not what the server stored. Fixed structurally: the browser now holds the
+   conversation (see guarantee 2), and closing the tab ends the session.
+3. **The prompt-store key never left memory** once anyone had logged in. It is
+   now wiped when the last session ends.
+
+Still true and worth knowing: the AI box has no disk encryption and Secure
+Boot is off, so anything that *does* reach its disk is readable by whoever
+holds the box; `prompts.enc` sits next to `k_auth`, so with the disk in hand
+its protection is the password's strength against an offline guessing attack
+(PBKDF2-SHA256, 210k iterations, fixed salt). Use a long passphrase.
+
+`tests/test_stateless.py` exercises the server side of all this with the ML
+stack stubbed out (`python3 imagegen/tests/test_stateless.py`; needs
+`fastapi`, `httpx`, `cryptography`).

@@ -822,9 +822,17 @@ the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
    request/response body is an AES-GCM envelope. Cloudflare terminates TLS but
    only relays ciphertext it has no key for. The browser keeps the key in a JS
    variable only (no localStorage), so a reload re-prompts for the password.
-2. **Nothing conversational persists.** Conversations, images, and sessions are
-   in-memory only — gone on restart, 20-min idle timeout, reset, or tab close
-   (session cookie, no Max-Age). No database, no disk writes of content.
+2. **The server keeps no conversation.** Since 2026-10-11 the chat history and
+   both galleries live in the browser tab; each request sends what it needs and
+   the server forgets it when the request ends (a pending chat image waits only
+   as ciphertext, deleted on delivery). Closing the tab sends a logout beacon,
+   so the session (just a key + timestamp) ends at once; the 20-min idle reaper
+   is the backstop. The last session ending also wipes the prompt-store key.
+   Plaintext exists in RAM only *during* a request, so the unit forbids swap
+   AND core dumps (`MemorySwapMax=0`, `LimitCORE=0`; apport is disabled on the
+   box — it once kept a 500 MB memory dump of an imagegen-env process in
+   `/var/crash`). Don't move state back to the server. Full write-up:
+   `imagegen/README.md` "Second audit".
 
 - **Persisted state (the only two things on disk):** `/var/lib/imagegen/`
   (owned by `nmteaco`, mode 700; a systemd `StateDirectory=imagegen`, not a

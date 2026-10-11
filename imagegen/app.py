@@ -5,9 +5,25 @@ Ephemeral, end-to-end-encrypted, three-mode generation tool:
   - image only               (JuggernautXL Ragnarok / SDXL, GPU)
 
 Design constraints (deliberate, do not "fix"):
-  - Nothing is ever written to disk. All state - login sessions, chat
-    history, generated images - lives only in this process's memory and
-    is gone on restart, idle-timeout, or explicit reset.
+  - The server keeps NO conversation between requests. The browser holds the
+    chat history and both galleries (in JS memory only) and sends what a
+    request needs - the history for a chat turn, the last few messages for a
+    scene image - inside the encrypted envelope. The server decrypts it, uses
+    it, encrypts the answer and drops it when the request ends. Close the tab
+    and the only copy is gone: there is nothing on this box to decrypt, with
+    or without a key. The one thing that outlives a request is a finished
+    chat image waiting to be polled, and it waits already encrypted under the
+    session key, deleted the moment it is fetched.
+  - Nothing is ever written to disk except the login verifier and the
+    encrypted prompt store. Login sessions (a key + a timestamp) live only in
+    memory: ended by the tab's close beacon, the 20-minute idle reaper, or a
+    restart. When the last session ends, the prompt-store key and decrypted
+    prompts are wiped from memory too.
+  - Plaintext DOES exist in this process's memory while a request is being
+    served (the model has to read it), and Python cannot overwrite freed
+    memory, so fragments can linger in RAM until reused. imagegen.service
+    therefore forbids swap (MemorySwapMax=0) and core dumps (LimitCORE=0):
+    nothing in this process's memory may ever reach the disk.
   - The password is never transmitted OR stored, not even server-side. The
     browser derives two independent PBKDF2 halves from it: an auth key and
     an encryption key. The server persists ONLY the auth half - a login
@@ -166,8 +182,9 @@ MAX_PENDING_CHALLENGES = 4096
 REAPER_INTERVAL = 60  # how often the background sweep of expired state runs
 LOGIN_MAX_ATTEMPTS = 5
 LOGIN_WINDOW_SECONDS = 15 * 60
-MAX_HISTORY = 40  # messages kept per conversation, oldest dropped past this
-MAX_GALLERY = 30  # images kept per conversation-with-images session
+MAX_HISTORY = 40  # messages of client-sent history the model sees, oldest dropped past this
+MAX_MESSAGE_CHARS = 8000  # per message in client-sent history
+MAX_PENDING_JOBS = 10  # undelivered chat images held (encrypted) per session
 MIN_PASSWORD_LEN = 8  # enforced client-side; the server never sees the password
 
 # Quality presets: steps + guidance on the same model/scheduler. Resolution
@@ -410,16 +427,41 @@ def _rate_limited(ip: str) -> bool:
         return _prune_attempts_locked(ip, now) >= LOGIN_MAX_ATTEMPTS
 
 
+def _attempts_append_locked(ip: str) -> None:
+    _login_attempts[ip].append(time.time())
+
+
 def _record_failure(ip: str) -> None:
     with _state_lock:
-        _login_attempts[ip].append(time.time())
+        _attempts_append_locked(ip)
 
 
-def _new_conversation_state() -> dict:
-    return {
-        "chat": {"history": [], "gallery": [], "jobs": {}, "turn": 0},
-        "image": {"gallery": []},
-    }
+def _new_session(sess_aesgcm) -> dict:
+    # Everything a session holds: its envelope key, its idle clock, the cancel
+    # flag of an in-flight reply, and chat images not yet collected - which are
+    # stored as finished envelopes, i.e. ciphertext. No history, no galleries:
+    # those live in the browser.
+    return {"last_seen": time.time(), "aesgcm": sess_aesgcm, "cancel": None, "jobs": {}}
+
+
+def _wipe_keys_if_idle_locked() -> None:
+    """Caller holds _state_lock. With no session left, nobody can use the
+    prompt-store key, so drop it and the decrypted prompts: the next login
+    delivers the key again. Lock order is always _state_lock -> _config_lock."""
+    global K_ENC, _aesgcm, _prompts
+    if _sessions:
+        return
+    with _config_lock:
+        K_ENC, _aesgcm, _prompts = b"", None, None
+
+
+def _end_session_locked(token: str) -> None:
+    s = _sessions.pop(token, None)
+    if s is not None:
+        # An image job still rendering holds this dict; emptying it is how the
+        # job learns the session is gone and discards its result.
+        s["jobs"].clear()
+    _wipe_keys_if_idle_locked()
 
 
 def _touch_session(token: str) -> dict | None:
@@ -430,7 +472,7 @@ def _touch_session(token: str) -> dict | None:
         if s is None:
             return None
         if now - s["last_seen"] > SESSION_IDLE_TIMEOUT:
-            del _sessions[token]
+            _end_session_locked(token)
             return None
         s["last_seen"] = now
         return s
@@ -440,7 +482,7 @@ def _sweep_expired_locked(now: float) -> None:
     for k in [k for k, ch in _challenges.items() if ch["exp"] < now]:
         del _challenges[k]
     for tok in [tok for tok, s in _sessions.items() if now - s["last_seen"] > SESSION_IDLE_TIMEOUT]:
-        del _sessions[tok]
+        _end_session_locked(tok)
     for ip in list(_login_attempts):
         _prune_attempts_locked(ip, now)
 
@@ -641,13 +683,19 @@ async def login(request: Request):
         return JSONResponse({"error": "incorrect password"}, status_code=401)
 
     candidate = AESGCM(ek)
-    with _config_lock:
+    token = base64.urlsafe_b64encode(os.urandom(32)).decode()
+    # Unlock the prompt store AND register the session in one critical section:
+    # the reaper wipes the key whenever no session exists, so a gap between the
+    # two would leave this session holding a wiped key.
+    with _state_lock, _config_lock:
         if PROMPTS_FILE.exists():
             try:
                 raw = PROMPTS_FILE.read_bytes()
                 prompts = json.loads(candidate.decrypt(raw[:12], raw[12:], None))
             except Exception:
-                _record_failure(ip)
+                prompts = None
+            if prompts is None:
+                _attempts_append_locked(ip)
                 return JSONResponse({"error": "incorrect password"}, status_code=401)
             K_ENC, _aesgcm, _prompts = ek, candidate, prompts
             _normalize_prompts(_prompts)
@@ -660,11 +708,7 @@ async def login(request: Request):
             }
             _normalize_prompts(_prompts)
             _write_prompts_locked()
-
-    token = base64.urlsafe_b64encode(os.urandom(32)).decode()
-    with _state_lock:
-        _sessions[token] = {"last_seen": time.time(), "aesgcm": sess_aesgcm,
-                            **_new_conversation_state()}
+        _sessions[token] = _new_session(sess_aesgcm)
 
     resp = JSONResponse({"ok": True})
     # Session cookie only - no Max-Age, so the browser drops it when it closes.
@@ -688,27 +732,28 @@ def _require_session(request: Request) -> tuple[str, dict] | JSONResponse:
 
 @app.post("/api/logout")
 async def logout(request: Request):
+    """Called by the tab's close beacon. The cookie is shared by every tab of
+    the browser, but the session KEY belongs to one tab - so the body must be
+    an envelope that decrypts under the cookie's session key. A stale tab
+    (whose cookie a newer login overwrote) can't produce one, so closing it
+    can't end the newer tab's session. Always answers 200: a beacon can't act
+    on the reply, and a reply must not tell a prober anything."""
     token = request.cookies.get("session")
-    if token:
-        with _state_lock:
-            _sessions.pop(token, None)
-    resp = JSONResponse({"ok": True})
-    resp.delete_cookie("session")
-    return resp
-
-
-@app.post("/api/reset")
-async def reset(request: Request):
-    result = _require_session(request)
-    if isinstance(result, JSONResponse):
-        return result
-    token, state = result
-    body = _decrypt(await request.json())
-    mode = body.get("mode")
+    try:
+        envelope = json.loads(await request.body() or b"{}")
+    except ValueError:
+        envelope = {}
     with _state_lock:
-        if mode in ("chat", "image"):
-            state[mode] = _new_conversation_state()[mode]
-    return JSONResponse(_encrypt({"ok": True}))
+        s = _sessions.get(token) if token else None
+    if s is not None:
+        try:
+            ok = bool(_decrypt(envelope, aesgcm=s["aesgcm"]).get("logout"))
+        except StaleSessionKey:
+            ok = False
+        if ok:
+            with _state_lock:
+                _end_session_locked(token)
+    return JSONResponse({"ok": True})
 
 
 @app.post("/api/get-prompts")
@@ -773,23 +818,40 @@ async def change_password(request: Request):
         _write_prompts_locked()  # re-encrypt prompts under the NEW key
     # Force everyone (including this browser) to re-login with the new password.
     with _state_lock:
-        _sessions.clear()
+        for tok in list(_sessions):
+            _end_session_locked(tok)
     return JSONResponse(_encrypt({"ok": True}, old_aesgcm))
 
 
 @app.post("/api/state")
 async def get_state(request: Request):
+    """The conversation lives in the browser; this only reports whether the
+    group-chat controls should show."""
     result = _require_session(request)
     if isinstance(result, JSONResponse):
         return result
-    token, state = result
-    body = _decrypt(await request.json())
-    mode = body.get("mode")
-    mode_state = state.get(mode, {})
-    return JSONResponse(
-        _encrypt({"history": mode_state.get("history", []), "gallery": mode_state.get("gallery"),
-                  "group_mode": bool(_prompts and _prompts.get("group_mode") and _prompts.get("personas"))})
-    )
+    _decrypt(await request.json())
+    with _config_lock:
+        group = bool(_prompts and _prompts.get("group_mode") and _prompts.get("personas"))
+    return JSONResponse(_encrypt({"group_mode": group}))
+
+
+def _client_history(raw) -> list[dict]:
+    """The browser-held history, validated: user/assistant turns only (the
+    system prompt is the server's), bounded in count and size."""
+    out = []
+    for m in (raw if isinstance(raw, list) else [])[-MAX_HISTORY:]:
+        if not isinstance(m, dict) or m.get("role") not in ("user", "assistant"):
+            continue
+        content = str(m.get("content") or "")[:MAX_MESSAGE_CHARS]
+        if not content:
+            continue
+        msg = {"role": m["role"], "content": content}
+        name = str(m.get("name") or "").strip()[:40]
+        if name and m["role"] == "assistant":
+            msg["name"] = name
+        out.append(msg)
+    return out
 
 
 def _run_llm(history: list[dict]) -> str:
@@ -1102,17 +1164,16 @@ def _run_image(prompt: str, quality: str = IMG_DEFAULT_PRESET,
     return result
 
 
-def _run_image_job(job_id: str, prompt: str, mode_state: dict):
-    """Generate an image and store it into mode_state['jobs'][job_id] + gallery.
-    Runs on the GPU executor; the client polls /api/image-status for it."""
-    jobs = mode_state["jobs"]
+def _run_image_job(job_id: str, prompt: str, jobs: dict, aes):
+    """Generate an image and park it in jobs[job_id] for the client's poll -
+    as a finished envelope under the session key, so what waits on the server
+    is ciphertext, and /api/image-status deletes it on delivery. The browser
+    keeps the gallery. Runs on the GPU executor."""
     try:
-        image_b64 = _run_image(prompt)
+        envelope = _encrypt({"status": "done", "image": _run_image(prompt)}, aes)
         with _state_lock:
-            jobs[job_id] = {"status": "done", "image": image_b64}
-            gallery = mode_state["gallery"]
-            gallery.append(image_b64)
-            del gallery[:-MAX_GALLERY]
+            if job_id in jobs:  # not evicted, and the session didn't end meanwhile
+                jobs[job_id] = envelope
     except Exception as e:
         # Surface WHY - a silently vanishing image is the worst UX. The usual
         # cause on the 6GB card is VRAM exhaustion when the chat model is on
@@ -1120,9 +1181,10 @@ def _run_image_job(job_id: str, prompt: str, mode_state: dict):
         msg = ("out of GPU memory - the chat model is using the GPU. Shut down "
                "models and re-initialize with CPU placement to free it for images."
                if _is_oom(e) else "image generation failed")
-        print(f"image job failed: {e}", flush=True)
+        print(f"image job failed: {type(e).__name__}", flush=True)
         with _state_lock:
-            jobs[job_id] = {"status": "error", "image": None, "error": msg}
+            if job_id in jobs:
+                jobs[job_id] = _encrypt({"status": "error", "image": None, "error": msg}, aes)
 
 
 def _is_oom(exc: Exception) -> bool:
@@ -1191,7 +1253,7 @@ async def chat_stop(request: Request):
     if isinstance(result, JSONResponse):
         return result
     _token, state = result
-    ev = state["chat"].get("cancel")
+    ev = state.get("cancel")
     if ev is not None:
         ev.set()
     return JSONResponse(_encrypt({"ok": True}))
@@ -1204,7 +1266,13 @@ async def chat(request: Request):
     relays ciphertext. Each decrypted chunk is {"delta": text} to append,
     {"replace": text} when the live channel-token filter has to retract
     already-shown text (a marker completed mid-stream), {"error": msg}, or
-    {"done": true}."""
+    {"done": true}.
+
+    The request carries the conversation so far ("history", held by the
+    browser) and the new "message"; the server keeps neither. Each finished
+    assistant message is sent back as {"final": text} (tagged with "speaker"
+    in group mode) for the browser to append to its own history; a stopped
+    reply's partial text counts as final, so the context stays coherent."""
     result = _require_session(request)
     if isinstance(result, JSONResponse):
         return result
@@ -1224,14 +1292,20 @@ async def chat(request: Request):
     if not advance and not message:
         return JSONResponse({"error": "empty message"}, status_code=400)
 
-    history = state["chat"]["history"]
+    # Request-local: dropped when this turn ends. Group mode appends each
+    # persona's reply so the next persona sees it.
+    history = _client_history(body.get("history"))
     if message:
         history.append({"role": "user", "content": message})
+    try:
+        turn = int(body.get("turn") or 0)
+    except (TypeError, ValueError):
+        turn = 0
     messages = [{"role": "system", "content": system_prompt},
                 *history[-MAX_HISTORY:]]
     # A fresh cancel event per turn; /api/chat-stop sets it.
     cancel = threading.Event()
-    state["chat"]["cancel"] = cancel
+    state["cancel"] = cancel
     gpu_mode = _chat_selection["mode"] == "gpu_chat"
 
     q: asyncio.Queue = asyncio.Queue()
@@ -1259,13 +1333,11 @@ async def chat(request: Request):
                     emitted = cleaned
                     loop.call_soon_threadsafe(q.put_nowait, {"replace": cleaned})
             final = _clean_llm_text(raw)
-            # Keep the partial reply on stop, so context continues coherently.
-            if final:
-                with _state_lock:
-                    history.append({"role": "assistant", "content": final})
-                    del history[:-MAX_HISTORY]
             if final != emitted:
                 loop.call_soon_threadsafe(q.put_nowait, {"replace": final})
+            # Keep the partial reply on stop, so context continues coherently.
+            if final:
+                loop.call_soon_threadsafe(q.put_nowait, {"final": final})
         except Exception as e:
             print(f"chat stream failed: {e}", flush=True)
             loop.call_soon_threadsafe(q.put_nowait, {"error": str(e)[:160] if "re-initialize" in str(e) else "generation failed"})
@@ -1297,22 +1369,22 @@ async def chat(request: Request):
                 loop.call_soon_threadsafe(q.put_nowait, {"speaker": name, "replace": cleaned})
         final = _strip_other_speakers(_clean_llm_text(raw), name, personas, user_name).strip()
         if final:
-            with _state_lock:
-                history.append({"role": "assistant", "name": name, "content": final})
-                del history[:-MAX_HISTORY]
+            history.append({"role": "assistant", "name": name, "content": final})
         if final != emitted:
             loop.call_soon_threadsafe(q.put_nowait, {"speaker": name, "replace": final})
+        if final:
+            loop.call_soon_threadsafe(q.put_nowait, {"speaker": name, "final": final})
         loop.call_soon_threadsafe(q.put_nowait, {"speaker": name, "end": True})
 
     def produce_group():
         try:
             addressed = _addressed_personas(message, personas)
             n = len(personas)
-            turn = state["chat"].get("turn", 0)
+            # The browser counts group turns and sends the count, so the
+            # round-robin lead rotates without the server remembering anything.
             order = personas[turn % n:] + personas[:turn % n]   # round-robin lead
             if addressed:  # whoever was named answers first
                 order = sorted(order, key=lambda p: 0 if p["name"] in addressed else 1)
-            state["chat"]["turn"] = turn + 1
             for persona in order:
                 if cancel.is_set():
                     break
@@ -1335,63 +1407,12 @@ async def chat(request: Request):
                              headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"})
 
 
-def _history_index(body) -> int | None:
-    try:
-        return int(body.get("index"))
-    except (TypeError, ValueError):
-        return None
-
-
-@app.post("/api/chat-edit")
-async def chat_edit(request: Request):
-    """Edit one message in the conversation history by index. The edited text
-    becomes canonical - the model conditions on it on the next turn, not on what
-    it originally said. Editing an assistant reply is the way out of a merge
-    model's stuck 'conservative' register: trim the cautious sentence (or rewrite
-    the reply) and generation continues from your version. Role is preserved."""
-    result = _require_session(request)
-    if isinstance(result, JSONResponse):
-        return result
-    _token, state = result
-    body = _decrypt(await request.json())
-    idx = _history_index(body)
-    content = (body.get("content") or "").strip()[:8000]
-    if not content:
-        return JSONResponse({"error": "empty edit - use delete instead"}, status_code=400)
-    with _state_lock:
-        history = state["chat"]["history"]
-        if idx is None or not (0 <= idx < len(history)):
-            return JSONResponse({"error": "no such message"}, status_code=400)
-        history[idx]["content"] = content
-        hist = [dict(m) for m in history]
-    return JSONResponse(_encrypt({"history": hist}))
-
-
-@app.post("/api/chat-delete")
-async def chat_delete(request: Request):
-    """Delete one message from the conversation history by index. Use it to drop
-    the message where a merge model first flipped into refusal - removing it from
-    the context breaks the self-reinforcing loop that kept it stuck."""
-    result = _require_session(request)
-    if isinstance(result, JSONResponse):
-        return result
-    _token, state = result
-    body = _decrypt(await request.json())
-    idx = _history_index(body)
-    with _state_lock:
-        history = state["chat"]["history"]
-        if idx is None or not (0 <= idx < len(history)):
-            return JSONResponse({"error": "no such message"}, status_code=400)
-        del history[idx]
-        hist = [dict(m) for m in history]
-    return JSONResponse(_encrypt({"history": hist}))
-
-
 @app.post("/api/chat-image")
 async def chat_image(request: Request):
     """'Get image' in conversation mode: distill the scene from the last few
     messages (local LLM), prepend the configured character appearance, render
-    in the background. The client polls /api/image-status (mode 'chat')."""
+    in the background. The client sends those messages ("history") and polls
+    /api/image-status for the result."""
     result = _require_session(request)
     if isinstance(result, JSONResponse):
         return result
@@ -1402,25 +1423,25 @@ async def chat_image(request: Request):
             {"error": "images are off in GPU-chat mode - shut down models and re-initialize in 'CPU chat + images' to generate"},
             status_code=409)
     token, state = result
-    _decrypt(await request.json())  # envelope validated; no params needed
-
-    mode_state = state["chat"]
-    history = mode_state["history"]
+    aes = _current_aesgcm.get()
+    body = _decrypt(await request.json())
+    history = _client_history(body.get("history"))[-6:]
     if not history:
         return JSONResponse({"error": "no conversation yet"}, status_code=400)
 
     loop = asyncio.get_event_loop()
-    scene = await loop.run_in_executor(_llm_executor, _distill_scene, history[-6:])
+    scene = await loop.run_in_executor(_llm_executor, _distill_scene, history)
     with _config_lock:
         appearance = _prompts["image_prompt_prefix"]
     image_prompt = f"{appearance}. {scene}"[:400]
 
     job_id = secrets.token_urlsafe(8)
-    jobs = mode_state["jobs"]
-    jobs[job_id] = {"status": "pending", "image": None}
-    for old_id in list(jobs)[:-10]:
-        del jobs[old_id]
-    loop.run_in_executor(_gpu_executor, _run_image_job, job_id, image_prompt, mode_state)
+    with _state_lock:
+        jobs = state["jobs"]
+        jobs[job_id] = None  # pending
+        for old_id in list(jobs)[:-MAX_PENDING_JOBS]:
+            del jobs[old_id]
+    loop.run_in_executor(_gpu_executor, _run_image_job, job_id, image_prompt, jobs, aes)
     return JSONResponse(_encrypt({"job_id": job_id}))
 
 
@@ -1458,11 +1479,14 @@ async def image_status(request: Request):
         return result
     token, state = result
     body = _decrypt(await request.json())
-    mode = body.get("mode")
     job_id = body.get("job_id")
-    jobs = state.get(mode, {}).get("jobs", {})
-    job = jobs.get(job_id, {"status": "error", "image": None})
-    return JSONResponse(_encrypt(job))
+    with _state_lock:
+        jobs = state["jobs"]
+        if job_id in jobs and jobs[job_id] is None:
+            return JSONResponse(_encrypt({"status": "pending", "image": None}))
+        # Delivered once, then gone: the browser holds the gallery.
+        envelope = jobs.pop(job_id, None)
+    return JSONResponse(envelope or _encrypt({"status": "error", "image": None}))
 
 
 @app.post("/api/image")
@@ -1520,9 +1544,6 @@ async def image_only(request: Request):
             {"error": "GPU is busy (likely the nightly Captain's Log run) - try again in ~30 minutes"},
             status_code=503,
         )
-    gallery = state["image"]["gallery"]
-    gallery.append(image_b64)
-    del gallery[:-MAX_GALLERY]
     return JSONResponse(_encrypt({
         "image": image_b64,
         "used_prompt": final_prompt if final_prompt != prompt else None,

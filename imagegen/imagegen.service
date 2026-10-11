@@ -60,6 +60,14 @@ MemoryMax=26G
 # where it would be forensically recoverable. Under pressure the process gets
 # OOM-killed and restarted (memory cleared) instead of swapping secrets out.
 MemorySwapMax=0
+# Same reason, other door: a crash must not write this process's memory to
+# disk either. A core dump is a full memory image - plaintext of whatever was
+# being served, plus the session keys. This box's apport once kept a 500 MB
+# dump of an imagegen-env process in /var/crash. LimitCORE=0 stops file dumps
+# (and the GPU chat worker inherits it); apport is also disabled on the box
+# (`systemctl disable --now apport`, enabled=0 in /etc/default/apport), because
+# a piped core_pattern doesn't reliably honour this limit.
+LimitCORE=0
 
 [Install]
 WantedBy=multi-user.target
