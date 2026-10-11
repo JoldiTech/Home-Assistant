@@ -831,7 +831,11 @@ the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
    Plaintext exists in RAM only *during* a request, so the unit forbids swap
    AND core dumps (`MemorySwapMax=0`, `LimitCORE=0`; apport is disabled on the
    box — it once kept a 500 MB memory dump of an imagegen-env process in
-   `/var/crash`). Don't move state back to the server. Full write-up:
+   `/var/crash`). **"Shut down models" physically wipes:** unload, zero-fill
+   free VRAM, then the process exits (systemd `Restart=always` brings it back
+   cold) and the kernel's `init_on_free=1` zeroes every page it held. The
+   leftovers it removes are plaintext, not ciphertext. Don't move state back
+   to the server. Full write-up:
    `imagegen/README.md` "Second audit".
 
 - **Persisted state (the only two things on disk):** `/var/lib/imagegen/`

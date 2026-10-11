@@ -241,4 +241,16 @@ with TestClient(A.app, base_url="https://testserver") as client:
     assert r == {"group_mode": True}
     ok("group chat: lead rotates by client turn, personas see prior replies, server keeps none")
 
+    # "Shut down models": unload, scrub VRAM, then end the process (here
+    # intercepted) only AFTER the answer went out; the answer names this
+    # process's boot id so the browser can wait for a new one.
+    terminated = []
+    A._terminate = lambda: terminated.append(True)
+    st, r = t4.call("/api/unload", {})
+    assert st == 200 and r["restarting"] is True and r["boot"] == A.BOOT_ID, r
+    assert r["status"] == "cold" and A.llm is None
+    assert terminated == [True], "the process must exit to wipe its memory"
+    assert client.get("/").headers["X-Chloe-Boot"] == A.BOOT_ID
+    ok("unload: models dropped, response sent, then the process exits for a clean restart")
+
 print("ALL PASS")

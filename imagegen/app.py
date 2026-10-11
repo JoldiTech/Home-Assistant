@@ -84,6 +84,7 @@ from diffusers.image_processor import IPAdapterMaskProcessor
 from PIL import Image as PILImage
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from llama_cpp import Llama
 
@@ -583,6 +584,13 @@ SECURITY_HEADERS = {
 }
 
 
+# Changes on every process start. "Shut down models" restarts the process; the
+# browser polls until a response carries a different id, so it never logs in
+# to the old process in the moment before it exits. Says nothing but "this
+# is a new process".
+BOOT_ID = secrets.token_hex(8)
+
+
 class SecurityHeadersMiddleware:
     """Pure-ASGI header injector. Deliberately NOT @app.middleware('http')
     (Starlette's BaseHTTPMiddleware), which buffers the whole response body and
@@ -602,6 +610,7 @@ class SecurityHeadersMiddleware:
                 headers = message.setdefault("headers", [])
                 for k, v in SECURITY_HEADERS.items():
                     headers.append((k.encode(), v.encode()))
+                headers.append((b"X-Chloe-Boot", BOOT_ID.encode()))
             await send(message)
 
         await self.app(scope, receive, send_wrapper)
@@ -1738,16 +1747,68 @@ def _unload_models():
     print(f"models unloaded, GPU released (RSS {before}MB -> {_rss_mb()}MB)", flush=True)
 
 
+VRAM_SCRUB_CHUNK = 256 * 1024 * 1024  # bytes per zero-fill block; shrinks as the card fills
+
+
+def _scrub_vram() -> None:
+    """Overwrite all free GPU memory with zeros. Freed VRAM keeps its contents
+    (latents, decoded image pixels, a GPU-chat worker's KV cache) until
+    something reuses it, and the driver gives no guarantee to clear it - so
+    claim every free byte with zero-filled blocks, then release them. Must run
+    on _gpu_executor's thread (the CUDA context). Best effort by construction:
+    a failure here must never stop the restart that follows."""
+    try:
+        if not torch.cuda.is_available():
+            return
+        torch.cuda.empty_cache()
+        blocks, chunk, filled = [], VRAM_SCRUB_CHUNK, 0
+        while chunk >= 1024 * 1024:
+            try:
+                blocks.append(torch.zeros(chunk, dtype=torch.uint8, device="cuda"))
+                filled += chunk
+            except RuntimeError:  # OutOfMemoryError: try a smaller block
+                chunk //= 4
+        torch.cuda.synchronize()
+        del blocks
+        torch.cuda.empty_cache()
+        print(f"VRAM scrubbed ({filled // (1024 * 1024)} MB zero-filled)", flush=True)
+    except Exception as e:
+        print(f"VRAM scrub incomplete: {type(e).__name__}", flush=True)
+
+
+def _terminate() -> None:
+    # A separate function so the tests can intercept it.
+    os._exit(0)
+
+
+async def _wipe_and_restart() -> None:
+    """Runs after the unload response has been sent. Zero the free VRAM, then
+    end the process: the kernel reclaims every page this process held -
+    including the plaintext fragments of past requests that Python can't
+    overwrite itself - and with init_on_free=1 on the kernel command line it
+    zeroes them as it does. systemd (Restart=always) starts a fresh, cold
+    process a couple of seconds later."""
+    await asyncio.get_event_loop().run_in_executor(_gpu_executor, _scrub_vram)
+    print("memory wipe: exiting for a clean restart", flush=True)
+    _terminate()
+
+
 @app.post("/api/unload")
 async def unload(request: Request):
+    """'Shut down models' = unload, then wipe: zero the GPU's free memory and
+    restart the process so nothing from any request survives in RAM. Every
+    session ends with it; the browser keeps its conversation and logs in again."""
     result = _require_session(request)
     if isinstance(result, JSONResponse):
         return result
     with _model_status_lock:
         busy = _model_status == "loading"
-    if not busy and _model_status != "cold":
+    if busy:
+        return JSONResponse(_encrypt(_init_payload()))
+    if _model_status != "cold":
         await asyncio.get_event_loop().run_in_executor(_gpu_executor, _unload_models)
-    return JSONResponse(_encrypt(_init_payload()))
+    payload = {**_init_payload(), "restarting": True, "boot": BOOT_ID}
+    return JSONResponse(_encrypt(payload), background=BackgroundTask(_wipe_and_restart))
 
 
 @app.post("/api/release-gpu")
