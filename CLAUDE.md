@@ -951,8 +951,31 @@ was done: `print_agent/PHASE2-4-REPORT.md`.
   chirp on Shawn's Office Siren (`wallmote_btn1_siren_beep`; that siren is
   notification-only — the alarm uses the other siren). A morning automation
   also runs `store_open` on the first person seen 9–10am on Tea Two Neo.
-- `input_select.store_state` (Open/Closed/Armed) was left an **orphaned helper**
-  after the incident below (as of 2026-07-19 nothing acted on it).
+- **`input_select.store_state` (Open/Closed/Armed) is a STATUS, never a control**
+  (rewired 2026-10-11 at the owner's request). What sets it:
+  - `script.store_open` / `script.store_close` set Open / Closed as their first
+    step, so the morning auto-open, WallMote buttons 4/3 and the dashboard
+    buttons all update it;
+  - `automation.store_state_armed_15_min_after_closing`: Open → Closed held
+    15 min → Armed (a state trigger with `for`; an HA restart inside the 15 min
+    cancels it);
+  - `automation.store_state_armed_back_to_closed_at_9am`: 09:00, if Armed →
+    Closed.
+
+  **Nothing may act on it.** Don't trigger lights, music or `store_close` from
+  it: that's exactly the 2026-07-19 blackout below. "Armed" does nothing yet;
+  the owner plans to use it later, and anything hung on it must use an explicit
+  `to: Armed` trigger plus guards, created after hours. On the Store view it's
+  the three coloured state tiles, each with a `select-options` (buttons style)
+  control (`dashboard/apply_store_controls.py`). On a day nobody opens the
+  store it stays Closed and never arms, because arming needs an Open → Closed
+  change.
+- Master Controls' **Store Close** and **All Lights Off** buttons ask for
+  confirmation (one tap used to black out the store).
+- `sensor.sonos_group_status` / `binary_sensor.speakers_grouped` are UI template
+  helpers (edit them in Settings → Helpers, or via the options flow). Their
+  templates return `none` while `group_members` is empty at startup; they used
+  `| default([])`, which doesn't catch None, and errored on every restart.
 
 ### ⚠️ Incident 2026-07-19: live automation experiment blacked out the store
 
