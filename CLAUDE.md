@@ -914,6 +914,15 @@ was done: `print_agent/PHASE2-4-REPORT.md`.
   `failed` or `uncertain`, a result not reported, or the printer blocking an
   order (one per incident, dismissed when it recovers). The token is read from
   `/run/s6/container_environment`, because s6 starts the agent with a clean env.
+- **Store State panel** (DowntownControls → Store view, first section): an
+  "Instore Order Printing" block shows the agent's `sensor.instore_order_printing`
+  (status tile, colour by state), toner and drum gauges from the IPP
+  integration, and a "Last 3 print jobs" markdown table. The cards live in
+  `print_agent/dashboard/`; `apply_store_panel.py` (needs `websocket-client`)
+  re-applies them over the websocket API and replaces only the cards from the
+  "Instore Order Printing" heading to the end of that section. Back up the
+  storage file first. The entity is pushed by the agent (no unique_id), so
+  after an HA restart it reappears within 30 s.
 - **State from IPP, count from SNMP:** `hrPrinterStatus` reads `other` while the
   M203 sleeps, and IPP has no page counter.
 - **Logs** carry ids, order numbers, page deltas and errors only, never job

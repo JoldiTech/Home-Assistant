@@ -1,6 +1,6 @@
 # Downtown print agent: Phases 2–4
 
-> **Now running v1.1.0** (deployed 2026-10-11 06:15 MT): the dashboard sends
+> **Now running v1.2.0** (1.1.0 deployed 2026-10-11 06:15 MT, 1.2.0 at 06:47): the dashboard sends
 > finished PDFs, results go to `/tools/webhook/printAgent.php`, result delivery
 > retries 4 times, and Home Assistant gets alerts. See
 > [v1.1.0](#v110-pdf-jobs-bounded-retries-ha-alerts) at the end. The Phase 3
@@ -237,6 +237,42 @@ The outcome stays recorded, so a re-push of the same id still gets it.
 - **PDF test page (id 2100000010):** `job 2100000010 order=TEST-2100000010
   kind=test outcome=printed pages_delta=1 took=18s error=-`. Counter 7165 →
   7166, one sheet.
+
+## v1.2.0: "Instore Order Printing" in the Store State panel
+
+Deployed 2026-10-11 06:47 MT, per the owner: the printer's toner, status and
+last three print jobs, shown in the existing **Store State** panel (Store view of
+the DowntownControls dashboard).
+
+- **The agent publishes `sensor.instore_order_printing`** through the
+  Supervisor's Core API, every 30 s and on every job change.
+  - State: `ready` / `printing` / `problem` / `unreachable`.
+  - Attributes: `problem`, `printer_state`, `reasons`, `page_count`, `queue`,
+    `last_jobs`, `checked`.
+  - Each entry in `last_jobs` has the order number, kind, status, page delta,
+    error and time. Never job content.
+- **Fixed:** the entity briefly read `printing` right after a job finished.
+  The e2e test caught it.
+- **The panel** gets 8 cards appended after the Open/Closed/Armed buttons
+  (`dashboard/store_state_printing.json`):
+  - a heading;
+  - a status tile per state (green ready, blue printing, red can't-print with
+    the reason, red unreachable);
+  - toner and drum gauges (IPP integration sensors);
+  - a "Last 3 print jobs" markdown table (`dashboard/last_jobs.md.j2`) with
+    local times, plus a line for any job that failed or may not have printed.
+
+  Applied with `dashboard/apply_store_panel.py`. The storage file was backed up
+  first as `lovelace.dashboard_downtowncontrols.bak-20261011064918`. A diff of
+  before and after shows only that section changed, and its original 7 cards
+  are intact. HA's template engine rendered the table as expected (three test
+  jobs, Mountain times, page count 7166).
+- **Not visually checked:** headless Chromium couldn't open HA's websocket
+  through the sandbox proxy. No failed logins and no bans resulted (checked the
+  HA log).
+- **Tests:** 25 unit tests and 38 e2e checks, all pass. New checks: the entity
+  shows `ready` and job 1 printed with 1 page; `unreachable` while the printer
+  is off; the three newest jobs, newest first; no job content.
 
 ## Still open
 
