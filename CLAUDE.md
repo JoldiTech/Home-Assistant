@@ -113,13 +113,28 @@ Connect with `ssh aibox` (set up by the same SessionStart hook / Setup script as
   (`sensor.cyberpower_*`); `script.wake_ai_box` sends WoL (MAC
   `a8:5e:45:e6:62:1f`) to restart the box after an outage shutdown, since the
   UPS never lets the PSU see AC drop. WoL persisted via `wol-enable.service`.
+  **HA reads NUT at `192.168.22.6:3493`**, and upsd used to lose that bind on
+  every reboot (it started before the LAN IP existed, logged `not listening on
+  192.168.22.6`, and served loopback only), leaving every `sensor.cyberpower_*`
+  unavailable. Fixed 2026-10-11 by the drop-in
+  `/etc/systemd/system/nut-server.service.d/wait-for-lan-ip.conf` (waits up to
+  30 s for the address). If the sensors are unavailable after a reboot, check
+  `ss -ltn | grep 3493`, then reload HA's NUT config entry (it sits in
+  `setup_retry` backoff and doesn't notice the port coming back on its own).
+- **Kernel runs with `init_on_free=1`** (`/etc/default/grub.d/90-init-on-free.cfg`,
+  added 2026-10-11): freed pages are zeroed immediately, which is what makes
+  Chloe's "shut down models" restart a real memory wipe.
 - **Bulk downloads ride the backup line:** `via-att <command>` on the box runs
   anything with egress pinned to the AT&T dongle (dedicated `dl` user +
   uidrange ip rule -> table 107, asserted by `dl-route.service` at boot and a
   networkd-dispatcher hook after any netplan/link event — netplan apply
   flushes table 107 and would otherwise silently fall back to the store WAN).
-  ~95 Mbps measured to HuggingFace. Use it for every model download so the
-  store's T-Mobile line never feels it: `via-att curl -LO <url>`. /srv/dl is
+  ~95 Mbps measured to HuggingFace. **Since 2026-10-11 AT&T is the store's
+  primary WAN too**, so `via-att` no longer spares the store: a big download
+  saturates the same line the store and the AI box's own tunnel use (SSH to
+  the box timed out repeatedly during a 24 GB pull). Run large downloads while
+  the store is closed — or re-point the helper at T-Mobile.
+  Usage: `via-att curl -LO <url>`. /srv/dl is
   the dl user's group-writable staging dir. Dongle MTU is pinned to **1430**
   (probed: 1500/1452 drop with DF on AT&T Internet Air — a PMTUD blackhole
   that strangles bulk TCP against hosts that filter ICMP).
@@ -155,12 +170,30 @@ environment — they live only on the box itself:
   without touching the rack. **It ALSO works on the legacy admin API**
   (`/proxy/network/api/s/default/...` — stat/health, stat/device), which is
   where WAN detail lives that the integration API omits.
-- **Store dual-WAN (UDM Pro Max):** WAN1 eth8 = AT&T Internet Air (via the
-  same AT&T box the AI-box dongle uses, `192.168.1.x`); WAN2 eth7 = T-Mobile
-  (`192.168.12.x`, egress `172.59.x`). Both monitored by the UDM; failover is
-  automatic. After a full rack power-cycle the UDM may sit on WAN2 without
-  failing back unless failback is enabled. UniFi Talk is installed but has NO
-  integration API - its endpoints reject API keys (admin session only).
+- **Store dual-WAN (UDM Pro Max)** — names and ports as the live config has
+  them (an earlier note here had them backwards): **"Internet 1" = T-Mobile**
+  on eth7 (UniFi calls it "WAN1 … port 8"; `192.168.12.x`, double-NAT behind
+  T-Mobile's gateway, CGNAT egress `172.59.x`) and **"Internet 2" = AT&T
+  Internet Air** on eth8 (`192.168.1.x`, the same AT&T box the AI-box dongle
+  uses, egress `99.104.177.57`). **Since 2026-10-11 AT&T is primary**
+  (priority 1, `weighted`) and T-Mobile is backup (priority 2,
+  `failover-only`): T-Mobile was dropping ~33 s at a time, 7–9×/day (71
+  failovers in 30 days), which cuts every call in progress. To swap priorities
+  through the API, move one WAN to a temporary priority 3 first — two WANs
+  can't share a priority even mid-edit (`WanFailOverPriorityAlreadyExists`).
+  UniFi Talk is installed (native Talk service; the "Allow Anveo" firewall
+  policy is a leftover from an old SIP trunk) and has NO integration API — its
+  endpoints reject API keys (admin session only).
+- **Talk phones must stay wired.** The two G3 Touch phones have Wi-Fi 5 built
+  in and had joined "NM Tea Co." *as well as* being plugged in, registering
+  with Talk over Wi-Fi and swapping IPs with their wired side (181
+  `CLIENT_IP_CONFLICT`s in 30 days) — the prime suspect for calls cutting out
+  at ~30 s with no outgoing audio. Talk has no remote Wi-Fi toggle, and UniFi
+  refuses to block a UniFi device (`BlockUnifiDeviceForbidden`), so since
+  2026-10-11 the SSID carries a **MAC deny filter** for the phones' Wi-Fi
+  MACs `84:78:48:52:78:97` (Main Store Phone) and `84:78:48:32:04:15`; their
+  wired MACs are `…78:96` (port 16) and `…04:14` (port 4). A new Talk phone
+  needs its Wi-Fi MAC (wired MAC + 1) added to that list.
 - Any future systemd service on this box should read secrets via
   `EnvironmentFile=/etc/nmteaco/protect.env`, never hardcode them.
 
@@ -596,8 +629,9 @@ exists to prevent. Zero transcript support for any of it.
 
 **More capacity against lossy mic audio buys more convincing confabulation.**
 Qwen3-8B's clumsiness is a safety feature: it garbles visibly where the 30B
-invents plausibly. Keep `Qwen3-8B-Q4_K_M` at `SUMMARIZER_CTX=8192`. The model
-is staged at `~/transcribe/models/` if you want to re-verify; don't re-litigate
+invents plausibly. Keep `Qwen3-8B-Q4_K_M` at `SUMMARIZER_CTX=8192`. The 30B
+was deleted from the box on 2026-10-11 (with an unused Qwen2.5-7B and a
+duplicate Qwen3-8B); re-download it only to re-verify, and don't re-litigate
 it from first principles.
 
 Two related dead ends, both measured: the `/no_think` suffix is a Qwen3 *hybrid*
@@ -776,9 +810,16 @@ the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
   model is just dropping the file/folder in. Currently: JuggernautXL Ragnarok
   (`juggernautXL_ragnarok.safetensors`, 6.6 GB, from Civitai) and RealVisXL V5.0
   (`RealVisXL_V5.0.safetensors`, ~6.9 GB, from `SG161222/RealVisXL_V5.0` on HF).
-  chat = `Gemma-4-12B-OBLITERATED.Q4_K_M.gguf` (~7.4 GB, from
-  `mradermacher/Gemma-4-12B-OBLITERATED-GGUF`) via `llama-cpp-python`, **CPU-only**
-  (`n_gpu_layers=0`) so it never contends with SDXL for the 6 GB VRAM. Install
+  Chat models (2026-10-11; Gemma-4-12B-OBLITERATED and Rocinante-12B were
+  removed as weak): **`NemoMix-Unleashed-12B.Q4_K_M.gguf`** (the owner's main
+  one, default), `Impish_Bloodmoon_12B.Q4_K_M.gguf` (Sep 2025, NeMo base, 7.5 GB)
+  and `G4-MeroMero-26B-A4B.Q4_K_M.gguf` (Gemma 4 26B MoE, ~4B active, 16.8 GB),
+  all from mradermacher on HF. Run via `llama-cpp-python`; in "CPU chat +
+  images" mode **CPU-only** (`n_gpu_layers=0`) so it never contends with SDXL
+  for the 6 GB VRAM. **Per-model modes:** a GGUF over `CPU_IMAGES_MAX_GB` (9 GB)
+  or listed in `CHAT_MODEL_PROFILES` (`app.py`) is offered only "GPU chat, no
+  images" — it can't fit in RAM beside SDXL under `MemoryHigh=22G`. MeroMero is
+  one; its profile also sets where the GPU-layer search starts. Install
   llama-cpp-python with `--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu`
   (plain `--index-url` breaks dep resolution).
 - **Lazy load:** nothing loads at startup (~700 MB cold). The **Initialize**
@@ -831,7 +872,11 @@ the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
    Plaintext exists in RAM only *during* a request, so the unit forbids swap
    AND core dumps (`MemorySwapMax=0`, `LimitCORE=0`; apport is disabled on the
    box — it once kept a 500 MB memory dump of an imagegen-env process in
-   `/var/crash`). Don't move state back to the server. Full write-up:
+   `/var/crash`). **"Shut down models" physically wipes:** unload, zero-fill
+   free VRAM, then the process exits (systemd `Restart=always` brings it back
+   cold) and the kernel's `init_on_free=1` zeroes every page it held. The
+   leftovers it removes are plaintext, not ciphertext. Don't move state back
+   to the server. Full write-up:
    `imagegen/README.md` "Second audit".
 
 - **Persisted state (the only two things on disk):** `/var/lib/imagegen/`

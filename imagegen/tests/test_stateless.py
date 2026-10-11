@@ -241,4 +241,41 @@ with TestClient(A.app, base_url="https://testserver") as client:
     assert r == {"group_mode": True}
     ok("group chat: lead rotates by client turn, personas see prior replies, server keeps none")
 
+    # "Shut down models": unload, scrub VRAM, then end the process (here
+    # intercepted) only AFTER the answer went out; the answer names this
+    # process's boot id so the browser can wait for a new one.
+    terminated = []
+    A._terminate = lambda: terminated.append(True)
+    st, r = t4.call("/api/unload", {})
+    assert st == 200 and r["restarting"] is True and r["boot"] == A.BOOT_ID, r
+    assert r["status"] == "cold" and A.llm is None
+    assert terminated == [True], "the process must exit to wipe its memory"
+    assert client.get("/").headers["X-Chloe-Boot"] == A.BOOT_ID
+    ok("unload: models dropped, response sent, then the process exits for a clean restart")
+
+# Per-model modes: a model too big to sit beside SDXL is GPU-chat only, a
+# deleted default falls back to a model that exists, and a request for a mode
+# the model can't run is overridden.
+mdir = tempfile.mkdtemp()
+A.GGUF_DIR = __import__("pathlib").Path(mdir)
+for name, gb in (("Small-12B.Q4_K_M.gguf", 7.5), ("Big-26B-A4B.Q4_K_M.gguf", 16.8)):
+    with open(os.path.join(mdir, name), "wb") as f:
+        f.truncate(int(gb * 1e9))  # sparse: size without the disk
+assert A._chat_model_modes("Small-12B.Q4_K_M.gguf") == ["cpu_images", "gpu_chat"]
+assert A._chat_model_modes("Big-26B-A4B.Q4_K_M.gguf") == ["gpu_chat"]
+assert A._chat_model_modes("G4-MeroMero-26B-A4B.Q4_K_M.gguf") == ["gpu_chat"]  # profile
+A._chat_selection.update(model="Deleted.gguf", mode="cpu_images")
+A._settle_chat_selection()
+assert A._chat_selection == {"model": "Big-26B-A4B.Q4_K_M.gguf", "mode": "gpu_chat"}, A._chat_selection
+A._chat_selection.update(model="Small-12B.Q4_K_M.gguf", mode="cpu_images")
+A._settle_chat_selection()
+assert A._chat_selection["mode"] == "cpu_images"
+A._chat_selection["model"] = "G4-MeroMero-26B-A4B.Q4_K_M.gguf"
+assert A._gpu_layer_chain() == [8], A._gpu_layer_chain()
+A._model_status = "cold"
+p = A._init_payload()
+assert p["model_modes"] == {"Big-26B-A4B.Q4_K_M.gguf": ["gpu_chat"],
+                            "Small-12B.Q4_K_M.gguf": ["cpu_images", "gpu_chat"]}, p
+ok("per-model modes: big models chat-only, deleted default falls back, offload start per profile")
+
 print("ALL PASS")

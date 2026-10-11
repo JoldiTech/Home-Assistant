@@ -4,7 +4,10 @@ A single password-gated web app on the AI box, public at
 `https://aibox.nmteaco.com`, with three modes after login:
 
 - **conversation** — chat with a local LLM. Any `.gguf` in the models dir is
-  selectable at Initialize (default Gemma-4-12B-OBLITERATED).
+  selectable at Initialize (default NemoMix-Unleashed-12B). Each model is only
+  offered the modes it can run in: one too large to sit beside SDXL (over
+  `CPU_IMAGES_MAX_GB`, or listed in `CHAT_MODEL_PROFILES`) is GPU-chat only,
+  no images.
 - **conversation with images** — same chat, plus an image "from the assistant"
   auto-generated after every reply, flowing into a session sidebar.
 - **image only** — type a prompt, get an SDXL image (any checkpoint in the
@@ -133,8 +136,8 @@ mode are all chosen there. The two modes are mutually exclusive on a 6 GB card:
 Steady state in `cpu_images` with both models loaded is ~17 GB RAM (one-time
 CUDA/accelerate init on the first generation, then flat — see the memory notes
 below). The systemd unit caps memory at 22 G/26 G as a safety net. "Shut down
-models" (`/api/unload`) returns to cold without touching sessions, and the
-conversations are in the browser anyway.
+models" (`/api/unload`) unloads, zeroes free VRAM and restarts the process to
+wipe its memory (see "Second audit"); the conversation stays in the browser.
 
 ## Notes & caveats
 
@@ -236,6 +239,22 @@ Boot is off, so anything that *does* reach its disk is readable by whoever
 holds the box; `prompts.enc` sits next to `k_auth`, so with the disk in hand
 its protection is the password's strength against an offline guessing attack
 (PBKDF2-SHA256, 210k iterations, fixed salt). Use a long passphrase.
+
+**"Shut down models" wipes memory physically.** The leftover fragments are
+*plaintext* (decrypted requests, replies, the model's KV cache, image pixels),
+not ciphertext - decryption has to happen before the model can read anything.
+So the button does three things: unload the models, zero-fill every free byte
+of VRAM (`_scrub_vram`; the driver doesn't promise to clear freed GPU memory),
+then exit the process - after the response is sent - so the kernel reclaims
+every page it held. The kernel runs with **`init_on_free=1`**
+(`/etc/default/grub.d/90-init-on-free.cfg`), so reclaimed pages are zeroed at
+once instead of keeping their contents until reuse (`init_on_alloc` was
+already on, which only stops *other processes* reading them). systemd
+(`Restart=always`) brings Chloe back cold in a few seconds; every session ends
+with it, and the browser waits for a response carrying a new `X-Chloe-Boot`
+id, then asks for the password again, keeping the tab's conversation.
+`/api/release-gpu` (the Captain's Log asking for the card) unloads without the
+restart, so it never logs out someone mid-conversation.
 
 `tests/test_stateless.py` exercises the server side of all this with the ML
 stack stubbed out (`python3 imagegen/tests/test_stateless.py`; needs
