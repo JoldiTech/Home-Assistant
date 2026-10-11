@@ -271,7 +271,7 @@ A._chat_selection.update(model="Small-12B.Q4_K_M.gguf", mode="cpu_images")
 A._settle_chat_selection()
 assert A._chat_selection["mode"] == "cpu_images"
 A._chat_selection["model"] = "G4-MeroMero-26B-A4B.Q4_K_M.gguf"
-assert A._gpu_layer_chain()[0] == 16, A._gpu_layer_chain()
+assert A._gpu_layer_chain() == [8], A._gpu_layer_chain()
 A._model_status = "cold"
 p = A._init_payload()
 assert p["model_modes"] == {"Big-26B-A4B.Q4_K_M.gguf": ["gpu_chat"],

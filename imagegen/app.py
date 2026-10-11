@@ -176,9 +176,11 @@ GPU_CHAT_CTX = int(os.environ.get("GPU_CHAT_CTX", "2048"))
 CPU_IMAGES_MAX_GB = 9.0
 CHAT_MODEL_PROFILES: dict[str, dict] = {
     # Gemma 4 26B mixture-of-experts (~4B active per token): 16.8 GB at Q4_K_M,
-    # so never beside SDXL. Only part of it fits the 6 GB card; the rest runs on
-    # the CPU, which stays quick because so few weights are active per token.
-    "G4-MeroMero-26B-A4B.Q4_K_M.gguf": {"modes": ["gpu_chat"], "gpu_layers": 16},
+    # so never beside SDXL. Measured 2026-10-11 on the RTX 2060 at ctx 2048:
+    # 8 layers = 5.1 GB VRAM, ~15 tok/s, first token ~1 s; 9 fits with only
+    # ~150 MB spare; 10+ fail to load. The rest runs on the CPU, which stays
+    # quick because so few weights are active per token.
+    "G4-MeroMero-26B-A4B.Q4_K_M.gguf": {"modes": ["gpu_chat"], "gpu_layers": 8},
 }
 # The GPU chat worker runs under transcribe-env, whose CUDA llama build needs
 # the torch-bundled CUDA runtime on LD_LIBRARY_PATH (same trick the captains-

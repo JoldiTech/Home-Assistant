@@ -129,8 +129,12 @@ Connect with `ssh aibox` (set up by the same SessionStart hook / Setup script as
   uidrange ip rule -> table 107, asserted by `dl-route.service` at boot and a
   networkd-dispatcher hook after any netplan/link event — netplan apply
   flushes table 107 and would otherwise silently fall back to the store WAN).
-  ~95 Mbps measured to HuggingFace. Use it for every model download so the
-  store's T-Mobile line never feels it: `via-att curl -LO <url>`. /srv/dl is
+  ~95 Mbps measured to HuggingFace. **Since 2026-10-11 AT&T is the store's
+  primary WAN too**, so `via-att` no longer spares the store: a big download
+  saturates the same line the store and the AI box's own tunnel use (SSH to
+  the box timed out repeatedly during a 24 GB pull). Run large downloads while
+  the store is closed — or re-point the helper at T-Mobile.
+  Usage: `via-att curl -LO <url>`. /srv/dl is
   the dl user's group-writable staging dir. Dongle MTU is pinned to **1430**
   (probed: 1500/1452 drop with DF on AT&T Internet Air — a PMTUD blackhole
   that strangles bulk TCP against hosts that filter ICMP).
