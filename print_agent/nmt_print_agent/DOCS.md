@@ -1,14 +1,15 @@
 # NMT Print Agent
 
-Prints pickup orders that the dashboard pushes, on the downtown HP LaserJet
-M203dw, and tells the dashboard whether paper came out. The full contract is
-`print_agent/INSTRUCTIONS.md` (Phase 3) in the Home-Assistant repository.
+Prints pickup orders that the dashboard pushes as finished PDFs, on the
+downtown HP LaserJet M203dw, and tells the dashboard whether paper came out.
+The contract is `print_agent/INSTRUCTIONS.md` (Phase 3) as amended by
+`print_agent/INSTRUCTIONS-UPDATE-PDF.md`, in the Home-Assistant repository.
 
 ## Options
 
 | Option | Meaning |
 | --- | --- |
-| `dashboard_url` | Where results are sent: `<dashboard_url>/tools/orders/curbsideAgent.php` |
+| `dashboard_url` | Where results are sent: `<dashboard_url>/tools/webhook/printAgent.php` |
 | `signing_key` | Shared HMAC key from the dashboard. Requests are refused until it is set |
 | `agent_name` | Name reported in `/status` and results (`downtown`) |
 | `printer_uri` | `ipp://192.168.22.238/ipp/print` |
@@ -24,15 +25,24 @@ Only through the Cloudflare tunnel: `print-downtown.nmteaco.com` →
 
 ## Endpoints (both need `X-NMT-Timestamp` and `X-NMT-Signature`)
 
-- `POST /print` `{"id", "order", "kind": "auto|reprint|test", "html"}` →
+- `POST /print` `{"id", "order", "kind": "auto|reprint|test", "pdf": "<base64>"}` →
   `202` accepted, `200` duplicate (with its outcome), `503` printer can't print
   (`media-empty`, `media-jam`, `door-open`, `offline`, `unreachable`, …),
-  `401` bad signature or clock.
-- `GET /status` → agent, version, printer reachability/state/reasons/page count,
-  queue length.
+  `400 {"reason": "bad-request"}` (no PDF, bad base64, not `%PDF-`, over 5 MB),
+  `401` bad signature or clock. The PDF is printed as sent; nothing is rendered.
+- `GET /status` → agent, version, `formats: ["pdf"]`, printer
+  reachability/state/reasons/page count, queue length.
+
+## Results and alerts
+
+Each outcome is POSTed signed to the dashboard. A network error or 5xx is
+retried 4 times (5 s, 30 s, 2 min, 5 min); a 4xx stops at once; `unknown: true`
+stops quietly. Home Assistant gets a persistent notification when an order
+fails, may not have printed, can't be reported, or when the printer blocks an
+order (cleared when it recovers).
 
 ## Log
 
 One line per request (method, path, job id, answer) and one per job (id,
-order number, outcome, page delta, rendered pages, seconds, error). Never job
-content or header values.
+order number, outcome, page delta, seconds, error). Never job content or
+header values.

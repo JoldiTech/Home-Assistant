@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """NMT downtown print agent.
 
-The dashboard pushes pickup-order HTML to POST /print. The agent renders it
-to a Letter PDF, prints it through a driverless CUPS queue, confirms with the
+The dashboard pushes each pickup order as a finished PDF to POST /print. The
+agent prints it unchanged through a driverless CUPS queue, confirms with the
 printer's page counter, and reports the outcome back to the dashboard. The
-contract is in print_agent/INSTRUCTIONS.md (Phase 3) in the repository.
+contract is print_agent/INSTRUCTIONS.md (Phase 3) as amended by
+print_agent/INSTRUCTIONS-UPDATE-PDF.md in the repository.
 
 Rules this file is built around:
 - Never print a job twice: a job id is recorded in /data before anything is
@@ -14,11 +15,13 @@ Rules this file is built around:
   timings, page counts and errors only.
 """
 
+import base64
+import binascii
 import hashlib
 import hmac
 import json
-import logging
 import os
+import queue
 import re
 import signal
 import socket
@@ -34,12 +37,26 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipp
 import snmp
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+
+
+def container_env(name, default=None):
+    """A container environment variable. s6-overlay (the base image's init)
+    starts the agent with a clean environment and keeps the container's
+    variables in /run/s6/container_environment."""
+    value = os.environ.get(name)
+    if value is None:
+        try:
+            with open(os.path.join("/run/s6/container_environment", name)) as f:
+                value = f.read()
+        except OSError:
+            pass
+    return default if value is None else value
 
 
 def _env_num(name, default):
     # Timings are overridable only so the test harness can shorten them.
-    return float(os.environ.get(name, default))
+    return float(container_env(name, default))
 
 
 DATA = os.environ.get("NMT_DATA", "/data")
@@ -51,7 +68,8 @@ PAGE_COUNT_OID = "1.3.6.1.2.1.43.10.2.1.4.1.1"
 LETTER = "na_letter_8.5x11in"
 
 MAX_SKEW = 300            # seconds a signed timestamp may differ from our clock
-MAX_BODY = 5 * 1024 * 1024
+MAX_PDF = 5 * 1024 * 1024          # decoded PDF
+MAX_BODY = MAX_PDF * 4 // 3 + 64 * 1024  # its base64 plus the JSON around it
 KEEP_JOBS = 1000          # job ids remembered for duplicate answers
 CUPS_WAIT = _env_num("NMT_CUPS_WAIT", 180)        # wait for CUPS to finish a job
 COUNTER_STABLE = _env_num("NMT_COUNTER_STABLE", 10)
@@ -59,8 +77,10 @@ COUNTER_WAIT = _env_num("NMT_COUNTER_WAIT", 60)
 BLOCKED_GRACE = _env_num("NMT_BLOCKED_GRACE", 600)  # hold before failing held jobs
 POLL_INTERVAL = _env_num("NMT_POLL_INTERVAL", 30)
 PROBE_MAX_AGE = 10        # /print re-probes the printer if the cached state is older
-RETRY_DELAYS = [5, 30, 120]
-RETRY_EVERY = 300
+# Result delivery: one attempt, then one retry after each delay; after the
+# last one the agent gives up and raises a Home Assistant alert.
+RETRY_DELAYS = [float(s) for s in container_env("NMT_RETRY_DELAYS", "5,30,120,300").split(",")]
+PRINTER_ALERT = "nmt_print_agent_printer"
 
 # Printer-state-reasons that mean the printer cannot print, after stripping the
 # -error/-warning/-report suffix and folding synonyms into the names the
@@ -288,16 +308,71 @@ class Store:
                 excess -= 1
 
 
+# --------------------------------------------------------------------------
+# Home Assistant alerts
+# --------------------------------------------------------------------------
+
+class Alerts:
+    """Persistent notifications in Home Assistant, through the Supervisor's
+    Core API proxy (`homeassistant_api: true`). Sent from a background thread
+    so /print never waits on HA. Best effort: a few retries on network errors
+    or 5xx, none on a 4xx."""
+
+    def __init__(self):
+        self.token = (container_env("SUPERVISOR_TOKEN") or "").strip()
+        self.base = container_env("NMT_HA_API", "http://supervisor/core/api").rstrip("/")
+        self.queue = queue.Queue()
+
+    def start(self):
+        if not self.token:
+            log("alerts: no SUPERVISOR_TOKEN; Home Assistant alerts are off")
+        threading.Thread(target=self.run, daemon=True, name="alerts").start()
+
+    def notify(self, nid, title, message):
+        self.queue.put(("create", {"notification_id": nid, "title": title, "message": message}))
+
+    def dismiss(self, nid):
+        self.queue.put(("dismiss", {"notification_id": nid}))
+
+    def call(self, service, data):
+        req = urllib.request.Request(
+            f"{self.base}/services/persistent_notification/{service}", data=json.dumps(data).encode(),
+            method="POST", headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+        except (urllib.error.URLError, OSError):
+            return None
+
+    def run(self):
+        while True:
+            service, data = self.queue.get()
+            if not self.token:
+                continue
+            for attempt in range(3):
+                code = self.call(service, data)
+                if code is not None and code < 500:
+                    break
+                time.sleep(10)
+            outcome = "sent" if code == 200 else f"failed ({code or 'no connection'})"
+            log(f"alert {service} {data['notification_id']} {outcome}")
+
+
+def job_label(job):
+    return "Test page" if job.get("kind") == "test" else f"Order {job.get('order')}"
+
+
 def spool_path(job_id, ext):
     return os.path.join(SPOOL, f"{job_id}.{ext}")
 
 
 def remove_files(job_id):
-    for ext in ("html", "pdf"):
-        try:
-            os.remove(spool_path(job_id, ext))
-        except FileNotFoundError:
-            pass
+    try:
+        os.remove(spool_path(job_id, "pdf"))
+    except FileNotFoundError:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -310,15 +385,30 @@ class Agent:
         self.key = opts.get("signing_key") or ""
         self.name = opts.get("agent_name") or "downtown"
         self.dashboard = (opts.get("dashboard_url") or "https://dashboard.nmteaco.com").rstrip("/")
-        self.result_url = self.dashboard + "/tools/orders/curbsideAgent.php"
+        self.result_url = self.dashboard + "/tools/webhook/printAgent.php"
         self.printer = Printer(opts["printer_uri"], opts["printer_ip"], opts.get("snmp_community") or "public")
         self.cups = Cups(opts["printer_uri"])
         self.store = Store(STATE_FILE)
         self.current = None  # job id being printed
+        self.alerts = Alerts()
+        self.printer_alerted = False
+
+    def printer_blocked(self, reason):
+        """An order wants to print and the printer can't: one alert per
+        incident, cleared by printer_ok()."""
+        if not self.printer_alerted:
+            self.printer_alerted = True
+            self.alerts.notify(PRINTER_ALERT, "Downtown printer can't print",
+                               f"The pickup printer reports **{reason}**. Orders can't print until it's fixed.")
+
+    def printer_ok(self):
+        if self.printer_alerted:
+            self.printer_alerted = False
+            self.alerts.dismiss(PRINTER_ALERT)
 
     # ---- results -----------------------------------------------------------
 
-    def finish(self, job_id, outcome, before, after, error, started=None, pages=None):
+    def finish(self, job_id, outcome, before, after, error, started=None):
         """Record the outcome and queue the report, in one durable write, then
         delete the job's files."""
         with self.store.lock:
@@ -332,11 +422,18 @@ class Agent:
             self.store.save()
             self.store.wake.notify_all()
         remove_files(job_id)
+        nid = f"nmt_print_agent_job_{job['id']}"
+        if outcome == "failed":
+            self.alerts.notify(nid, "Pickup order didn't print",
+                               f"{job_label(job)} (job {job['id']}) did not print: **{error}**.")
+        elif outcome == "uncertain":
+            self.alerts.notify(nid, "Pickup order may not have printed",
+                               f"{job_label(job)} (job {job['id']}) may not have printed: {error}. "
+                               "Check the printer tray and reprint it from the curbside tablet if it's missing.")
         delta = after - before if before is not None and after is not None else None
         secs = f"{time.time() - started:.0f}s" if started else "-"
         log(f"job {job['id']} order={job['order']} kind={job['kind']} outcome={outcome} "
-            f"pages_delta={delta if delta is not None else '?'} rendered_pages={pages or '?'} "
-            f"took={secs} error={error or '-'}")
+            f"pages_delta={delta if delta is not None else '?'} took={secs} error={error or '-'}")
 
     def recover(self):
         """A job marked printing when we start was in flight when the agent
@@ -356,25 +453,6 @@ class Agent:
                 os.remove(os.path.join(SPOOL, name))
 
     # ---- printing ----------------------------------------------------------
-
-    def render(self, job_id):
-        from weasyprint import CSS, HTML  # imported lazily: slow to load
-        with open(spool_path(job_id, "html"), encoding="utf-8") as f:
-            html = f.read()
-        doc = HTML(string=html, base_url=self.dashboard + "/", url_fetcher=self.fetch).render(
-            stylesheets=[CSS(string="@page { size: letter !important; }")])
-        doc.write_pdf(spool_path(job_id, "pdf"))
-        return len(doc.pages)
-
-    def fetch(self, url, timeout=10, ssl_context=None):
-        """Resources a job may load: inline data: URIs, and files from the
-        dashboard's own host. Nothing else, so no job content or URL leaves
-        for a third party."""
-        from weasyprint import default_url_fetcher
-        u = urllib.parse.urlsplit(url)
-        if u.scheme == "data" or (u.scheme == "https" and u.hostname == urllib.parse.urlsplit(self.dashboard).hostname):
-            return default_url_fetcher(url, timeout=timeout)
-        raise ValueError("resource host not allowed")
 
     def settle_counter(self, before, expect_change):
         """Poll the page counter until it has been stable for COUNTER_STABLE s.
@@ -407,11 +485,6 @@ class Agent:
             self.current = job["id"]
             self.store.save()  # durable BEFORE anything reaches CUPS
         try:
-            try:
-                pages = self.render(job_id)
-            except Exception as e:  # noqa: BLE001 — any render failure means nothing printed
-                self.finish(job_id, "failed", None, None, f"render-failed: {type(e).__name__}", started)
-                return
             before = self.printer.page_count()
             with self.store.lock:
                 job["pages_before"] = before
@@ -419,7 +492,7 @@ class Agent:
             try:
                 cups_id = self.cups.submit(spool_path(job_id, "pdf"), f"NMT job {job['id']}")
             except Exception as e:  # noqa: BLE001 — lp refused: nothing was queued
-                self.finish(job_id, "failed", before, before, f"submit-failed: {str(e)[:120]}", started, pages)
+                self.finish(job_id, "failed", before, before, f"submit-failed: {str(e)[:120]}", started)
                 return
             with self.store.lock:
                 job["cups_job"] = cups_id
@@ -446,7 +519,7 @@ class Agent:
             outcome, error = decide(state, timed_out, before, after, reason)
             if outcome != "printed" and state not in ipp.JOB_TERMINAL:
                 self.cups.cancel(cups_id)
-            self.finish(job_id, outcome, before, after, error, started, pages)
+            self.finish(job_id, outcome, before, after, error, started)
         finally:
             with self.store.lock:
                 self.current = None
@@ -467,6 +540,7 @@ class Agent:
                 if blocked_since is None:
                     blocked_since = time.monotonic()
                     log(f"queue held: printer {reason}, {len(self.store.queue)} job(s) waiting")
+                    self.printer_blocked(reason)
                 if time.monotonic() - blocked_since >= BLOCKED_GRACE:
                     with self.store.lock:
                         held = list(self.store.queue)
@@ -480,6 +554,7 @@ class Agent:
             if blocked_since is not None:
                 log("queue released: printer ready")
                 blocked_since = None
+                self.printer_ok()
             try:
                 self.run_job(job_id)
             except Exception as e:  # noqa: BLE001
@@ -490,9 +565,11 @@ class Agent:
 
     def monitor(self):
         while True:
-            self.printer.poll()
-            if self.printer.current()["reachable"]:
+            snap = self.printer.poll()
+            if snap["reachable"]:
                 self.cups.ensure_queue()
+            if not snap["blocking"]:
+                self.printer_ok()
             if not self.cups.alive():
                 log("cupsd exited; stopping so the Supervisor restarts the add-on")
                 os._exit(1)
@@ -501,22 +578,29 @@ class Agent:
     # ---- reporting back ----------------------------------------------------
 
     def post_result(self, payload):
+        """POST one result. Returns (verdict, detail): "ok"; "unknown" (the
+        dashboard never sent that id); "reject" (a 4xx: resending the same
+        report can't fix it); or "retry" (network error, 5xx, odd answer)."""
         body = json.dumps(payload, separators=(",", ":")).encode()
         ts = str(int(time.time()))
         path = urllib.parse.urlsplit(self.result_url).path
         req = urllib.request.Request(self.result_url, data=body, method="POST", headers={
             "Content-Type": "application/json",
+            "User-Agent": f"nmt-print-agent/{VERSION}",
             "X-NMT-Timestamp": ts,
             "X-NMT-Signature": sign(self.key, ts, "POST", path, body),
         })
         try:
             with urllib.request.urlopen(req, timeout=15) as r:
                 reply = json.loads(r.read(65536) or b"null")
-                return isinstance(reply, dict) and reply.get("ok") is True, f"HTTP {r.status}"
+                how = f"HTTP {r.status}"
+                if isinstance(reply, dict) and reply.get("ok") is True:
+                    return ("unknown" if reply.get("unknown") is True else "ok"), how
+                return "retry", how + " without ok"
         except urllib.error.HTTPError as e:
-            return False, f"HTTP {e.code}"
+            return ("retry" if e.code >= 500 else "reject"), f"HTTP {e.code}"
         except (urllib.error.URLError, OSError, ValueError) as e:
-            return False, type(e).__name__
+            return "retry", type(e).__name__
 
     def reporter(self):
         while True:
@@ -526,17 +610,34 @@ class Agent:
                 if due is None:
                     self.store.wake.wait(1)
                     continue
-            ok, how = self.post_result(due["payload"])
+            verdict, how = self.post_result(due["payload"])
             with self.store.lock:
-                if ok:
+                p = due["payload"]
+                if verdict == "ok":
                     self.store.outbox.remove(due)
-                    log(f"result job {due['payload']['id']} delivered ({how})")
+                    log(f"result job {p['id']} delivered ({how})")
+                elif verdict == "unknown":
+                    self.store.outbox.remove(due)
+                    log(f"result job {p['id']}: dashboard does not know this id ({how}); not retried")
+                elif verdict == "reject" or due["attempt"] >= len(RETRY_DELAYS):
+                    # Give up. The outcome stays recorded, so the dashboard
+                    # still learns it if it pushes the same job id again.
+                    self.store.outbox.remove(due)
+                    job = self.store.jobs.get(str(p["id"]), {"kind": None, "order": f"job {p['id']}"})
+                    why = (f"refused it ({how})" if verdict == "reject"
+                           else f"didn't accept it after {due['attempt']} retries ({how})")
+                    log(f"result job {p['id']} not delivered: dashboard {why}; giving up")
+                    self.alerts.notify(
+                        f"nmt_print_agent_report_{p['id']}", "Print result not reported",
+                        f"{job_label(job)} (job {p['id']}): the outcome was **{p['outcome']}**, but the dashboard "
+                        f"{why}. The dashboard may still show it as sending.")
                 else:
                     n = due["attempt"]
                     due["attempt"] = n + 1
-                    delay = RETRY_DELAYS[n] if n < len(RETRY_DELAYS) else RETRY_EVERY
+                    delay = RETRY_DELAYS[n]
                     due["next"] = time.time() + delay
-                    log(f"result job {due['payload']['id']} not accepted ({how}); retry in {delay}s")
+                    log(f"result job {due['payload']['id']} not accepted ({how}); "
+                        f"retry {n + 1} of {len(RETRY_DELAYS)} in {delay:g}s")
                 self.store.save()
 
     # ---- HTTP --------------------------------------------------------------
@@ -545,7 +646,7 @@ class Agent:
         snap = self.printer.current()
         with self.store.lock:
             queued = len(self.store.queue) + (1 if self.current is not None else 0)
-        return {"agent": self.name, "version": VERSION,
+        return {"agent": self.name, "version": VERSION, "formats": ["pdf"],
                 "printer": {"reachable": snap["reachable"], "state": snap["state"],
                             "reasons": snap["reasons"], "page_count": snap["page_count"]},
                 "queue": queued}
@@ -561,13 +662,15 @@ class Agent:
         if time.time() - snap["at"] > PROBE_MAX_AGE:
             snap = self.printer.poll(counter=False, timeout=2.5)
         if snap["blocking"]:
+            self.printer_blocked(snap["blocking"][0])
             return 503, {"accepted": False, "reason": snap["blocking"][0]}
         with self.store.lock:
             seen = self.store.jobs.get(key)  # a concurrent request may have won
             if seen:
                 return 200, {"accepted": True, "duplicate": True, "outcome": seen.get("outcome") or "pending"}
-            with open(spool_path(key, "html"), "w", encoding="utf-8") as f:
-                f.write(job["html"])
+            fd = os.open(spool_path(key, "pdf"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(job["pdf_bytes"])
             self.store.jobs[key] = {"id": job["id"], "order": job["order"], "kind": job["kind"],
                                     "status": "queued", "outcome": None, "accepted": time.time()}
             self.store.queue.append(job["id"])
@@ -601,6 +704,31 @@ def decide(state, timed_out, before, after, reason):
     if delta >= 1:
         return "uncertain", f"job aborted after the counter rose by {delta}"
     return "failed", reason or "job-aborted"
+
+
+BAD_REQUEST = {"accepted": False, "reason": "bad-request"}
+
+
+def parse_job(body):
+    """A validated /print body with the PDF decoded into "pdf_bytes", or None.
+    The dashboard reads the resulting 400 as "certainly not printed"."""
+    try:
+        job = json.loads(body)
+    except ValueError:
+        return None
+    if not (isinstance(job, dict) and isinstance(job.get("id"), int) and not isinstance(job["id"], bool)
+            and job["id"] > 0 and isinstance(job.get("order"), str) and len(job["order"]) <= 64
+            and job.get("kind") in ("auto", "reprint", "test") and isinstance(job.get("pdf"), str)):
+        return None
+    try:
+        pdf = base64.b64decode("".join(job["pdf"].split()), validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if not pdf.startswith(b"%PDF-") or len(pdf) > MAX_PDF:
+        return None
+    job["pdf_bytes"] = pdf
+    del job["pdf"]
+    return job
 
 
 def make_handler(agent):
@@ -645,20 +773,14 @@ def make_handler(agent):
             if self.path.split("?")[0] != "/print":
                 return self.reply(404, {"error": "not found"})
             body = self.body()
-            if body is None:
-                return self.reply(413, {"error": "too large"})
+            if body is None:  # over the size limit: unread, so drop the connection
+                self.close_connection = True
+                return self.reply(400, BAD_REQUEST)
             if not self.authed(body):
                 return self.reply(401, {"error": "unauthorized"})
-            try:
-                job = json.loads(body)
-                ok = (isinstance(job, dict) and isinstance(job.get("id"), int) and not isinstance(job["id"], bool)
-                      and job["id"] > 0 and isinstance(job.get("order"), str) and len(job["order"]) <= 64
-                      and job.get("kind") in ("auto", "reprint", "test")
-                      and isinstance(job.get("html"), str) and job["html"])
-            except ValueError:
-                ok = False
-            if not ok:
-                return self.reply(400, {"error": "bad request"})
+            job = parse_job(body)
+            if job is None:
+                return self.reply(400, BAD_REQUEST)
             code, answer = agent.accept(job)
             self.reply(code, answer, job["id"])
 
@@ -666,8 +788,6 @@ def make_handler(agent):
 
 
 def main():
-    # WeasyPrint/fontTools warnings can quote job markup or URLs: silence them.
-    logging.basicConfig(level=logging.CRITICAL)
     with open(os.path.join(DATA, "options.json")) as f:
         opts = json.load(f)
     os.makedirs(SPOOL, mode=0o700, exist_ok=True)
@@ -686,10 +806,13 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
-    agent.printer.poll()
+    agent.alerts.start()
+    snap = agent.printer.poll()
     agent.recover()
-    if agent.printer.current()["reachable"]:
+    if snap["reachable"]:
         agent.cups.ensure_queue()
+    if not snap["blocking"]:
+        agent.alerts.dismiss(PRINTER_ALERT)  # one raised before a restart may be stale
     for target in (agent.worker, agent.monitor, agent.reporter):
         threading.Thread(target=target, daemon=True, name=target.__name__).start()
 

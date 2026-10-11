@@ -3,6 +3,7 @@
     python3 print_agent/tests/test_agent.py
 """
 
+import base64
 import json
 import os
 import sys
@@ -18,6 +19,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "nmt_print_agen
 
 import agent  # noqa: E402
 import ipp  # noqa: E402
+sys.path.insert(0, os.path.dirname(__file__))
+from testpdf import make_pdf  # noqa: E402
+
+PDF = make_pdf()
 
 KEY = "k" * 64
 OPTS = {"signing_key": KEY, "agent_name": "downtown", "dashboard_url": "https://dash.example",
@@ -39,11 +44,30 @@ def fresh_agent():
         os.remove(os.path.join(agent.SPOOL, name))
     a = agent.Agent(OPTS)
     a.printer.snap = snap()
+    a.alerts = FakeAlerts()
     return a
 
 
-def job(i, html="<p>x</p>"):
-    return {"id": i, "order": f"T-{i}", "kind": "test", "html": html}
+class FakeAlerts:
+    def __init__(self):
+        self.sent = []
+
+    def notify(self, nid, title, message):
+        self.sent.append(("create", nid, message))
+
+    def dismiss(self, nid):
+        self.sent.append(("dismiss", nid, None))
+
+
+def job(i):
+    """An accepted job as parse_job() hands it to Agent.accept()."""
+    return {"id": i, "order": f"T-{i}", "kind": "test", "pdf_bytes": PDF}
+
+
+def body(i=1, pdf=PDF, **extra):
+    d = {"id": i, "order": f"T-{i}", "kind": "test", "pdf": base64.b64encode(pdf).decode()}
+    d.update(extra)
+    return json.dumps(d).encode()
 
 
 class Signing(unittest.TestCase):
@@ -112,7 +136,9 @@ class Accept(unittest.TestCase):
     def test_accept_then_duplicate(self):
         a = fresh_agent()
         self.assertEqual(a.accept(job(1)), (202, {"accepted": True}))
-        self.assertTrue(os.path.exists(agent.spool_path(1, "html")))
+        with open(agent.spool_path(1, "pdf"), "rb") as f:
+            self.assertEqual(f.read(), PDF, "the PDF is spooled unchanged")
+        self.assertEqual(os.stat(agent.spool_path(1, "pdf")).st_mode & 0o777, 0o600)
         self.assertEqual(a.accept(job(1)), (200, {"accepted": True, "duplicate": True, "outcome": "pending"}))
         self.assertEqual(a.store.queue, [1])
         # Survives a restart.
@@ -126,7 +152,7 @@ class Accept(unittest.TestCase):
         a.store.queue.remove(5)
         a.finish(5, "printed", 100, 101, None)
         self.assertEqual(a.accept(job(5))[1]["outcome"], "printed")
-        self.assertFalse(os.path.exists(agent.spool_path(5, "html")), "files deleted after the outcome")
+        self.assertFalse(os.path.exists(agent.spool_path(5, "pdf")), "files deleted after the outcome")
         self.assertEqual(a.store.outbox[0]["payload"],
                          {"action": "result", "agent": "downtown", "id": 5, "outcome": "printed",
                           "pages_before": 100, "pages_after": 101, "error": None})
@@ -175,8 +201,8 @@ class Recover(unittest.TestCase):
         self.assertEqual(b.store.outbox[0]["payload"]["error"], "agent restarted during the job")
         self.assertEqual(b.store.outbox[0]["payload"]["pages_after"], 51)
         self.assertEqual(b.store.queue, [4], "the rest of the queue continues")
-        self.assertFalse(os.path.exists(agent.spool_path(3, "html")))
-        self.assertTrue(os.path.exists(agent.spool_path(4, "html")))
+        self.assertFalse(os.path.exists(agent.spool_path(3, "pdf")))
+        self.assertTrue(os.path.exists(agent.spool_path(4, "pdf")))
 
 
 class HeldQueue(unittest.TestCase):
@@ -200,7 +226,7 @@ class Reporter(unittest.TestCase):
         a = fresh_agent()
         a.accept(job(11))
         a.store.queue.remove(11)
-        answers = [(False, "HTTP 503"), (False, "URLError"), (True, "HTTP 200")]
+        answers = [("retry", "HTTP 503"), ("retry", "URLError"), ("ok", "HTTP 200")]
         calls = []
 
         def post(payload):
@@ -218,6 +244,135 @@ class Reporter(unittest.TestCase):
         self.assertEqual(a.store.outbox, [])
         with a.store.lock, open(agent.STATE_FILE) as f:  # removal and save happen under the lock
             self.assertEqual(json.load(f)["outbox"], [], "delivery persisted")
+        self.assertEqual(a.alerts.sent, [], "a delivered result raises no alert")
+
+    def test_gives_up_after_four_retries_and_alerts(self):
+        a = fresh_agent()
+        a.accept(job(12))
+        a.store.queue.remove(12)
+        calls = []
+        a.post_result = lambda payload: (calls.append(1), ("retry", "HTTP 502"))[1]
+        agent.RETRY_DELAYS[:] = [0.1, 0.1, 0.1, 0.1]
+        a.finish(12, "printed", 1, 2, None)
+        threading.Thread(target=a.reporter, daemon=True).start()
+        deadline = time.time() + 10
+        while time.time() < deadline and not a.alerts.sent:
+            time.sleep(0.1)
+        time.sleep(0.5)
+        self.assertEqual(len(calls), 5, "first attempt + 4 retries, then stop")
+        self.assertEqual(a.store.outbox, [])
+        (kind, nid, message), = a.alerts.sent
+        self.assertEqual((kind, nid), ("create", "nmt_print_agent_report_12"))
+        self.assertIn("after 4 retries", message)
+        self.assertEqual(a.accept(job(12))[1]["outcome"], "printed", "outcome still answerable as a duplicate")
+
+
+    def run_reporter_once(self, verdict):
+        a = fresh_agent()
+        a.accept(job(13))
+        a.store.queue.remove(13)
+        calls = []
+        a.post_result = lambda payload: (calls.append(1), verdict)[1]
+        agent.RETRY_DELAYS[:] = [0.1, 0.1, 0.1, 0.1]
+        a.finish(13, "printed", 1, 2, None)
+        threading.Thread(target=a.reporter, daemon=True).start()
+        time.sleep(1.5)
+        return a, calls
+
+    def test_unknown_id_stops_quietly(self):
+        a, calls = self.run_reporter_once(("unknown", "HTTP 200"))
+        self.assertEqual((len(calls), a.store.outbox, a.alerts.sent), (1, [], []))
+
+    def test_4xx_stops_at_once_and_alerts(self):
+        a, calls = self.run_reporter_once(("reject", "HTTP 401"))
+        self.assertEqual((len(calls), a.store.outbox), (1, []))
+        (kind, nid, message), = a.alerts.sent
+        self.assertIn("refused it (HTTP 401)", message)
+
+
+class PostResult(unittest.TestCase):
+    """post_result against a local stand-in for printAgent.php."""
+
+    def serve(self, code, reply):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        seen = {}
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                raw = self.rfile.read(int(self.headers["Content-Length"]))
+                seen.update(path=self.path, ua=self.headers.get("User-Agent"),
+                            ok=agent.verify(KEY, self.headers, "POST", self.path, raw), body=json.loads(raw))
+                data = json.dumps(reply).encode()
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        srv = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.handle_request, daemon=True).start()
+        a = fresh_agent()
+        a.result_url = f"http://127.0.0.1:{srv.server_port}/tools/webhook/printAgent.php"
+        return a, seen
+
+    def test_signed_to_new_path_with_user_agent(self):
+        self.assertTrue(fresh_agent().result_url.endswith("/tools/webhook/printAgent.php"))
+        a, seen = self.serve(200, {"ok": True})
+        os.environ.pop("http_proxy", None), os.environ.pop("HTTP_PROXY", None)
+        self.assertEqual(a.post_result({"id": 1})[0], "ok")
+        self.assertEqual((seen["path"], seen["ua"], seen["ok"]),
+                         ("/tools/webhook/printAgent.php", f"nmt-print-agent/{agent.VERSION}", True))
+
+    def test_verdicts(self):
+        os.environ.pop("http_proxy", None), os.environ.pop("HTTP_PROXY", None)
+        for code, reply, verdict in ((200, {"ok": True, "unknown": True}, "unknown"), (401, {}, "reject"),
+                                     (400, {}, "reject"), (503, {}, "retry"), (200, {"ok": False}, "retry")):
+            a, _ = self.serve(code, reply)
+            self.assertEqual(a.post_result({"id": 1})[0], verdict, (code, reply))
+
+
+class ParseJob(unittest.TestCase):
+    def test_valid_pdf(self):
+        j = agent.parse_job(body(7))
+        self.assertEqual((j["id"], j["pdf_bytes"]), (7, PDF))
+        self.assertNotIn("pdf", j)
+
+    def test_bad_requests(self):
+        big = b"%PDF-1.4\n" + b"0" * (agent.MAX_PDF + 1)
+        for b in (body(pdf=b"<html>not a pdf</html>"), body(pdf=big), b"not json", b"[]",
+                  json.dumps({"id": 1, "order": "T-1", "kind": "test", "html": "<p>x</p>"}).encode(),
+                  json.dumps({"id": 1, "order": "T-1", "kind": "test", "pdf": "%%%not base64%%%"}).encode(),
+                  body(kind="other"), body(i=0), body(order=5)):
+            self.assertIsNone(agent.parse_job(b), b[:60])
+        self.assertIsNotNone(agent.parse_job(body(pdf=b"%PDF-" + b"0" * (agent.MAX_PDF - 5))), "exactly 5 MB is fine")
+
+    def test_status_advertises_pdf(self):
+        self.assertEqual(fresh_agent().status()["formats"], ["pdf"])
+
+
+class AlertsOnOutcome(unittest.TestCase):
+    def test_failed_and_uncertain_alert_printed_does_not(self):
+        a = fresh_agent()
+        for i, outcome in ((21, "printed"), (22, "failed"), (23, "uncertain")):
+            a.accept(job(i))
+            a.store.queue.remove(i)
+            a.finish(i, outcome, 1, 1 if outcome != "printed" else 2, None if outcome == "printed" else "media-jam")
+        self.assertEqual([(k, n) for k, n, _ in a.alerts.sent],
+                         [("create", "nmt_print_agent_job_22"), ("create", "nmt_print_agent_job_23")])
+        self.assertNotIn("%PDF", " ".join(m for _, _, m in a.alerts.sent), "no job content in alerts")
+
+    def test_printer_alert_once_per_incident_then_cleared(self):
+        a = fresh_agent()
+        a.printer.snap = snap(["media-empty"])
+        a.accept(job(31))
+        a.accept(job(32))
+        self.assertEqual([(k, n) for k, n, _ in a.alerts.sent], [("create", agent.PRINTER_ALERT)])
+        self.assertIn("media-empty", a.alerts.sent[0][2])
+        a.printer_ok()
+        a.printer_ok()
+        self.assertEqual([k for k, _, _ in a.alerts.sent], ["create", "dismiss"])
 
 
 if __name__ == "__main__":

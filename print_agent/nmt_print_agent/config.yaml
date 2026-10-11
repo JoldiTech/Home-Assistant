@@ -1,5 +1,5 @@
 name: NMT Print Agent
-version: "1.0.0"
+version: "1.1.0"
 slug: nmt_print_agent
 description: >-
   Prints pickup orders pushed by the dashboard on the downtown printer and
@@ -13,6 +13,8 @@ startup: application
 # The agent listens on 8080 inside the add-on network only. The Cloudflare
 # tunnel reaches it as http://local-nmt-print-agent:8080; no host port is mapped.
 watchdog: "tcp://[HOST]:[PORT:8080]"
+# Raises persistent notifications in Home Assistant when a job cannot print.
+homeassistant_api: true
 options:
   dashboard_url: https://dashboard.nmteaco.com
   signing_key: ""
