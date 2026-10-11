@@ -113,6 +113,17 @@ Connect with `ssh aibox` (set up by the same SessionStart hook / Setup script as
   (`sensor.cyberpower_*`); `script.wake_ai_box` sends WoL (MAC
   `a8:5e:45:e6:62:1f`) to restart the box after an outage shutdown, since the
   UPS never lets the PSU see AC drop. WoL persisted via `wol-enable.service`.
+  **HA reads NUT at `192.168.22.6:3493`**, and upsd used to lose that bind on
+  every reboot (it started before the LAN IP existed, logged `not listening on
+  192.168.22.6`, and served loopback only), leaving every `sensor.cyberpower_*`
+  unavailable. Fixed 2026-10-11 by the drop-in
+  `/etc/systemd/system/nut-server.service.d/wait-for-lan-ip.conf` (waits up to
+  30 s for the address). If the sensors are unavailable after a reboot, check
+  `ss -ltn | grep 3493`, then reload HA's NUT config entry (it sits in
+  `setup_retry` backoff and doesn't notice the port coming back on its own).
+- **Kernel runs with `init_on_free=1`** (`/etc/default/grub.d/90-init-on-free.cfg`,
+  added 2026-10-11): freed pages are zeroed immediately, which is what makes
+  Chloe's "shut down models" restart a real memory wipe.
 - **Bulk downloads ride the backup line:** `via-att <command>` on the box runs
   anything with egress pinned to the AT&T dongle (dedicated `dl` user +
   uidrange ip rule -> table 107, asserted by `dl-route.service` at boot and a
