@@ -53,4 +53,7 @@ check "$cur" && echo "PASS  captains.env updated; datalog API accepts the token"
 REMOTE_SCRIPT
 )
 enc=$(printf '%s' "$REMOTE" | base64 -w0)
-printf '%s\n' "$DATALOG_API_TOKEN" | timeout 120 ssh -o BatchMode=yes aibox "echo $enc | base64 -d | bash"
+# The script goes in as an argument, not on stdin: stdin carries the token, and
+# a script piped into bash would have its own `read` consume the script's next
+# line instead of the token.
+printf '%s\n' "$DATALOG_API_TOKEN" | timeout 120 ssh -o BatchMode=yes aibox "bash -c \"\$(echo $enc | base64 -d)\""
