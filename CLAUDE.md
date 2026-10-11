@@ -876,6 +876,37 @@ the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
 - **Password:** change it in-app (Settings → change password), not by editing
   files. `/etc/nmteaco/imagegen.env` only seeds the very first start. Never commit it.
 
+### Downtown print agent (HA add-on `local_nmt_print_agent`)
+
+Pickup orders print on the downtown **HP LaserJet M203dw** (192.168.22.238,
+UniFi fixed IP since 2026-10-11, Wi-Fi, MAC `5c:fb:3a:0d:80:7e`). The dashboard
+pushes each job to the add-on through `print-downtown.nmteaco.com` (Cloudflare
+Access, service token `dashboard-print`) → `http://local-nmt-print-agent:8080`.
+The add-on renders HTML to a Letter PDF (WeasyPrint) and prints through a
+driverless CUPS queue inside its container. It confirms each job with the SNMP
+page counter (`1.3.6.1.2.1.43.10.2.1.4.1.1`) and posts the outcome, signed, to
+`<dashboard>/tools/orders/curbsideAgent.php`. Plan/contract:
+`print_agent/INSTRUCTIONS.md`; what was done: `print_agent/PHASE2-4-REPORT.md`.
+
+- **Source:** `print_agent/nmt_print_agent/` → copied to `/local_apps/nmt_print_agent`
+  on the box (`/local_apps`, not `/addons/local`). After an edit: copy it, bump
+  `version` in `config.yaml`, `ha store reload`, `ha apps rebuild local_nmt_print_agent`.
+  The aarch64 build takes ~15+ min on the Green.
+- **Tests:** `python3 print_agent/tests/test_agent.py` (unit, no deps);
+  `print_agent/tests/e2e.py` (needs docker: real image vs a fake CUPS printer).
+  Live: `print_agent/tests/remote_request.py status|print <id>` signs with
+  `PRINT_AGENT_SIGNING_KEY` and sends from inside the box. **Test job ids start at
+  2100000001**: a test id that collides with a real dashboard job id would make
+  the agent answer "duplicate" and never print that order.
+- **Never print twice:** a job id is persisted before CUPS sees it. A job in
+  flight at restart, or still unfinished after 3 min, is reported `uncertain`
+  (staff decide) and is never `failed`, because the dashboard resends `failed`
+  jobs under a new id.
+- **State from IPP, count from SNMP:** `hrPrinterStatus` reads `other` while the
+  M203 sleeps, and IPP has no page counter.
+- **Logs** carry ids, order numbers, page deltas and errors only, never job
+  HTML or header values. Keep it that way.
+
 ### Store open/close automations (lights & music)
 
 - `script.store_open` → `all_lights_on` + `music_on`; `script.store_close` →
