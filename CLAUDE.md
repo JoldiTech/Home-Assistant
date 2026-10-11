@@ -166,12 +166,30 @@ environment — they live only on the box itself:
   without touching the rack. **It ALSO works on the legacy admin API**
   (`/proxy/network/api/s/default/...` — stat/health, stat/device), which is
   where WAN detail lives that the integration API omits.
-- **Store dual-WAN (UDM Pro Max):** WAN1 eth8 = AT&T Internet Air (via the
-  same AT&T box the AI-box dongle uses, `192.168.1.x`); WAN2 eth7 = T-Mobile
-  (`192.168.12.x`, egress `172.59.x`). Both monitored by the UDM; failover is
-  automatic. After a full rack power-cycle the UDM may sit on WAN2 without
-  failing back unless failback is enabled. UniFi Talk is installed but has NO
-  integration API - its endpoints reject API keys (admin session only).
+- **Store dual-WAN (UDM Pro Max)** — names and ports as the live config has
+  them (an earlier note here had them backwards): **"Internet 1" = T-Mobile**
+  on eth7 (UniFi calls it "WAN1 … port 8"; `192.168.12.x`, double-NAT behind
+  T-Mobile's gateway, CGNAT egress `172.59.x`) and **"Internet 2" = AT&T
+  Internet Air** on eth8 (`192.168.1.x`, the same AT&T box the AI-box dongle
+  uses, egress `99.104.177.57`). **Since 2026-10-11 AT&T is primary**
+  (priority 1, `weighted`) and T-Mobile is backup (priority 2,
+  `failover-only`): T-Mobile was dropping ~33 s at a time, 7–9×/day (71
+  failovers in 30 days), which cuts every call in progress. To swap priorities
+  through the API, move one WAN to a temporary priority 3 first — two WANs
+  can't share a priority even mid-edit (`WanFailOverPriorityAlreadyExists`).
+  UniFi Talk is installed (native Talk service; the "Allow Anveo" firewall
+  policy is a leftover from an old SIP trunk) and has NO integration API — its
+  endpoints reject API keys (admin session only).
+- **Talk phones must stay wired.** The two G3 Touch phones have Wi-Fi 5 built
+  in and had joined "NM Tea Co." *as well as* being plugged in, registering
+  with Talk over Wi-Fi and swapping IPs with their wired side (181
+  `CLIENT_IP_CONFLICT`s in 30 days) — the prime suspect for calls cutting out
+  at ~30 s with no outgoing audio. Talk has no remote Wi-Fi toggle, and UniFi
+  refuses to block a UniFi device (`BlockUnifiDeviceForbidden`), so since
+  2026-10-11 the SSID carries a **MAC deny filter** for the phones' Wi-Fi
+  MACs `84:78:48:52:78:97` (Main Store Phone) and `84:78:48:32:04:15`; their
+  wired MACs are `…78:96` (port 16) and `…04:14` (port 4). A new Talk phone
+  needs its Wi-Fi MAC (wired MAC + 1) added to that list.
 - Any future systemd service on this box should read secrets via
   `EnvironmentFile=/etc/nmteaco/protect.env`, never hardcode them.
 
