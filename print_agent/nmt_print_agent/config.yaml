@@ -1,0 +1,31 @@
+name: NMT Print Agent
+version: "1.0.0"
+slug: nmt_print_agent
+description: >-
+  Prints pickup orders pushed by the dashboard on the downtown printer and
+  reports back whether paper came out.
+arch:
+  - aarch64
+  - amd64
+init: false
+boot: auto
+startup: application
+# The agent listens on 8080 inside the add-on network only. The Cloudflare
+# tunnel reaches it as http://local-nmt-print-agent:8080; no host port is mapped.
+watchdog: "tcp://[HOST]:[PORT:8080]"
+options:
+  dashboard_url: https://dashboard.nmteaco.com
+  signing_key: ""
+  agent_name: downtown
+  printer_uri: ipp://192.168.22.238/ipp/print
+  printer_ip: 192.168.22.238
+  snmp_community: public
+  listen_port: 8080
+schema:
+  dashboard_url: url
+  signing_key: password
+  agent_name: str
+  printer_uri: str
+  printer_ip: str
+  snmp_community: str
+  listen_port: port

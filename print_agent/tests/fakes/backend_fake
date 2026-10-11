@@ -1,0 +1,9 @@
+#!/bin/sh
+# CUPS backend for the fake printer: discard the document, run print_cmd.sh.
+if [ $# -eq 0 ]; then
+  echo 'direct fake "Unknown" "Fake printer"'
+  exit 0
+fi
+cat > /dev/null
+SHARED=/shared /fakes/print_cmd.sh "job-$1" || exit 1
+exit 0
