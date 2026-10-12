@@ -19,6 +19,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import queue
@@ -34,10 +35,12 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import handlers
 import ipp
 import snmp
+import store_requests
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 
 
 def container_env(name, default=None):
@@ -61,6 +64,7 @@ def _env_num(name, default):
 
 DATA = os.environ.get("NMT_DATA", "/data")
 STATE_FILE = os.path.join(DATA, "state.json")
+REQUESTS_FILE = os.path.join(DATA, "requests.json")  # typed requests; printing never reads it
 SPOOL = os.path.join(DATA, "spool")
 CUPS_QUEUE = "downtown"
 CUPS_URI = f"ipp://localhost:631/printers/{CUPS_QUEUE}"
@@ -381,6 +385,38 @@ def iso(ts):
     return time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(ts)) if ts else None
 
 
+def container_network():
+    """The add-on's own side of the network, read without sending anything:
+    the default route's interface from /proc, and the source address the
+    kernel would pick for the LAN (a UDP connect() sends no packet)."""
+    out = {"interface": None, "container_ip": None, "mode": "unknown"}
+    try:
+        with open("/proc/net/route") as f:
+            for line in f.readlines()[1:]:
+                parts = line.split()
+                if len(parts) > 2 and parts[1] == "00000000":
+                    out["interface"] = parts[0]
+                    break
+    except OSError:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("192.168.22.1", 9))
+            out["container_ip"] = s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        pass
+    if out["container_ip"]:
+        ip = ipaddress.ip_address(out["container_ip"])
+        if ip in ipaddress.ip_network("172.30.32.0/23"):
+            out["mode"] = "Home Assistant bridge network (host_network: false); LAN traffic is NATed via the host"
+        elif ip in ipaddress.ip_network("192.168.22.0/24"):
+            out["mode"] = "host network"
+    return out
+
+
 def job_label(job):
     return "Test page" if job.get("kind") == "test" else f"Order {job.get('order')}"
 
@@ -413,6 +449,9 @@ class Agent:
         self.current = None  # job id being printed
         self.ha = HomeAssistant()
         self.printer_alerted = False
+        self.started = time.time()
+        self.registers, registry = handlers.build(opts)
+        self.requests = store_requests.Engine(REQUESTS_FILE, registry, log)
 
     def printer_blocked(self, reason):
         """An order wants to print and the printer can't: one alert per
@@ -713,7 +752,109 @@ class Agent:
         return {"agent": self.name, "version": VERSION, "formats": ["pdf"],
                 "printer": {"reachable": snap["reachable"], "state": snap["state"],
                             "reasons": snap["reasons"], "page_count": snap["page_count"]},
-                "queue": queued}
+                "queue": queued,
+                # Additive since 1.3.0; the dashboard's print client ignores them.
+                "agent_api": store_requests.API_VERSION,
+                "handlers": ["print"] + sorted(self.requests.handlers)}
+
+    # ---- the general agent API (/v1) ---------------------------------------
+
+    def capabilities(self):
+        snap = self.printer.current()
+        return {
+            "agent_api": store_requests.API_VERSION, "agent": self.name, "version": VERSION,
+            "routes": ["GET /status", "POST /print", "GET /v1/capabilities", "GET /v1/targets",
+                       "GET /v1/diagnostics", "POST /v1/requests", "GET /v1/requests/{request_id}"],
+            "auth": "Cloudflare Access service token, then X-NMT-Timestamp and X-NMT-Signature: HMAC-SHA256 over "
+                    "timestamp \\n METHOD \\n path \\n body (empty for GET), clock within 300 s",
+            "request_envelope": {
+                "version": store_requests.API_VERSION,
+                "request_id": "8-128 characters of A-Z a-z 0-9 . _ : - (used as-is in /v1/requests/{request_id})",
+                "type": "a handler below", "target": "a configured target id for that handler",
+                "dry_run": "true or false, required", "expires_at": "ISO-8601 UTC, e.g. 2026-01-01T00:00:00Z, "
+                "no later than the handler's max_ttl_s ahead", "payload": "the handler's object",
+            },
+            "max_body_bytes": store_requests.MAX_BODY,
+            "idempotency": {"exact_repeat": "200 with the stored result, never run twice",
+                            "same_id_other_content": "409 (dry_run is part of the content: a dry-run id can never go live)",
+                            "retention_s": store_requests.RETENTION_S, "max_records": store_requests.MAX_RECORDS},
+            "http": {"202": "accepted", "200": "status or exact repeat", "401": "signature or clock",
+                     "404": "unknown request id", "409": "request_id reused for other content",
+                     "410": "already expired", "413": "body too large", "422": "invalid content",
+                     "429": "rate limited", "503": "handler unavailable or queue full"},
+            "error_shape": {"agent_api": 1, "error": {"code": "stable_code", "message": "short, safe"}},
+            "handlers": [
+                {"type": "print", "version": VERSION, "route": "POST /print (not /v1/requests)",
+                 "available": snap["reachable"] and not snap["blocking"], "formats": ["pdf"]},
+            ] + [h.capability() for h in self.requests.handlers.values()],
+            "limitations": [
+                "The add-on runs on Home Assistant's internal bridge network, so it cannot broadcast to the "
+                "store LAN; caller-ID records go by unicast to one configured register.",
+                "UDP gives no delivery receipt: 'sent' never means Revel showed or sounded anything.",
+                "Revel's caller_id setting is per station and cannot be changed through Revel's API.",
+            ],
+            "registers_config_problems": self.registers.problems,
+        }
+
+    def target_view(self, t):
+        probe = self.requests.last_for_target("diagnostic.probe", t["id"])
+        send = self.requests.last_for_target("revel.caller_id", t["id"])
+        probe_age = None
+        if probe and probe.get("at"):
+            probe_age = time.time() - store_requests.parse_utc(probe["at"])
+        return {
+            "id": t["id"], "name": t["name"], "ip": t["ip"], "revel_station": t["revel_station"],
+            "test_target": t["test"], "source": "configured (add-on options)",
+            "same_subnet_as_agent_lan": True,  # enforced when the options are read
+            "mac": None, "mac_note": "not known to the agent: the iPads use private Wi-Fi addresses",
+            "last_probe": probe, "probe_stale": probe_age is None or probe_age > 3600,
+            "last_caller_id": send,
+        }
+
+    def targets(self):
+        return {"agent_api": store_requests.API_VERSION,
+                "observed_at": store_requests.iso(time.time()),
+                "targets": [{"id": handlers.AGENT_TARGET, "name": "this agent",
+                             "types": ["diagnostic.echo"]}] +
+                           [dict(self.target_view(t), types=["diagnostic.probe", "revel.caller_id"])
+                            for t in self.registers.items.values()],
+                "problems": self.registers.problems}
+
+    def diagnostics(self):
+        """Read-only and cached: nothing here probes, scans, prints or sends."""
+        snap = self.printer.current()
+        lan = self.opts.get("lan_subnet") or "192.168.22.0/24"
+        try:
+            bcast = str(ipaddress.ip_network(lan).broadcast_address)
+        except ValueError:
+            bcast = None
+        cid = self.requests.handlers.get("revel.caller_id")
+        return {
+            "agent_api": store_requests.API_VERSION, "observed_at": store_requests.iso(time.time()),
+            "agent": {"name": self.name, "version": VERSION, "uptime_s": round(time.time() - self.started),
+                      "handlers": ["print"] + sorted(self.requests.handlers)},
+            "network": dict(container_network(), **{
+                "lan_ip": self.opts.get("lan_ip") or "192.168.22.254", "lan_subnet": lan,
+                "lan_broadcast": bcast, "lan_source": "configured (add-on options); UniFi fixed IP",
+                "broadcast_reaches_lan": False,
+                "broadcast_note": "the add-on is not on the host network; its broadcasts stay on Home Assistant's "
+                                  "internal bridge. Unicast to a LAN address is routed out through the host.",
+                "verified_findings": [
+                    {"observed": "2026-10-12", "source": "UniFi API (read-only)",
+                     "finding": "Registers and Home Assistant are on the same untagged network 'Default' "
+                                "(192.168.22.0/24); WLAN 'NM Tea Co.' has client isolation off; no firewall rule "
+                                "between them. Historical, not a live check."},
+                ],
+            }),
+            "caller_id": cid.capability() if cid else None,
+            "targets": [self.target_view(t) for t in self.registers.items.values()],
+            "queues": dict(self.requests.queue_stats(),
+                           print={"depth": len(self.store.queue) + (1 if self.current is not None else 0)}),
+            "printer": {"reachable": snap["reachable"], "state": snap["state"], "reasons": snap["reasons"],
+                        "checked": iso(snap["at"])},
+            "recent_errors": self.requests.errors(),
+            "config_problems": self.registers.problems,
+        }
 
     def accept(self, job):
         """Answer for a validated POST /print: (code, body)."""
@@ -772,6 +913,7 @@ def decide(state, timed_out, before, after, reason):
 
 
 BAD_REQUEST = {"accepted": False, "reason": "bad-request"}
+V1_GET = {"/v1/capabilities", "/v1/targets", "/v1/diagnostics"}
 
 
 def parse_job(body):
@@ -815,26 +957,55 @@ def make_handler(agent):
             self.wfile.write(data)
             log(f"{self.command} {self.path.split('?')[0][:64]} job={job_id} -> {code}")
 
-        def body(self):
+        def body(self, limit=MAX_BODY):
             n = self.headers.get("Content-Length")
             if n is None:
                 return b""
-            if not n.isdigit() or int(n) > MAX_BODY:
+            if not n.isdigit() or int(n) > limit:
                 return None
             return self.rfile.read(int(n))
+
+        def v1_get(self, path):
+            """The /v1 GET routes: (code, body), or None for an unknown path.
+            Query strings are refused so the signed path is unambiguous."""
+            if "?" in self.path:
+                return 400, store_requests.Engine.error("query_not_allowed", "the /v1 routes take no query string")
+            if path == "/v1/capabilities":
+                return 200, agent.capabilities()
+            if path == "/v1/targets":
+                return 200, agent.targets()
+            if path == "/v1/diagnostics":
+                return 200, agent.diagnostics()
+            if path.startswith("/v1/requests/"):
+                return agent.requests.get(path[len("/v1/requests/"):])
+            return None
 
         def authed(self, body):
             return verify(agent.key, self.headers, self.command, self.path.split("?")[0], body)
 
         def do_GET(self):
-            if self.path.split("?")[0] != "/status":
+            path = self.path.split("?")[0]
+            if path != "/status" and not (path in V1_GET or path.startswith("/v1/requests/")):
                 return self.reply(404, {"error": "not found"})
             body = self.body()
             if body is None or not self.authed(body):
                 return self.reply(401, {"error": "unauthorized"})
-            self.reply(200, agent.status())
+            if path == "/status":
+                return self.reply(200, agent.status())
+            code, answer = self.v1_get(path)
+            self.reply(code, answer, path.rsplit("/", 1)[-1][:64] if path.startswith("/v1/requests/") else "-")
 
         def do_POST(self):
+            if self.path == "/v1/requests":
+                body = self.body(store_requests.MAX_BODY)
+                if body is None:
+                    self.close_connection = True
+                    return self.reply(413, store_requests.Engine.error(
+                        "body_too_large", f"at most {store_requests.MAX_BODY} bytes"))
+                if not self.authed(body):
+                    return self.reply(401, {"error": "unauthorized"})
+                code, answer = agent.requests.submit(body)
+                return self.reply(code, answer, answer.get("request_id", "-"))
             if self.path.split("?")[0] != "/print":
                 return self.reply(404, {"error": "not found"})
             body = self.body()
@@ -874,6 +1045,8 @@ def main():
     agent.ha.start()
     snap = agent.printer.poll()
     agent.recover()
+    agent.requests.recover()   # never replays a send; see store_requests.Engine.recover
+    agent.requests.start()     # one worker per handler, apart from the print worker
     if snap["reachable"]:
         agent.cups.ensure_queue()
     if not snap["blocking"]:

@@ -1,9 +1,10 @@
 name: NMT Print Agent
-version: "1.2.1"
+version: "1.3.0"
 slug: nmt_print_agent
 description: >-
-  Prints pickup orders pushed by the dashboard on the downtown printer and
-  reports back whether paper came out.
+  Downtown store agent: prints pickup orders pushed by the dashboard and
+  reports whether paper came out; runs typed requests (diagnostics, Revel
+  caller-ID alerts) for the dashboard.
 arch:
   - aarch64
   - amd64
@@ -24,6 +25,31 @@ options:
   printer_ip: 192.168.22.238
   snmp_community: public
   listen_port: 8080
+  # Store agent (1.3.0). New options take these defaults on upgrade; the
+  # options above (and signing_key) are left exactly as they are.
+  lan_ip: 192.168.22.254
+  lan_subnet: 192.168.22.0/24
+  store_timezone: America/Denver
+  # off = dry runs only; test = live only to a register marked test, with
+  # the test identity below; on = live to any configured register.
+  revel_caller_id_mode: test
+  revel_caller_id_port: 3520
+  revel_caller_id_copies: 1
+  # 555-0100..0199 numbers are reserved for fiction: never a real caller.
+  revel_test_number: "505-555-0100"
+  # Revel registers, from Revel PosStation + UniFi (2026-10-12). DHCP, not
+  # reserved: check /v1/targets against Revel's station IP if a send fails.
+  revel_targets:
+    - id: pink-ipad
+      name: Pink Ipad
+      ip: 192.168.22.91
+      revel_station: 14
+      test: true
+    - id: blue-ipad
+      name: Blue Ipad
+      ip: 192.168.22.190
+      revel_station: 12
+      test: false
 schema:
   dashboard_url: url
   signing_key: password
@@ -32,3 +58,16 @@ schema:
   printer_ip: str
   snmp_community: str
   listen_port: port
+  lan_ip: str
+  lan_subnet: str
+  store_timezone: str
+  revel_caller_id_mode: list(off|test|on)
+  revel_caller_id_port: port
+  revel_caller_id_copies: int(1,8)
+  revel_test_number: "match(^\\d{3}-?\\d{3}-?\\d{4}$)"
+  revel_targets:
+    - id: "match(^[a-z0-9][a-z0-9-]{0,31}$)"
+      name: str
+      ip: str
+      revel_station: int?
+      test: bool
