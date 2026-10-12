@@ -353,7 +353,15 @@ The hook activates for all sessions once merged to the default branch.
 
 Beyond the generic connection info above, these instance-specific facts save time:
 
-- **HA version:** 2026.7.x · **Timezone:** `America/Denver` (Mountain). The REST
+- **HA version:** 2026.10.x (Core 2026.10.1 / HAOS 18.3 since 2026-10-11, from
+  2026.7.2 / 18.1; full backup `pre-updates-2026-10-11`, slug `1c3066f6`, taken
+  first) · **Timezone:** `America/Denver` (Mountain).
+- **UniFi Protect must stay ≥ 7.2.105.** Since HA 2026.9 the integration refuses
+  to set up on older Protect, which would kill every camera sensor and the
+  automations built on them. The console was on exactly 7.2.105 at the update.
+- **Shawn's Office Siren (Z-Wave node 34) is dead** since at least 05:43 MT
+  2026-10-11 (before the update round); the WallMote button-1 chirp targets it.
+  Studio Code Server was already in an error state before its 7.2.0 update. The REST
   API returns timestamps in **UTC** — convert to Mountain for anything shown to a
   human.
 - **Cameras are UniFi Protect.** AI detections surface as
@@ -876,6 +884,91 @@ the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
 - **Password:** change it in-app (Settings → change password), not by editing
   files. `/etc/nmteaco/imagegen.env` only seeds the very first start. Never commit it.
 
+### Downtown print agent (HA add-on `local_nmt_print_agent`)
+
+Pickup orders print on the downtown **HP LaserJet M203dw** (192.168.22.238,
+UniFi fixed IP since 2026-10-11, Wi-Fi, MAC `5c:fb:3a:0d:80:7e`). The dashboard
+pushes each job to the add-on through `print-downtown.nmteaco.com` (Cloudflare
+Access, service token `dashboard-print`) → `http://local-nmt-print-agent:8080`.
+Since v1.1.0 the dashboard sends each order as a finished **PDF** (base64 in
+`POST /print`), and the add-on prints it unchanged through a driverless CUPS
+queue inside its container; nothing is rendered on the box. `/status` reports
+`formats: ["pdf"]`, which is the dashboard's switch: without it the dashboard
+falls back to emailing the printer. Each job is confirmed with the SNMP page
+counter (`1.3.6.1.2.1.43.10.2.1.4.1.1`), and the outcome is posted, signed, to
+`<dashboard>/tools/webhook/printAgent.php`. Plan/contract:
+`print_agent/INSTRUCTIONS.md` + `print_agent/INSTRUCTIONS-UPDATE-PDF.md`; what
+was done: `print_agent/PHASE2-4-REPORT.md`.
+
+- **Source:** `print_agent/nmt_print_agent/` → copied to `/local_apps/nmt_print_agent`
+  on the box (`/local_apps`, not `/addons/local`). After an edit: copy it, bump
+  `version` in `config.yaml`, `ha store reload`, `ha apps rebuild local_nmt_print_agent`.
+  The aarch64 build takes ~15+ min on the Green.
+- **Tests:** `python3 print_agent/tests/test_agent.py` (unit, no deps);
+  `print_agent/tests/e2e.py` (needs docker: real image vs a fake CUPS printer).
+  Live: `print_agent/tests/remote_request.py status|print <id>` signs with
+  `PRINT_AGENT_SIGNING_KEY` and sends from inside the box. **Test job ids start at
+  2100000001**: a test id that collides with a real dashboard job id would make
+  the agent answer "duplicate" and never print that order. Used so far:
+  2100000001, 2100000007, 2100000010, 2100000011.
+- **Never print twice:** a job id is persisted before CUPS sees it. A job in
+  flight at restart, or still unfinished after 3 min, is reported `uncertain`
+  (staff decide) and is never `failed`, because the dashboard resends `failed`
+  jobs under a new id.
+- **Result delivery** retries 4 times on a network error or 5xx (5 s, 30 s,
+  2 min, 5 min; the owner's limit), stops at once on a 4xx, and stops quietly on
+  `{"ok":true,"unknown":true}`. Giving up raises an HA alert.
+- **HA alerts** (`homeassistant_api: true`, persistent notifications): an order
+  `failed` or `uncertain`, a result not reported, or the printer blocking an
+  order (one per incident, dismissed when it recovers). The token is read from
+  `/run/s6/container_environment`, because s6 starts the agent with a clean env.
+- **Store State panel** (DowntownControls → Store view, first section): an
+  "Instore Order Printing" block shows the agent's `sensor.instore_order_printing`
+  (status tile, colour by state), toner and drum gauges from the IPP
+  integration, and a "Last 3 print jobs" markdown table, all in one
+  vertical stack (the owner wanted them stacked). The cards live in
+  `print_agent/dashboard/`; `apply_store_panel.py` (needs `websocket-client`)
+  re-applies them over the websocket API and replaces only the cards from the
+  "Instore Order Printing" heading to the end of that section. Back up the
+  storage file first. The entity is pushed by the agent (no unique_id), so
+  after an HA restart it reappears within 30 s.
+- **State from IPP, count from SNMP:** `hrPrinterStatus` reads `other` while the
+  M203 sleeps, and IPP has no page counter. The M203 reports `spool-area-full`
+  while it is receiving a job; that is busy, not blocked (v1.2.1).
+- **Dashboard job ids are small** (1, 2, … since the 2026-10-11 switch-over), so
+  test ids from 2100000001 can't collide.
+- **Logs** carry ids, order numbers, page deltas and errors only, never job
+  HTML or header values. Keep it that way.
+- **Store agent (1.3.0, 2026-10-12): typed requests beside printing.**
+  `GET /v1/capabilities|targets|diagnostics`, `POST /v1/requests`,
+  `GET /v1/requests/{id}`, same Access token + HMAC. Own state file
+  (`/data/requests.json`), own worker and bounded queue per handler, so it
+  cannot stall printing; `/print` and `/status` are unchanged (two additive
+  `/status` keys). Handlers: `diagnostic.echo`, `diagnostic.probe` (ping),
+  `revel.caller_id`. Contract and report: `print_agent/STORE-AGENT-REPORT.md`.
+  Dashboard side (live since 2026-10-12, dashboard `bd3c8da`):
+  `datalog/store_agent.php` + `docs/store-agent-test.py` (safe run 18/18).
+- **Revel caller ID facts (verify, don't assume):** CallerID.com Ethernet
+  Link record, 83 bytes (21-byte binary header + 62 ASCII), UDP 3520; real
+  units broadcast, but the add-on is on HA's bridge network
+  (172.30.33.x, NATed), so it **cannot broadcast to the LAN** — it unicasts
+  to one configured register. Revel's `PosStation.caller_id` was **false on
+  every station** on 2026-10-12 and is **read-only in Revel's API** (Revel
+  Support or the console sets it per station); until it is on, the register
+  is not listening and nothing appears. In Revel the pop-up's **Answer**
+  opens a customer window/order — staff must dismiss a test with **Hang up**.
+  `sent` only means the bytes left; display/sound are only known at the iPad.
+- **Registers** (Revel PosStation + UniFi, 2026-10-12): Pink Ipad station 14
+  `192.168.22.91` (`pink-ipad`, the test target), Blue Ipad station 12
+  `192.168.22.190` (`blue-ipad`). Wi-Fi "NM Tea Co.", private MACs, **DHCP
+  without reservations** — if a send fails, compare `/v1/targets` with
+  Revel's station IP (`store_agent.php?action=targets&revel=1`). "Mobile
+  Station" (station 1) last used Revel 2026-09-16; not configured. iPads
+  don't answer ping while asleep.
+- **New options take their config.yaml defaults on upgrade** (the Supervisor
+  merges defaults under the saved options), so adding options never needs the
+  options API and never risks `signing_key`.
+
 ### Store open/close automations (lights & music)
 
 - `script.store_open` → `all_lights_on` + `music_on`; `script.store_close` →
@@ -887,8 +980,31 @@ the box, run as the `imagegen.service` systemd unit (`~/imagegen-env` venv).
   chirp on Shawn's Office Siren (`wallmote_btn1_siren_beep`; that siren is
   notification-only — the alarm uses the other siren). A morning automation
   also runs `store_open` on the first person seen 9–10am on Tea Two Neo.
-- `input_select.store_state` (Open/Closed/Armed) was left an **orphaned helper**
-  after the incident below (as of 2026-07-19 nothing acted on it).
+- **`input_select.store_state` (Open/Closed/Armed) is a STATUS, never a control**
+  (rewired 2026-10-11 at the owner's request). What sets it:
+  - `script.store_open` / `script.store_close` set Open / Closed as their first
+    step, so the morning auto-open, WallMote buttons 4/3 and the dashboard
+    buttons all update it;
+  - `automation.store_state_armed_15_min_after_closing`: Open → Closed held
+    15 min → Armed (a state trigger with `for`; an HA restart inside the 15 min
+    cancels it);
+  - `automation.store_state_armed_back_to_closed_at_9am`: 09:00, if Armed →
+    Closed.
+
+  **Nothing may act on it.** Don't trigger lights, music or `store_close` from
+  it: that's exactly the 2026-07-19 blackout below. "Armed" does nothing yet;
+  the owner plans to use it later, and anything hung on it must use an explicit
+  `to: Armed` trigger plus guards, created after hours. On the Store view it's
+  the three coloured state tiles, each with a `select-options` (buttons style)
+  control (`dashboard/apply_store_controls.py`). On a day nobody opens the
+  store it stays Closed and never arms, because arming needs an Open → Closed
+  change.
+- Master Controls' **Store Close** and **All Lights Off** buttons ask for
+  confirmation (one tap used to black out the store).
+- `sensor.sonos_group_status` / `binary_sensor.speakers_grouped` are UI template
+  helpers (edit them in Settings → Helpers, or via the options flow). Their
+  templates return `none` while `group_members` is empty at startup; they used
+  `| default([])`, which doesn't catch None, and errored on every restart.
 
 ### ⚠️ Incident 2026-07-19: live automation experiment blacked out the store
 

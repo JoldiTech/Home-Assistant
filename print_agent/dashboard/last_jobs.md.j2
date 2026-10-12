@@ -1,0 +1,22 @@
+{%- set s = states.sensor.instore_order_printing -%}
+{%- if s is none or s.state in ['unknown', 'unavailable'] -%}
+⚠️ The print agent isn't reporting. Orders fall back to email until it's back.
+{%- else -%}
+{%- set jobs = s.attributes.last_jobs or [] -%}
+{%- set icons = {'printed': '✅', 'failed': '❌', 'uncertain': '⚠️', 'printing': '🖨️', 'queued': '⏳'} -%}
+{%- if jobs | count == 0 -%}
+No print jobs yet.
+{%- else -%}
+| | Order | When | Pages |
+|:-|:-|:-|-:|
+{%- for j in jobs %}
+| {{ icons.get(j.status, '•') }} | {{ 'Test page' if j.kind == 'test' else j.order }}{{ ' (reprint)' if j.kind == 'reprint' else '' }} | {{ (as_timestamp(j.time) | timestamp_custom('%a %-I:%M %p')) if j.time else '' }} | {{ j.pages if j.pages is not none else '–' }} |
+{%- endfor %}
+{%- for j in jobs if j.status in ['failed', 'uncertain'] %}
+
+{{ icons[j.status] }} **{{ 'Test page' if j.kind == 'test' else j.order }}** {{ 'did not print' if j.status == 'failed' else 'may not have printed' }}: {{ j.error }}
+{%- endfor %}
+{%- endif %}
+
+<sub>Page count {{ s.attributes.page_count }} · checked {{ as_timestamp(s.attributes.checked) | timestamp_custom('%-I:%M %p') }}</sub>
+{%- endif -%}
