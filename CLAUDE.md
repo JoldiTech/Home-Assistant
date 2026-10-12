@@ -939,6 +939,35 @@ was done: `print_agent/PHASE2-4-REPORT.md`.
   test ids from 2100000001 can't collide.
 - **Logs** carry ids, order numbers, page deltas and errors only, never job
   HTML or header values. Keep it that way.
+- **Store agent (1.3.0, 2026-10-12): typed requests beside printing.**
+  `GET /v1/capabilities|targets|diagnostics`, `POST /v1/requests`,
+  `GET /v1/requests/{id}`, same Access token + HMAC. Own state file
+  (`/data/requests.json`), own worker and bounded queue per handler, so it
+  cannot stall printing; `/print` and `/status` are unchanged (two additive
+  `/status` keys). Handlers: `diagnostic.echo`, `diagnostic.probe` (ping),
+  `revel.caller_id`. Contract and report: `print_agent/STORE-AGENT-REPORT.md`.
+  Dashboard side: `datalog/store_agent.php` + `docs/store-agent-test.py`
+  (patch in `print_agent/dashboard_bridge/` until it is merged there).
+- **Revel caller ID facts (verify, don't assume):** CallerID.com Ethernet
+  Link record, 83 bytes (21-byte binary header + 62 ASCII), UDP 3520; real
+  units broadcast, but the add-on is on HA's bridge network
+  (172.30.33.x, NATed), so it **cannot broadcast to the LAN** — it unicasts
+  to one configured register. Revel's `PosStation.caller_id` was **false on
+  every station** on 2026-10-12 and is **read-only in Revel's API** (Revel
+  Support or the console sets it per station); until it is on, the register
+  is not listening and nothing appears. In Revel the pop-up's **Answer**
+  opens a customer window/order — staff must dismiss a test with **Hang up**.
+  `sent` only means the bytes left; display/sound are only known at the iPad.
+- **Registers** (Revel PosStation + UniFi, 2026-10-12): Pink Ipad station 14
+  `192.168.22.91` (`pink-ipad`, the test target), Blue Ipad station 12
+  `192.168.22.190` (`blue-ipad`). Wi-Fi "NM Tea Co.", private MACs, **DHCP
+  without reservations** — if a send fails, compare `/v1/targets` with
+  Revel's station IP (`store_agent.php?action=targets&revel=1`). "Mobile
+  Station" (station 1) last used Revel 2026-09-16; not configured. iPads
+  don't answer ping while asleep.
+- **New options take their config.yaml defaults on upgrade** (the Supervisor
+  merges defaults under the saved options), so adding options never needs the
+  options API and never risks `signing_key`.
 
 ### Store open/close automations (lights & music)
 

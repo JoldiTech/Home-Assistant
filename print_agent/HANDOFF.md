@@ -1,5 +1,10 @@
 # Handoff: downtown print agent (after Phases 2–4, 2026-10-11)
 
+> **2026-10-12: now the store agent, 1.3.0.** Typed requests (`/v1`) and a
+> Revel caller-ID handler run beside printing. Start with
+> `STORE-AGENT-REPORT.md`; the dashboard bridge is
+> `dashboard_bridge/0001-datalog-store-agent-bridge.patch` until merged.
+
 - **Plan/contract:** `INSTRUCTIONS.md`. **Phase 1:** `PHASE1-REPORT.md`.
   **What was done and tested:** `PHASE2-4-REPORT.md`. Running notes in the
   CLAUDE.md "Downtown print agent" section.

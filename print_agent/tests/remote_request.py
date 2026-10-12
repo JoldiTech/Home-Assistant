@@ -11,6 +11,8 @@ body goes over ssh stdin, so neither appears on a command line.
     remote_request.py print 2100000010 --pages 3  # a 3-page test PDF
     remote_request.py print 2100000010 --not-pdf  # expect 400 bad-request
     remote_request.py print 2100000010 --bad-sig  # or --old-ts / --unsigned
+    remote_request.py get /v1/capabilities        # any GET route (signed)
+    remote_request.py post /v1/requests req.json  # POST a JSON file (signed)
 """
 
 import argparse
@@ -31,8 +33,9 @@ from testpdf import make_pdf  # noqa: E402
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("what", choices=["status", "print"])
-    p.add_argument("job", nargs="?", type=int)
+    p.add_argument("what", choices=["status", "print", "get", "post"])
+    p.add_argument("job", nargs="?")
+    p.add_argument("file", nargs="?")
     p.add_argument("--bad-sig", action="store_true")
     p.add_argument("--old-ts", action="store_true")
     p.add_argument("--unsigned", action="store_true")
@@ -43,7 +46,14 @@ def main():
 
     if a.what == "status":
         method, path, body = "GET", "/status", b""
+    elif a.what == "get":
+        method, path, body = "GET", a.job, b""
+    elif a.what == "post":
+        method, path = "POST", a.job
+        with open(a.file, "rb") as f:
+            body = f.read()
     else:
+        a.job = int(a.job)
         method, path = "POST", "/print"
         pdf = b"<!doctype html><p>not a pdf</p>" if a.not_pdf else make_pdf(pages=a.pages)
         body = json.dumps({"id": a.job, "order": f"TEST-{a.job}", "kind": "test",
