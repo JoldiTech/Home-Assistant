@@ -946,8 +946,8 @@ was done: `print_agent/PHASE2-4-REPORT.md`.
   cannot stall printing; `/print` and `/status` are unchanged (two additive
   `/status` keys). Handlers: `diagnostic.echo`, `diagnostic.probe` (ping),
   `revel.caller_id`. Contract and report: `print_agent/STORE-AGENT-REPORT.md`.
-  Dashboard side: `datalog/store_agent.php` + `docs/store-agent-test.py`
-  (patch in `print_agent/dashboard_bridge/` until it is merged there).
+  Dashboard side (live since 2026-10-12, dashboard `bd3c8da`):
+  `datalog/store_agent.php` + `docs/store-agent-test.py` (safe run 18/18).
 - **Revel caller ID facts (verify, don't assume):** CallerID.com Ethernet
   Link record, 83 bytes (21-byte binary header + 62 ASCII), UDP 3520; real
   units broadcast, but the add-on is on HA's bridge network

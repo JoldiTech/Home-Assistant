@@ -3,14 +3,12 @@
 Done 2026-10-12, 03:40–04:10 MT (store closed). Brief:
 `NM_Tea_Store_Agent_Revel_Handoff.md` (12 October 2026).
 
-**Status in one line:** the agent side is **deployed on Green (1.3.0) and
-verified on the LAN**, with printing unaffected. The Datalog bridge is
-**written and tested end to end against the real agent code, but not
-deployed**: this session has read-only access to the dashboard repository.
-So the handoff's bar, "testable remotely by the dashboard AI through
-Datalog", **is not met until the bridge is merged**. No live caller-ID record
-has been sent to a real register, and Revel would ignore one today anyway
-(see Revel below).
+**Status in one line:** the agent is **deployed on Green (1.3.0)** and the
+Datalog bridge is **live on the dashboard** (merged to `main` as `bd3c8da`,
+2026-10-12 10:12 UTC). The safe remote acceptance run through Datalog
+passed **18/18** (run `dash:20261012T101237:1186b8`). Printing is
+unaffected. No live caller-ID record has been sent to a real register, and
+Revel would ignore one today anyway (see Revel below).
 
 ## Versions and where things are
 
@@ -18,9 +16,9 @@ has been sent to a real register, and Revel would ignore one today anyway
 |---|---|
 | Home-Assistant repo | branch `claude/bold-davinci-uxje1c` (built on `ccr-7d0e6fa1-2ia932`, which held the deployed 1.2.1 source byte-for-byte) |
 | Green | add-on `local_nmt_print_agent` **1.3.0**, started, boot auto, watchdog on |
-| Dashboard | **unchanged in production.** Bridge commit prepared as `print_agent/dashboard_bridge/0001-datalog-store-agent-bridge.patch` (`git am` it onto `main` of New-Mexico-Tea-Company-Server) |
+| Dashboard | New-Mexico-Tea-Company-Server `main` `bd3c8da` (branch `claude/store-agent-bridge`, commit `9f60fb0`): `dashboard/tools/datalog/store_agent.php`, `docs/store-agent-test.py`, CLAUDE.md |
 | Agent URL | `https://print-downtown.nmteaco.com` (unchanged tunnel route `http://local-nmt-print-agent:8080`, Access-protected) |
-| Bridge URL (after merge) | `https://dashboard.nmteaco.com/tools/datalog/store_agent.php` |
+| Bridge URL | `https://dashboard.nmteaco.com/tools/datalog/store_agent.php` (live) |
 
 ## Credentials (names only)
 
@@ -161,9 +159,19 @@ blocks neither echo nor printing, reads change nothing.
 
 **Against the handoff's remote sequence (through Datalog):**
 
+Run `dash:20261012T101237:1186b8`, `python3 docs/store-agent-test.py` from
+this sandbox with only `DATALOG_API_TOKEN`: **18/18 passed.**
+
 | Step | State |
 |---|---|
-| 1–5, 7, 9, 10 | **Pending the bridge merge.** Same checks pass on the LAN and in the end-to-end harness |
+| 1 reads | status (1.3.0, `pdf`), capabilities, targets, diagnostics: all `reached: agent`, 200 |
+| 2 echo | 202 → `completed`, challenge returned (`…:echo:1`) |
+| 3 repeat / reuse | exact repeat 200 `duplicate`, attempts 1; changed content 409 |
+| 4 rejections | unknown handler 400 (bridge allowlist), unknown target 422, 19-char name 422, expired 410, no dry_run 400, version 9 422 |
+| 5 dry run | `dry_run_passed`, pink-ipad only, port 3520, 83 bytes, 0 sends; its id refused live (409) |
+| 7 live repeat | proven in the end-to-end harness; on a real register, with step 6 |
+| 9 print compatibility | `/status` fields intact through the bridge and the dashboard's own print client |
+| 10 unauthenticated | bad bearer 401 at the bridge; unsigned 401 at the agent (unit tests) |
 | 6 (one live test) | **Not run.** Needs the bridge (or a LAN run), an explicit go-ahead, Revel caller ID turned on for station 14, and a person at the Pink Ipad |
 | 8 (restart/uncertain) | Done with the isolated fixture (unit test), as the brief asks |
 
@@ -209,7 +217,6 @@ caller-ID handler, and the agent's mode is `test`.
 
 ## Remaining limitations
 
-- Remote testability waits on merging the bridge patch.
 - Revel caller ID is off everywhere and can't be switched on through the API.
 - Revel behavior (pop-up, sound, Hang up, Answer) is unobserved.
 - Unicast acceptance by Revel is unverified; broadcast is impossible from
