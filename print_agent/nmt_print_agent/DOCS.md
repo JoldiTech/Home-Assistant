@@ -3,7 +3,9 @@
 Prints pickup orders that the dashboard pushes as finished PDFs, on the
 downtown HP LaserJet M203dw, and tells the dashboard whether paper came out.
 Since 1.3.0 it also runs typed requests for the dashboard (`/v1`, below):
-diagnostics and Revel caller-ID records to one register. Printing keeps its
+diagnostics and Revel caller-ID records to one register. Since 1.4.0 it also
+runs CryptoCart's register box (below) for the counter scanners and receipt
+printer. Printing keeps its
 own route, queue and state file; a slow or failing request cannot hold it up.
 The contract is `print_agent/INSTRUCTIONS.md` (Phase 3) as amended by
 `print_agent/INSTRUCTIONS-UPDATE-PDF.md`, in the Home-Assistant repository.
@@ -26,12 +28,13 @@ The contract is `print_agent/INSTRUCTIONS.md` (Phase 3) as amended by
 | `revel_caller_id_copies` | `1`. CallerID.com sends 8 copies 40 ms apart for Wi-Fi displays; whether Revel drops repeats is unverified |
 | `revel_test_number` | `505-555-0100` (555-01xx numbers are fictional) |
 | `revel_targets` | The registers: `id`, `name`, `ip`, `revel_station`, `test` |
+| `cryptocart_company` | The company's CryptoCart address for the register box. Empty: the box stays off |
 
 ## How it is reached
 
 Only through the Cloudflare tunnel: `print-downtown.nmteaco.com` →
 `http://local-nmt-print-agent:8080`, behind Cloudflare Access (service token
-`dashboard-print`). No host port is mapped.
+`dashboard-print`). Port 8080 is never mapped to the host.
 
 ## Endpoints (both need `X-NMT-Timestamp` and `X-NMT-Signature`)
 
@@ -82,6 +85,25 @@ state `ready` / `printing` / `problem` / `unreachable`; attributes `problem`
 `last_jobs` (the three newest: id, order, kind, status, pages, error, time in
 UTC) and `checked`. Order numbers only, never job content. The "Store State"
 panel on the DowntownControls dashboard shows it.
+
+## Register box (CryptoCart)
+
+A second process beside the agent, each restarted alone by s6: CryptoCart's
+`box.mjs` on Node 26, from the CryptoCart commit named in `CHANGELOG.md`.
+Its contract is CryptoCart's `apps/pos/APP.md` section 8; nothing of it is
+written here.
+
+- It dials out to `wss://<cryptocart_company>/api/pos/box` once paired, and
+  reads the counter scanners and prints receipts as POS's settings tell it.
+- Registers on the shop's Wi-Fi reach it on host port **8443**, opened only
+  once its first certificate arrives. The certificate's address is `lan_ip`.
+- Pairing: a one-time code from POS's back office, sent as one line with the
+  `hassio.addon_stdin` service (`addon: local_nmt_print_agent`).
+- Its data is `/data/cryptocart/`. It logs JSON lines with an `event`, never a
+  scanned code.
+- It stays down, logging `box_down`, when `cryptocart_company` is empty or it
+  refuses its options at start (a `lan_ip` off the shop's network). Fix the
+  option and restart the add-on.
 
 ## Log
 

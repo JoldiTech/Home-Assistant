@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""The add-on's stdin to the register box, one pairing code per line.
+
+Under s6-overlay only CMD gets the add-on's stdin. hassio.addon_stdin
+delivers its input JSON-encoded and without a newline, so a write is also
+ended by a pause, and a JSON string is unwrapped. Lines go to a pipe both
+ends hold open read-write, so neither blocks while the other is down.
+Returning would stop the add-on, so after stdin closes this only waits.
+"""
+
+import json
+import os
+import select
+import stat
+import time
+
+FIFO = "/run/nmt-box/stdin"
+PAUSE_S = 0.5
+
+
+def fifo():
+    os.makedirs(os.path.dirname(FIFO), exist_ok=True)
+    try:
+        if not stat.S_ISFIFO(os.stat(FIFO).st_mode):
+            raise FileNotFoundError
+    except FileNotFoundError:
+        try:
+            os.mkfifo(FIFO, 0o600)
+        except FileExistsError:
+            pass
+    return os.open(FIFO, os.O_RDWR)
+
+
+def line(raw):
+    text = raw.decode("utf-8", "replace").strip()
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return text
+    return value.strip() if isinstance(value, str) else text
+
+
+def main():
+    out = fifo()
+    pending = b""
+    while True:
+        ready, _, _ = select.select([0], [], [], PAUSE_S if pending else None)
+        if not ready:
+            chunks, pending = [pending], b""
+        else:
+            data = os.read(0, 4096)
+            if not data:
+                break
+            pending += data
+            *chunks, pending = pending.split(b"\n")
+        for chunk in chunks:
+            text = line(chunk)
+            if text:
+                os.write(out, (text + "\n").encode())
+    if pending.strip():
+        os.write(out, (line(pending) + "\n").encode())
+    while True:
+        time.sleep(3600)
+
+
+if __name__ == "__main__":
+    main()

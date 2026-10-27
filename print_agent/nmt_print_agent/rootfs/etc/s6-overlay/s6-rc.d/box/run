@@ -1,0 +1,9 @@
+#!/command/with-contenv sh
+# CryptoCart's register box (CHANGELOG.md names the commit). An empty
+# cryptocart_company makes it exit 0, and finish keeps it down.
+mkdir -p /run/nmt-box
+[ -p /run/nmt-box/stdin ] || mkfifo -m 600 /run/nmt-box/stdin
+BOX_COMPANY="$(jq -r '.cryptocart_company // ""' /data/options.json)"
+BOX_LAN_IP="$(jq -r '.lan_ip // ""' /data/options.json)"
+export BOX_COMPANY BOX_LAN_IP BOX_DATA=/data/cryptocart
+exec node /opt/nmt-box/box.mjs <>/run/nmt-box/stdin
