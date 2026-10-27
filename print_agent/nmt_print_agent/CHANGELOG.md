@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.4.1
+
+- Register box 1.6.0, `box.mjs` built from CryptoCart `main` at `e5c76433`
+  with `npm run build:box -w apps/pos`, SHA-256
+  `a07fda2ca4486d5c629c78f55d30cda207749b920f2727e5347a0b31d3376d8f`, on Node
+  26.12.1. The box now looks on its own /24 (from `lan_ip`) for counter
+  scanner adapters (TCP 10001) and receipt printers (TCP 9100), connecting
+  and closing without a byte, and reports them to POS to be set up there.
+
 ## 1.4.0
 
 - CryptoCart's register box runs beside the agent as a second s6 service:

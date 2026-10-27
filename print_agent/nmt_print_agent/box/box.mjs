@@ -3856,6 +3856,7 @@ var SCAN_CODE = /^[\x20-\x7e]{1,64}$/;
 // shared/box.ts
 var MESSAGE_MAX = 65536;
 var DEVICES_MAX = 16;
+var FOUND_MAX = 64;
 var BLOCKS_MAX = 500;
 var FEED_MAX = 10;
 var DOTS_MAX = 576;
@@ -3901,7 +3902,7 @@ function devices(v, at, states) {
   });
 }
 function fromBox(raw) {
-  const { v, type } = typed(raw, ["hello", "scan", "status", "job", "journal", "csr"]);
+  const { v, type } = typed(raw, ["hello", "scan", "status", "job", "journal", "csr", "found"]);
   switch (type) {
     case "hello": {
       const f = fields(v, "hello", ["type", "key", "version"]);
@@ -3929,6 +3930,10 @@ function fromBox(raw) {
         key: text(f.get("key"), "key", BASE64_OF(400)),
         signature: text(f.get("signature"), "signature", BASE64_OF(200))
       };
+    }
+    case "found": {
+      const f = fields(v, "found", ["type", "scanners", "printers"]);
+      return { type, scanners: foundOf(f.get("scanners"), "scanners"), printers: foundOf(f.get("printers"), "printers") };
     }
     case "journal": {
       const f = fields(v, "journal", ["type", "sale", "register", "body", "at", "window", "sig", "receivedAt", "sentAt"]);
@@ -4001,6 +4006,11 @@ function drawerPin(v) {
   return v;
 }
 var address = (f) => ({ host: text(f.get("host"), "host", { max: 253, pattern: HOST }), port: between(f.get("port"), "port", 1, 65535) });
+function foundOf(v, at) {
+  const all = list(v, at);
+  if (all.length > FOUND_MAX) throw new Invalid(`${at}: more than ${String(FOUND_MAX)}`);
+  return all.map((d, i) => address(fields(d, `${at}[${String(i)}]`, ["host", "port"])));
+}
 function logoOf(v) {
   const f = fields(v, "logo", ["width", "height", "bits"]);
   const width = between(f.get("width"), "logo.width", 8, DOTS_MAX);
@@ -4084,7 +4094,7 @@ var PATHS = {
   pay: "/pos/pay",
   payOrder: "/pos/pay/order",
   receipt: "/pos/r",
-  scan: "/pos/scan",
+  scanner: "/pos/scanner",
   office: "/pos/office",
   more: "/pos/office/more",
   reports: "/pos/office/reports",
@@ -4120,7 +4130,44 @@ var PATHS = {
 var INSTALL = { manifest: "/pos/manifest.webmanifest", icons: "/pos/icons/", worker: "/pos/sw.js", scope: PATHS.sale, built: "/assets/pos" };
 var PHONE_BUILD = { folder: "phone", built: `${INSTALL.built}/phone` };
 var RECEIPT_BUILD = { folder: "receipt", built: `${INSTALL.built}/receipt` };
+var SCANNER_BUILD = { folder: "scanner", built: `${INSTALL.built}/scanner` };
 var SOCKETS = { realtime: "/api/pos/ws", box: "/api/pos/box" };
+
+// box/found.ts
+import { connect } from "node:net";
+var PORTS = { scanner: 10001, printer: 9100 };
+function answers(host, port, ms) {
+  return new Promise((resolve) => {
+    const s = connect({ host, port });
+    const done = (yes) => {
+      s.destroy();
+      resolve(yes);
+    };
+    s.setTimeout(ms, () => done(false));
+    s.once("connect", () => done(true));
+    s.once("error", () => done(false));
+  });
+}
+function neighbours(own) {
+  const parts = own.split(".");
+  const prefix = parts.slice(0, 3).join(".");
+  return Array.from({ length: 254 }, (_, i) => `${prefix}.${String(i + 1)}`).filter((a) => a !== own);
+}
+async function findOnNetwork(own, known, t, ask = answers) {
+  const all = neighbours(own).flatMap((host) => [{ host, port: PORTS.scanner }, { host, port: PORTS.printer }]).filter((a) => !known.has(`${a.host}:${String(a.port)}`));
+  const found = [];
+  let next = 0;
+  const worker = async () => {
+    while (next < all.length) {
+      const a = all[next++];
+      if (a !== void 0 && await ask(a.host, a.port, t.answerMs)) found.push(a);
+    }
+  };
+  await Promise.all(Array.from({ length: t.atOnce }, worker));
+  const order = (x, y) => Number(x.host.split(".")[3]) - Number(y.host.split(".")[3]);
+  const of = (port) => found.filter((a) => a.port === port).sort(order);
+  return { scanners: of(PORTS.scanner), printers: of(PORTS.printer) };
+}
 
 // box/link.ts
 var Link = class {
@@ -5436,7 +5483,15 @@ var OFFICE = {
     pin: (n) => `Pin ${String(n)}`,
     model: "Model",
     printerStates: { ready: "Ready", paper_low: "Paper low", paper_out: "Paper out", cover_open: "Cover open", offline: "Offline" },
-    phone: "Phone"
+    phone: "Phone",
+    at: (host, port) => `${host}:${String(port)}`,
+    foundAt: (host, port) => `Found at ${host}:${String(port)}`,
+    addPhoneScanner: "Add a phone scanner",
+    phoneScanner: "Phone scanner",
+    openOnPhone: "Open on the phone",
+    phoneLink: "Phone scanner link",
+    notSetUp: "Not set up",
+    printsFor: "Prints for"
   },
   stripe: {
     locations: "Stripe locations",
@@ -5533,22 +5588,29 @@ var OFFICE = {
     cash: "Cash",
     registers: "Registers",
     scanners: "Scanners and printers",
-    settings: "Settings",
-    scan: "Scan"
-  },
-  scan: {
-    register: "Register",
-    camera: "Camera",
-    photo: "Take a photo",
-    noCode: "No code found",
-    notACode: "Not a code",
-    noRegisters: "No registers",
-    sendAgain: "Send again",
-    sent: (ending) => `Sent \u2026${ending}`,
-    notTaken: (ending) => `Not taken \u2026${ending}`,
-    notSent: (endings) => `Not sent: ${endings.map((e) => `\u2026${e}`).join(", ")}`,
-    registerAt: (register, shop) => `${register}, ${shop}`
+    settings: "Settings"
   }
+};
+var SCANNER_PAGE = {
+  ...PAGE_WORDS,
+  title: "Scanner",
+  sendTo: "Send to",
+  camera: "Camera",
+  photo: "Take a photo",
+  noCode: "No code found",
+  notACode: "Not a code",
+  noRegisters: "No registers",
+  sendAgain: "Send again",
+  sent: (ending) => `Sent \u2026${ending}`,
+  notTaken: (ending) => `Not taken \u2026${ending}`,
+  notSent: (endings) => `Not sent: ${endings.map((e) => `\u2026${e}`).join(", ")}`,
+  notLinked: "Not linked",
+  linkCamera: "Scan the QR code from Add a phone scanner",
+  notALink: "Not a scanner QR code",
+  removed: "Scanner removed",
+  notReached: "Not reachable",
+  tryAgain: "Try again",
+  addToHome: "Share, then Add to Home Screen"
 };
 var RECEIPT_PAGE = {
   ...PAGE_WORDS,
@@ -5675,7 +5737,7 @@ function receiptBytes(doc, columns, logo) {
 }
 
 // box/printer.ts
-import { connect } from "node:net";
+import { connect as connect2 } from "node:net";
 var RETRY_MS = 500;
 var STATUS_BYTES = 3;
 var sleep = (ms) => new Promise((done) => setTimeout(done, ms));
@@ -5721,7 +5783,7 @@ var Wire = class {
 };
 function attempt(at, ms) {
   return new Promise((done) => {
-    const socket = connect({ host: at.host, port: at.port });
+    const socket = connect2({ host: at.host, port: at.port });
     const late = setTimeout(() => {
       socket.destroy();
       done(void 0);
@@ -5844,7 +5906,7 @@ var Printers = class {
 };
 
 // box/scanner.ts
-import { connect as connect2 } from "node:net";
+import { connect as connect3 } from "node:net";
 var ENDS = { auto: /\r\n|\r|\n/, cr: /\r/, lf: /\n/, crlf: /\r\n/, tab: /\t/ };
 var PARTIAL_MAX = 256;
 var JOIN_MS = 50;
@@ -5891,7 +5953,7 @@ function watchScanner(at, t, h) {
   const open = () => {
     const frame = framer(at.suffix);
     let upAt;
-    const s = connect2({ host: at.host, port: at.port });
+    const s = connect3({ host: at.host, port: at.port });
     socket = s;
     s.setKeepAlive(true, t.steadyMs);
     s.on("connect", () => {
@@ -6039,7 +6101,7 @@ var Store = class {
 };
 
 // box/version.ts
-var BOX_VERSION = "1.5.0";
+var BOX_VERSION = "1.6.0";
 
 // box/program.ts
 var TIMING = {
@@ -6048,7 +6110,8 @@ var TIMING = {
   printer: { connectForMs: 1e4, attemptMs: 2e3, statusMs: 1e3, processedMs: 3e4 },
   ackMs: 15e3,
   helloMs: 5e3,
-  pollMs: 6e4
+  pollMs: 6e4,
+  find: { answerMs: 500, atOnce: 8, firstMs: 5e3, everyMs: 9e5 }
 };
 var PRIVATE_V4 = /^(?:10\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.)/;
 var BRIDGE_V4 = /^(?:172\.17\.|172\.30\.3[23]\.)/;
@@ -6108,6 +6171,8 @@ var Box = class {
   // Certificates taken one after another, the local server started by the first
   #tls = Promise.resolve();
   #status = "";
+  #finding = false;
+  #findSoon;
   c;
   constructor(c) {
     this.c = c;
@@ -6123,7 +6188,11 @@ var Box = class {
       message: (raw) => this.#fromPos(raw),
       closed: () => this.#closed()
     });
-    this.#timers = [setInterval(() => this.#watch(), Math.min(1e3, c.timing.ackMs)), setInterval(() => this.#prune(), PRUNE_MS)];
+    this.#timers = [
+      setInterval(() => this.#watch(), Math.min(1e3, c.timing.ackMs)),
+      setInterval(() => this.#prune(), PRUNE_MS),
+      setInterval(() => void this.#find(), c.timing.find.everyMs)
+    ];
     const settings = this.#store.settings();
     if (settings !== void 0) this.#apply(settings);
   }
@@ -6157,6 +6226,7 @@ var Box = class {
   }
   async stop() {
     for (const t of this.#timers) clearInterval(t);
+    clearTimeout(this.#findSoon);
     this.#link.stop();
     for (const w of this.#scanners.values()) w.stop();
     this.#printers.stop();
@@ -6195,6 +6265,24 @@ var Box = class {
   #opened() {
     this.#changed(true);
     this.#flush();
+    clearTimeout(this.#findSoon);
+    this.#findSoon = setTimeout(() => void this.#find(), this.c.timing.find.firstMs);
+  }
+  // The scanners and printers on the shop's network the box doesn't drive yet, told to POS, which lists them for the
+  // owner to set up; one look at a time, and only while POS hears it
+  async #find() {
+    const own = (this.c.address ?? shopAddress)();
+    if (this.#finding || own === void 0 || !this.#link.isOpen()) return;
+    this.#finding = true;
+    try {
+      const known = new Set([...this.#settings?.scanners ?? [], ...this.#settings?.printers ?? []].map((d) => `${d.host}:${String(d.port)}`));
+      const found = await findOnNetwork(own, known, this.c.timing.find);
+      if (this.#link.isOpen()) this.#link.send(written2({ type: "found", ...found }));
+    } catch (err) {
+      log("find_failed", { error: String(err) });
+    } finally {
+      this.#finding = false;
+    }
   }
   // A sale given up on stays on disk and is offered again at the next prune
   #closed() {

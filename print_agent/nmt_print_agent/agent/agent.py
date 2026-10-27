@@ -40,7 +40,7 @@ import ipp
 import snmp
 import store_requests
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 
 def container_env(name, default=None):
