@@ -89,7 +89,7 @@ panel on the DowntownControls dashboard shows it.
 ## Register box (CryptoCart)
 
 A second process beside the agent, each restarted alone by s6: CryptoCart's
-`box.mjs` on Node 24, from the CryptoCart commit named in `CHANGELOG.md`.
+`box.mjs` on Node 26, from the CryptoCart commit named in `CHANGELOG.md`.
 Its contract is CryptoCart's `apps/pos/APP.md` section 8; nothing of it is
 written here.
 

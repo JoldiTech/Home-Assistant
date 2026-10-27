@@ -3,7 +3,7 @@ FROM ${BUILD_FROM}
 
 # CUPS with a driverless (IPP Everywhere) queue. Jobs arrive as finished PDFs;
 # nothing is rendered here. iputils-ping for diagnostic.probe, tzdata so
-# caller-ID records carry the shop's local time.
+# caller-ID records carry the shop's local time. libatomic1 for Node 26.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -11,14 +11,15 @@ RUN apt-get update \
         cups-client \
         cups-filters \
         iputils-ping \
+        libatomic1 \
         python3 \
         tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # Node for CryptoCart's register box: the nodejs.org build, only bin/node.
-ARG NODE_VERSION=24.22.1
-ARG NODE_SHA256_ARM64=33c37be234ba8bee041961047b19160f4d7d0f164e8e246f78bdd10feff148b3
-ARG NODE_SHA256_X64=eb6728e77c576a35162c122c45ccadf224d89ff00abc8dae46cc2897c6002d7c
+ARG NODE_VERSION=26.12.1
+ARG NODE_SHA256_ARM64=a6c01af459dd8972ab3fb08ee5da81244d26ba8c4944a62d5bbba8c597ae154f
+ARG NODE_SHA256_X64=0fd1eb7770598f52a21995edf6ed35fc690400fa437c2386af329519e9143132
 RUN case "$(dpkg --print-architecture)" in \
         arm64) arch=arm64; sum="${NODE_SHA256_ARM64}" ;; \
         amd64) arch=x64;   sum="${NODE_SHA256_X64}" ;; \
