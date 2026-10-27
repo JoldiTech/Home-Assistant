@@ -189,11 +189,18 @@ def main():
         before = tree(data)
         n = len(conns)
         code = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
+        # hassio.addon_stdin's form: the input JSON-encoded, no newline
+        proc.stdin.write(json.dumps(code))
+        proc.stdin.flush()
+        check("stdin: hassio.addon_stdin's JSON string reaches the box as a pairing code, sent to the company",
+              wait_for(lambda: logs("box").count('"event":"pair_failed"') == 1, 30)
+              and len(open(os.path.join(SHARED, "conns.log")).read().split()) > n, logs("box")[-800:])
+        n2 = len(open(os.path.join(SHARED, "conns.log")).read().split())
         proc.stdin.write(code + "\n")
         proc.stdin.flush()
-        check("stdin: a line reaches the box as a pairing code, sent to the company",
-              wait_for(lambda: '"event":"pair_failed"' in logs("box"), 30)
-              and len(open(os.path.join(SHARED, "conns.log")).read().split()) > n, logs("box")[-800:])
+        check("stdin: a plain line reaches the box as a pairing code too",
+              wait_for(lambda: logs("box").count('"event":"pair_failed"') == 2, 30)
+              and len(open(os.path.join(SHARED, "conns.log")).read().split()) > n2, logs("box")[-800:])
         new = {p for p in tree(data) - before}
         box_files = {p for p in tree(data) if p.startswith("cryptocart")}
         check("box writes only under /data/cryptocart",
