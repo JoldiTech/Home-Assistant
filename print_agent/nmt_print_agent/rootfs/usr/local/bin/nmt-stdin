@@ -1,0 +1,11 @@
+#!/bin/sh
+# Under s6-overlay only CMD gets the add-on's stdin (hassio.addon_stdin). Each
+# line goes to the box through a pipe both ends hold open read-write, so
+# neither blocks while the other is down. CMD exiting would stop the add-on.
+mkdir -p /run/nmt-box
+[ -p /run/nmt-box/stdin ] || mkfifo -m 600 /run/nmt-box/stdin
+exec 3<>/run/nmt-box/stdin
+while IFS= read -r line; do
+  printf '%s\n' "$line" >&3
+done
+exec sleep infinity

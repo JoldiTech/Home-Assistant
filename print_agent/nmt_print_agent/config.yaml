@@ -1,10 +1,11 @@
 name: NMT Print Agent
-version: "1.3.0"
+version: "1.4.0"
 slug: nmt_print_agent
 description: >-
   Downtown store agent: prints pickup orders pushed by the dashboard and
   reports whether paper came out; runs typed requests (diagnostics, Revel
-  caller-ID alerts) for the dashboard.
+  caller-ID alerts) for the dashboard; runs CryptoCart's register box for the
+  counter scanners and receipt printer.
 arch:
   - aarch64
   - amd64
@@ -12,8 +13,16 @@ init: false
 boot: auto
 startup: application
 # The agent listens on 8080 inside the add-on network only. The Cloudflare
-# tunnel reaches it as http://local-nmt-print-agent:8080; no host port is mapped.
+# tunnel reaches it as http://local-nmt-print-agent:8080; 8080 is never mapped.
 watchdog: "tcp://[HOST]:[PORT:8080]"
+# CryptoCart's register box: the registers on the shop's Wi-Fi reach it on
+# 8443. It opens 8443 only once its first certificate arrives.
+ports:
+  8443/tcp: 8443
+ports_description:
+  8443/tcp: Registers on the shop's Wi-Fi
+# The box's one-time pairing code arrives as a line by hassio.addon_stdin.
+stdin: true
 # Raises persistent notifications in Home Assistant when a job cannot print, and
 # publishes sensor.instore_order_printing for the Store view.
 homeassistant_api: true
@@ -71,3 +80,5 @@ schema:
       ip: str
       revel_station: int?
       test: bool
+  # CryptoCart company address; empty leaves the register box off.
+  cryptocart_company: str?
