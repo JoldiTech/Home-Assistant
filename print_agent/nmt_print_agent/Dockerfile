@@ -34,7 +34,7 @@ RUN case "$(dpkg --print-architecture)" in \
 # box.mjs is CryptoCart's `npm run build:box -w apps/pos` at the commit in
 # CHANGELOG.md; the build is reproducible, so this hash is that commit's.
 COPY box/box.mjs /opt/nmt-box/box.mjs
-RUN echo "68a6701c94005fb8e49c78649fa3dbcfcb670ed978cd41754a61f5e8cfe3e1e9  /opt/nmt-box/box.mjs" | sha256sum -c -
+RUN echo "a07fda2ca4486d5c629c78f55d30cda207749b920f2727e5347a0b31d3376d8f  /opt/nmt-box/box.mjs" | sha256sum -c -
 
 COPY agent/ /opt/nmt-print-agent/
 COPY rootfs/ /

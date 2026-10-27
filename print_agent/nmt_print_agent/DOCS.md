@@ -95,6 +95,10 @@ written here.
 
 - It dials out to `wss://<cryptocart_company>/api/pos/box` once paired, and
   reads the counter scanners and prints receipts as POS's settings tell it.
+- Every 15 minutes, and 5 s after it reaches POS, it looks on its own /24 (from
+  `lan_ip`) for scanner adapters (TCP 10001) and receipt printers (TCP 9100),
+  connecting and closing without sending a byte, and reports them to POS, where
+  they are set up. What it already drives is left alone.
 - Registers on the shop's Wi-Fi reach it on host port **8443**, opened only
   once its first certificate arrives. The certificate's address is `lan_ip`.
 - Pairing: a one-time code from POS's back office, sent as one line with the
