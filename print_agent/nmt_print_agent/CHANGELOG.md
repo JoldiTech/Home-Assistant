@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.2
+
+- Register box 1.7.0, `box.mjs` built from CryptoCart `main` at `140ac106`
+  with `npm run build:box -w apps/pos`, SHA-256
+  `709bbead2d6188ecef8afaaf47f03a3dd5ff6e4369a03ccb16154f75ff32f199`, on Node
+  26.12.1. Each printer it finds is named from its own SNMP answer
+  (hrDeviceDescr, then sysDescr, then sysName; UDP 161, read-only).
+
 ## 1.4.1
 
 - Register box 1.6.0, `box.mjs` built from CryptoCart `main` at `e5c76433`
