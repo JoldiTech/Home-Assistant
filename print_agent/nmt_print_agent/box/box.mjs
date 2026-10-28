@@ -2874,9 +2874,9 @@ var require_websocket = __commonJS({
         opts.auth = `${parsedUrl.username}:${parsedUrl.password}`;
       }
       if (isIpcUrl) {
-        const parts = opts.path.split(":");
-        opts.socketPath = parts[0];
-        opts.path = parts[1];
+        const parts2 = opts.path.split(":");
+        opts.socketPath = parts2[0];
+        opts.path = parts2[1];
       }
       let req;
       if (opts.followRedirects) {
@@ -3794,7 +3794,7 @@ import { readFileSync as readFileSync2 } from "node:fs";
 import { networkInterfaces } from "node:os";
 import { createSecureContext } from "node:tls";
 
-// ../../packages/core/src/csr.ts
+// ../../packages/core/src/der.ts
 function tlv(tag, content) {
   const n = content.length;
   const length = n < 128 ? Buffer.from([n]) : (() => {
@@ -3804,9 +3804,7 @@ function tlv(tag, content) {
   })();
   return Buffer.concat([Buffer.from([tag]), length, content]);
 }
-var sequence = (...parts) => tlv(48, Buffer.concat(parts));
-var set = (...parts) => tlv(49, Buffer.concat(parts));
-function oid(dotted) {
+function oidContent(dotted) {
   const [a = 0, b = 0, ...rest] = dotted.split(".").map(Number);
   const bytes = [40 * a + b];
   for (const n of rest) {
@@ -3817,8 +3815,13 @@ function oid(dotted) {
     }
     bytes.push(...sevens);
   }
-  return tlv(6, Buffer.from(bytes));
+  return Buffer.from(bytes);
 }
+var oid = (dotted) => tlv(6, oidContent(dotted));
+
+// ../../packages/core/src/csr.ts
+var sequence = (...parts2) => tlv(48, Buffer.concat(parts2));
+var set = (...parts2) => tlv(49, Buffer.concat(parts2));
 var COMMON_NAME = "2.5.4.3";
 var EXTENSION_REQUEST = "1.2.840.113549.1.9.14";
 var SUBJECT_ALT_NAME = "2.5.29.17";
@@ -4009,7 +4012,10 @@ var address = (f) => ({ host: text(f.get("host"), "host", { max: 253, pattern: H
 function foundOf(v, at) {
   const all = list(v, at);
   if (all.length > FOUND_MAX) throw new Invalid(`${at}: more than ${String(FOUND_MAX)}`);
-  return all.map((d, i) => address(fields(d, `${at}[${String(i)}]`, ["host", "port"])));
+  return all.map((d, i) => {
+    const f = fields(d, `${at}[${String(i)}]`, ["host", "port"], ["name"]);
+    return { ...address(f), name: f.get("name") === void 0 ? null : nullable(f.get("name"), (n) => text(n, "name", { max: 64, pattern: /^[\x20-\x7e]+$/ })) };
+  });
 }
 function logoOf(v) {
   const f = fields(v, "logo", ["width", "height", "bits"]);
@@ -4103,6 +4109,7 @@ var PATHS = {
   officeOrder: "/pos/office/order",
   items: "/pos/office/items",
   item: "/pos/office/item",
+  group: "/pos/office/group",
   templates: "/pos/office/templates",
   template: "/pos/office/template",
   unknownCodes: "/pos/office/unknown-codes",
@@ -4130,11 +4137,103 @@ var PATHS = {
 var INSTALL = { manifest: "/pos/manifest.webmanifest", icons: "/pos/icons/", worker: "/pos/sw.js", scope: PATHS.sale, built: "/assets/pos" };
 var PHONE_BUILD = { folder: "phone", built: `${INSTALL.built}/phone` };
 var RECEIPT_BUILD = { folder: "receipt", built: `${INSTALL.built}/receipt` };
-var SCANNER_BUILD = { folder: "scanner", built: `${INSTALL.built}/scanner` };
+var SCANNER_BUILD = { folder: "scanner", built: `${INSTALL.built}/scanner`, manifest: "/pos/scanner/manifest.webmanifest" };
 var SOCKETS = { realtime: "/api/pos/ws", box: "/api/pos/box" };
 
 // box/found.ts
 import { connect } from "node:net";
+
+// box/snmp.ts
+import { createSocket } from "node:dgram";
+var PORT = 161;
+var COMMUNITY = "public";
+var NAME_OIDS = ["1.3.6.1.2.1.25.3.2.1.3.1", "1.3.6.1.2.1.1.1.0", "1.3.6.1.2.1.1.5.0"];
+var NAME_MAX = 64;
+var TAG = { integer: 2, octets: 4, nul: 5, oid: 6, sequence: 48, get: 160, response: 162 };
+function integer2(n) {
+  const bytes = [n & 255];
+  for (let v = n >>> 8; v > 0; v >>>= 8) bytes.unshift(v & 255);
+  if ((bytes[0] ?? 0) & 128) bytes.unshift(0);
+  return tlv(TAG.integer, Buffer.from(bytes));
+}
+function getRequest(id, oid2) {
+  const binding = tlv(TAG.sequence, Buffer.concat([oid(oid2), tlv(TAG.nul, Buffer.alloc(0))]));
+  const pdu = tlv(TAG.get, Buffer.concat([integer2(id), integer2(0), integer2(0), tlv(TAG.sequence, binding)]));
+  return tlv(TAG.sequence, Buffer.concat([integer2(0), tlv(TAG.octets, Buffer.from(COMMUNITY)), pdu]));
+}
+function part(b, at) {
+  const tag = b[at];
+  let len = b[at + 1];
+  let start = at + 2;
+  if (tag === void 0 || len === void 0) throw new RangeError("short");
+  if (len & 128) {
+    const bytes = len & 127;
+    if (bytes < 1 || bytes > 2) throw new RangeError("length");
+    len = 0;
+    for (let i = 0; i < bytes; i++) len = len << 8 | (b[start + i] ?? 0);
+    start += bytes;
+  }
+  if (start + len > b.length) throw new RangeError("past the end");
+  return { tag, body: b.subarray(start, start + len), next: start + len };
+}
+function parts(b) {
+  const all = [];
+  for (let at = 0; at < b.length; ) {
+    const p = part(b, at);
+    all.push(p);
+    at = p.next;
+  }
+  return all;
+}
+var intOf = (p) => p?.tag === TAG.integer && p.body.length <= 4 ? p.body.reduce((n, x) => n << 8 | x, 0) : void 0;
+function responseText(b, id, oid2) {
+  try {
+    const [message] = parts(b);
+    if (message?.tag !== TAG.sequence) return void 0;
+    const [, , pdu] = parts(message.body);
+    if (pdu?.tag !== TAG.response) return void 0;
+    const [reqId, status, , bindings] = parts(pdu.body);
+    if (intOf(reqId) !== id) return void 0;
+    if (intOf(status) !== 0 || bindings?.tag !== TAG.sequence) return { text: void 0 };
+    const [binding] = parts(bindings.body);
+    const [name, value] = binding?.tag === TAG.sequence ? parts(binding.body) : [];
+    return { text: name?.tag === TAG.oid && name.body.equals(oidContent(oid2)) && value?.tag === TAG.octets ? value.body.toString("latin1") : void 0 };
+  } catch {
+    return void 0;
+  }
+}
+function nameOf(text3) {
+  const name = (text3 ?? "").replace(/[^\x20-\x7e]/g, " ").replace(/ +/g, " ").trim().slice(0, NAME_MAX).trim();
+  return name === "" ? null : name;
+}
+function snmpText(host, oid2, ms) {
+  return new Promise((resolve) => {
+    const id = Math.floor(Math.random() * 2147483647);
+    const s = createSocket("udp4");
+    const done = (text3) => {
+      clearTimeout(timer);
+      s.close();
+      resolve(text3);
+    };
+    const timer = setTimeout(() => done(void 0), ms);
+    s.on("error", () => done(void 0));
+    s.on("message", (msg, from) => {
+      if (from.address !== host || from.port !== PORT) return;
+      const answer = responseText(msg, id, oid2);
+      if (answer !== void 0) done(answer.text);
+    });
+    s.send(getRequest(id, oid2), PORT, host);
+  });
+}
+async function deviceName(host, ms, ask = snmpText) {
+  for (const oid2 of NAME_OIDS) {
+    const name = nameOf(await ask(host, oid2, ms));
+    if (name !== null) return name;
+  }
+  return null;
+}
+
+// box/found.ts
 var PORTS = { scanner: 10001, printer: 9100 };
 function answers(host, port, ms) {
   return new Promise((resolve) => {
@@ -4149,11 +4248,11 @@ function answers(host, port, ms) {
   });
 }
 function neighbours(own) {
-  const parts = own.split(".");
-  const prefix = parts.slice(0, 3).join(".");
+  const parts2 = own.split(".");
+  const prefix = parts2.slice(0, 3).join(".");
   return Array.from({ length: 254 }, (_, i) => `${prefix}.${String(i + 1)}`).filter((a) => a !== own);
 }
-async function findOnNetwork(own, known, t, ask = answers) {
+async function findOnNetwork(own, known, t, ask = answers, named = deviceName) {
   const all = neighbours(own).flatMap((host) => [{ host, port: PORTS.scanner }, { host, port: PORTS.printer }]).filter((a) => !known.has(`${a.host}:${String(a.port)}`));
   const found = [];
   let next = 0;
@@ -4166,7 +4265,9 @@ async function findOnNetwork(own, known, t, ask = answers) {
   await Promise.all(Array.from({ length: t.atOnce }, worker));
   const order = (x, y) => Number(x.host.split(".")[3]) - Number(y.host.split(".")[3]);
   const of = (port) => found.filter((a) => a.port === port).sort(order);
-  return { scanners: of(PORTS.scanner), printers: of(PORTS.printer) };
+  const printers = [];
+  for (const p of of(PORTS.printer)) printers.push({ ...p, name: await named(p.host, 2 * t.answerMs) });
+  return { scanners: of(PORTS.scanner).map((s) => ({ ...s, name: null })), printers };
 }
 
 // box/link.ts
@@ -4499,6 +4600,7 @@ var REGISTER = {
   noItems: "No items",
   nothingFound: "Nothing found",
   from: (price) => `From ${price}`,
+  pickBy: (by) => `Pick ${/^[aeiou]/i.test(by) ? "an" : "a"} ${by.toLowerCase()}`,
   misc: "Misc item",
   miscName: "What it is",
   price: "Price",
@@ -4681,6 +4783,10 @@ var REGISTER = {
   moved: (amount) => `Moved ${amount}`,
   drawerOpened: "Drawer opened",
   heldForReview: "Held for review",
+  resync: "Reload items",
+  resyncing: "Reloading",
+  resynced: "Reloaded",
+  notResynced: "Not reloaded",
   connection: "Connection",
   online: "Online",
   waitingToSend: "Waiting to send",
@@ -4949,6 +5055,13 @@ var OFFICE = {
   },
   problems: {
     too_large: "Too large",
+    unreadable: "Photo not readable",
+    lost: "Photo not taken",
+    not_converted: "Photo not taken",
+    not_a_photo: "Not a photo",
+    storage_full: "Storage full",
+    photo_not_found: "Photo not found",
+    template_photo: "Photos go on items",
     not_found: "Not found",
     not_allowed: "No access",
     step_up: "Passkey check needed",
@@ -4982,6 +5095,9 @@ var OFFICE = {
     submitted: "Already submitted",
     file_refused: "Receipt not taken",
     dispute_refused: "Not taken by Stripe",
+    template_sizes: "Sizes come from its template",
+    not_count: "Not sold each",
+    several_sizes: "More than one size",
     shop_address: "Shop address missing",
     location_refused: "Location not made",
     no_terminal_location: "No Stripe location",
@@ -4990,8 +5106,19 @@ var OFFICE = {
     reader_elsewhere: "Reader at another location",
     reader_taken: "Reader on another register",
     restart_window: "Different hours",
+    in_group: "Already in a group",
     configuration_refused: "Not taken by Stripe",
-    serial_or_code: "Serial number or code needed"
+    serial_or_code: "Serial number or code needed",
+    other_form_taken: "Barcode on another item",
+    file_kind: "Not a photo",
+    templates_differ: "Items of different templates",
+    group_in_group: "A group in a group",
+    not_a_group: "Not a group",
+    group_archived: "Group archived",
+    name_too_long: "Name too long with its group",
+    group_size: "Size of a group",
+    not_its_group: "Size of another group",
+    group_has_items: "Group has items"
   },
   reports: {
     names: {
@@ -5135,6 +5262,11 @@ var OFFICE = {
     newCategory: "New category",
     sized,
     give: "Give to this size",
+    group: "Group",
+    newGroup: "New group",
+    pickTwo: "Two or more items",
+    findItems: "Search items",
+    groupOf: (n) => `Group \xB7 ${itemCount(n)}`,
     size: "Size",
     noUnknown: "No unknown codes",
     scanned: (n) => n === 1 ? "Scanned once" : `Scanned ${String(n)} times`,
@@ -5162,12 +5294,24 @@ var OFFICE = {
     noTemplate: "No template",
     newTemplate: "New template",
     items: "Items",
+    group: "Group",
+    noGroup: "No group",
+    addGroup: "Add group",
+    newGroup: "New group",
+    variesBy: "Varies by",
+    groupName: "Group name",
     addToItems: (n) => n === 1 ? "Add to 1 item" : `Add to ${String(n)} items`,
     addedTo: (n) => n === 1 ? "Added to 1 item" : `Added to ${String(n)} items`,
     addSize: "Add size",
     newSize: "New size",
     priceAt: (level, price) => `${level} ${price}`,
     done: "Done",
+    oneSize: "Each",
+    addItem: "Add item",
+    photo: "Photo",
+    addPhoto: "Add photo",
+    changePhoto: "Change photo",
+    removePhoto: "Remove photo",
     unitNames: { oz: "oz", lb: "lb", g: "g", kg: "kg", each: "each", fl_oz_us: "fl oz", mL: "mL", L: "L" }
   },
   customers: {
@@ -5610,14 +5754,14 @@ var SCANNER_PAGE = {
   removed: "Scanner removed",
   notReached: "Not reachable",
   tryAgain: "Try again",
-  addToHome: "Share, then Add to Home Screen"
+  addToHome: "Add to Home Screen"
 };
 var RECEIPT_PAGE = {
   ...PAGE_WORDS,
   title: "Receipt",
   number: (kind, number2) => `${kind ?? "Receipt"} ${number2}`,
   from: (shop, company2) => `${shop}, ${company2}`,
-  under: (parts) => parts.join(" \xB7 "),
+  under: (parts2) => parts2.join(" \xB7 "),
   totals: "Totals",
   paid: "Paid",
   notFound: "Receipt not found",
@@ -5910,7 +6054,7 @@ import { connect as connect3 } from "node:net";
 var ENDS = { auto: /\r\n|\r|\n/, cr: /\r/, lf: /\n/, crlf: /\r\n/, tab: /\t/ };
 var PARTIAL_MAX = 256;
 var JOIN_MS = 50;
-var codes = (parts) => parts.map((p) => p.trim()).filter((code) => SCAN_CODE.test(code));
+var codes = (parts2) => parts2.map((p) => p.trim()).filter((code) => SCAN_CODE.test(code));
 function framer(suffix) {
   let partial = "";
   const kept = (text3) => text3.length > PARTIAL_MAX ? "" : text3;
@@ -5929,9 +6073,9 @@ function framer(suffix) {
   }
   return {
     chunk: (text3) => {
-      const parts = (partial + text3).split(ENDS[suffix]);
-      partial = kept(parts.pop() ?? "");
-      return codes(parts);
+      const parts2 = (partial + text3).split(ENDS[suffix]);
+      partial = kept(parts2.pop() ?? "");
+      return codes(parts2);
     },
     flush: () => []
   };
@@ -6101,7 +6245,7 @@ var Store = class {
 };
 
 // box/version.ts
-var BOX_VERSION = "1.6.0";
+var BOX_VERSION = "1.7.0";
 
 // box/program.ts
 var TIMING = {
