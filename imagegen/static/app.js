@@ -161,10 +161,13 @@ async function apiCall(path, payload) {
 
 // --- login ------------------------------------------------------------------
 
-function showLogin(error) {
+// keepStore: re-login without dropping this tab's conversation - used after
+// "shut down models" restarts the server, and for failed login attempts.
+// Everything else that lands here (an expired or stale session) wipes it.
+function showLogin(error, keepStore = false) {
   kSess = null;
   logoutEnvelope = null;
-  store = freshStore();
+  if (!keepStore) store = freshStore();
   currentMode = null;
   viewGeneration++;
   $("app").innerHTML = `
@@ -195,7 +198,7 @@ async function onLoginSubmit(e) {
     if (!challenge) {
       // Distinguish "server is unhappy" from "wrong password" - otherwise a
       // restarting service reads as a rejected login.
-      showLogin("server is not responding - try again in a moment");
+      showLogin("server is not responding - try again in a moment", true);
       return;
     }
     const { nonce, server_pub } = challenge;
@@ -209,17 +212,16 @@ async function onLoginSubmit(e) {
       body: JSON.stringify({ nonce, proof: b64e(proof), client_pub: clientPubB64, ek_iv, ek_ct }),
     });
     if (!loginRes.ok) {
-      showLogin("incorrect password");
+      showLogin("incorrect password", true);
       return;
     }
     // Only the session key survives past this point - the password-derived
     // halves are dropped so nothing longer-lived than the session exists here.
     kSess = sessKey;
-    store = freshStore();
     logoutEnvelope = JSON.stringify(await encryptEnvelope({ logout: true }));
     showModePicker();
   } catch (err) {
-    showLogin("something went wrong, try again");
+    showLogin("something went wrong, try again", true);
   } finally {
     btn.disabled = false;
   }
@@ -406,7 +408,8 @@ function renderInitState(st) {
     const modeNote = imagesEnabled ? "CPU chat + images" : "GPU chat (images off)";
     area.innerHTML = `<p id="chat-status">chat model: ${escapeText(st.chat_model)} — ${modeNote}
       &mdash; <a href="#" id="unload-btn">shut down models</a>
-      (frees the GPU and RAM; your chats stay in this tab)</p>`;
+      (frees the GPU and wipes the server's memory; you log in again after,
+      and your chats stay in this tab)</p>`;
     modeButtons.style.display = "flex";
     // "image only" is meaningless in GPU-chat mode (SDXL isn't loaded).
     const imgBtn = document.querySelector('[data-mode="image"]');
@@ -428,14 +431,27 @@ function renderInitState(st) {
       <select id="image-model-sel"></select>
       <label for="chat-mode-sel">mode</label>
       <select id="chat-mode-sel"></select>
+      <p id="mode-note" style="color:#888;font-size:.85rem"></p>
       <button id="init-btn">initialize system</button>
       ${errLine}
       <p id="chat-status">models aren't loaded yet - nothing uses memory until you start this</p>`;
     fillSelect($("chat-model-sel"), st.models || [st.chat_model], st.chat_model, (m) => m);
     fillSelect($("image-model-sel"), st.image_models || [st.image_model], st.image_model,
                (m) => m.replace(/\.safetensors$/, ""));
-    fillSelect($("chat-mode-sel"), st.modes || ["cpu_images"], st.mode || "cpu_images",
-               (m) => CHAT_MODE_LABELS[m] || m);
+    // Each chat model only offers the modes it can run in: one too big to sit
+    // beside the image model is chat-only (the server enforces this too).
+    const fillModes = () => {
+      const model = $("chat-model-sel").value;
+      const allowed = (st.model_modes && st.model_modes[model]) || st.modes || ["cpu_images"];
+      const sel = $("chat-mode-sel");
+      sel.innerHTML = "";
+      fillSelect(sel, allowed, allowed.includes(st.mode) ? st.mode : allowed[0],
+                 (m) => CHAT_MODE_LABELS[m] || m);
+      $("mode-note").textContent = allowed.includes("cpu_images") ? "" :
+        "this model is too large to run next to the image generator, so it's chat only (no images)";
+    };
+    fillModes();
+    $("chat-model-sel").addEventListener("change", fillModes);
     $("init-btn").addEventListener("click", startInit);
   }
 }
@@ -498,15 +514,35 @@ async function startInit() {
   if (st.status === "loading") setTimeout(() => checkInit(), INIT_POLL_MS);
 }
 
+const RESTART_POLL_MS = 1500;
+const RESTART_MAX_POLLS = 40;
+
 async function doUnload() {
   let st;
+  setStatus("chat-status", "unloading models and wiping server memory...");
   try {
     st = await apiCall("/api/unload", {});
   } catch (err) {
     setStatus("chat-status", err.message || "shutting the models down failed");
     return;
   }
-  renderInitState(st);
+  if (!st.restarting) { renderInitState(st); return; }
+  // The server zeroes the GPU and restarts itself, which ends every session.
+  // Wait for the old process to go and the new one to answer, then log in
+  // again - this tab's conversation is kept.
+  kSess = null;
+  logoutEnvelope = null;
+  setStatus("chat-status", "server memory is being wiped - restarting...");
+  // Only a response from a NEW process counts: the old one may still answer
+  // for a moment while it zeroes the GPU, and a login there would die with it.
+  for (let i = 0; i < RESTART_MAX_POLLS; i++) {
+    await new Promise((r) => setTimeout(r, RESTART_POLL_MS));
+    try {
+      const res = await fetch("/", { cache: "no-store" });
+      if (res.ok && res.headers.get("X-Chloe-Boot") !== st.boot) break;
+    } catch (e) { /* still restarting */ }
+  }
+  showLogin("models unloaded and server memory wiped - enter the password to continue", true);
 }
 
 async function openMode(mode) {

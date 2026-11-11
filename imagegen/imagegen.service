@@ -9,7 +9,7 @@ Group=nmteaco
 WorkingDirectory=/home/nmteaco/imagegen
 EnvironmentFile=/etc/nmteaco/imagegen.env
 Environment=MODEL_PATH=/home/nmteaco/imagegen/models/juggernautXL_ragnarok.safetensors
-Environment=LLM_MODEL_PATH=/home/nmteaco/imagegen/models/Gemma-4-12B-OBLITERATED.Q4_K_M.gguf
+Environment=LLM_MODEL_PATH=/home/nmteaco/imagegen/models/NemoMix-Unleashed-12B.Q4_K_M.gguf
 Environment=PORT=8189
 Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # The huggingface cache only appears on first download, but a ReadWritePaths
@@ -22,8 +22,11 @@ Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ExecStartPre=+/usr/bin/mkdir -p /home/nmteaco/.cache/huggingface
 ExecStartPre=+/usr/bin/chown nmteaco:nmteaco /home/nmteaco/.cache /home/nmteaco/.cache/huggingface
 ExecStart=/home/nmteaco/imagegen-env/bin/python /home/nmteaco/imagegen/app.py
-Restart=on-failure
-RestartSec=5
+# always, not on-failure: "shut down models" wipes memory by exiting the
+# process on purpose (exit 0), and it must come straight back up cold.
+# `systemctl stop` still stops it.
+Restart=always
+RestartSec=2
 
 # --- Hardening ---
 NoNewPrivileges=yes
